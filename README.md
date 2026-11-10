@@ -5,10 +5,12 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.2)
+## Funktionen (v0.3)
 
 - Verknüpfung per QR-Code, die Sitzung bleibt gespeichert
-- WhatsApp-ähnliche Oberfläche: Chatliste mit Rundbildern, Suche, Ungelesen-Zähler, grüne Sprechblasen
+- Modernes, ruhiges Design, hell und dunkel umschaltbar; Chatliste mit Profilbildern, Suche, Ungelesen-Zähler, Datumstrenner
+- Verlauf wird lokal gespeichert und ist nach dem Neustart wieder da
+- Mehrzeilig schreiben (Shift+Enter) und Emoji-Auswahl
 - Namen aus dem Adressbuch (sobald WhatsApp sie synchronisiert hat), sonst Push-Namen
 - Interne Sync-Nachrichten werden ausgeblendet, Uhrzeit in deiner Zeitzone
 - Nachrichten empfangen und Textnachrichten senden (Enter)
@@ -16,17 +18,17 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Desktop-Benachrichtigungen (an/aus, mit oder ohne Textvorschau), Chats einzeln stummschalten
 - Einstellungen: Benachrichtigungen, Autostart (Linux), Schriftgröße
 - Neuer Chat per Telefonnummer (Nummer in die Suche tippen)
-- Medien erscheinen als Platzhalter, z. B. `[image]`
+- Medien erscheinen als Platzhalter, z. B. `[image]`; Profilbilder werden geladen und zwischengespeichert
 - Dunkles Design, läuft unter Linux, Windows und macOS (getestet nur unter Linux)
 
-**Noch nicht vorhanden:** Nachrichtenverlauf nach Neustart (nur der Sync nach dem Verknüpfen), Profilbilder, Bilder/Dokumente/Sprachnachrichten, Anrufe, Antworten/Reaktionen, Gruppen anlegen. Der Login mit einem echten Konto ist bisher nicht ausführlich getestet. Fehler bitte als Issue melden.
+**Noch nicht vorhanden:** Bilder/Dokumente/Sprachnachrichten, bunte Emojis (die Oberfläche zeichnet Emojis einfarbig), Anrufe, Antworten/Reaktionen, Haken für gelesen, Gruppen anlegen. Der Login mit einem echten Konto ist bisher nicht ausführlich getestet. Fehler bitte als Issue melden.
 
 ## Installation auf Fedora (empfohlen)
 
 Ein Befehl, danach findest du wa-snap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.2.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.3.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.

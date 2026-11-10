@@ -19,6 +19,8 @@ pub enum UiEvent {
     Contact { user: String, name: String, from_book: bool },
     /// Chats und Nachrichten aus dem Verlauf-Sync nach der Verknüpfung.
     History(Vec<HistChat>),
+    /// Profilbild als RGBA-Pixel (96x96 oder kleiner), Schlüssel ist die Rufnummer/LID.
+    Avatar { user: String, size: [usize; 2], rgba: Vec<u8> },
     SendFailed(String),
 }
 
@@ -34,6 +36,7 @@ pub struct HistChat {
 /// Was die Oberfläche dem Backend aufträgt.
 pub enum Cmd {
     Send { chat: Jid, text: String },
+    Avatar { jid: Jid },
     Quit,
 }
 
@@ -127,12 +130,59 @@ fn convert_history(h: &wa::HistorySync, send: &impl Fn(UiEvent)) {
     }
 }
 
+/// Profilbild holen (Cache auf Platte, 7 Tage; leere Datei = hat keins, 1 Tag) und verkleinern.
+async fn load_avatar(client: Arc<Client>, dir: std::path::PathBuf, jid: Jid) -> Option<UiEvent> {
+    let user = jid.user.to_string();
+    let path = dir.join(format!("{user}.img"));
+    let age = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|e| e.as_secs())
+    };
+    let cached = match age(&path) {
+        Some(a) => std::fs::read(&path).ok().map(|b| (a, b)),
+        None => None,
+    };
+    let bytes: Vec<u8> = match cached {
+        Some((a, b)) if (!b.is_empty() && a < 7 * 86_400) || (b.is_empty() && a < 86_400) => b,
+        _ => {
+            let fetched = match client.contacts().get_profile_picture(&jid, true).await {
+                Ok(Some(pp)) => tokio::task::spawn_blocking(move || {
+                    let mut resp = ureq::get(&pp.url).call().ok()?;
+                    resp.body_mut().read_to_vec().ok()
+                })
+                .await
+                .ok()
+                .flatten(),
+                _ => None,
+            };
+            let data = fetched.unwrap_or_default();
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(&path, &data);
+            data
+        }
+    };
+    if bytes.is_empty() {
+        return None;
+    }
+    tokio::task::spawn_blocking(move || {
+        let img = image::load_from_memory(&bytes).ok()?.thumbnail(96, 96).to_rgba8();
+        let size = [img.width() as usize, img.height() as usize];
+        Some(UiEvent::Avatar { user, size, rgba: img.into_raw() })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 fn user_of(jid: &str) -> String {
     jid.split('@').next().unwrap_or("").split(':').next().unwrap_or("").to_owned()
 }
 
 pub fn spawn(
-    db_path: String,
+    dir: std::path::PathBuf,
     ui_tx: Sender<UiEvent>,
     repaint: impl Fn() + Send + Sync + Clone + 'static,
 ) -> tokio::sync::mpsc::UnboundedSender<Cmd> {
@@ -156,7 +206,8 @@ pub fn spawn(
                     }
                 };
 
-                let store = match SqliteStore::new(&db_path).await {
+                let avatar_dir = dir.join("avatars");
+                let store = match SqliteStore::new(&dir.join("whatsapp.db").to_string_lossy()).await {
                     Ok(s) => s,
                     Err(e) => {
                         send(UiEvent::Status(format!("Datenbank-Fehler: {e}")));
@@ -281,6 +332,16 @@ pub fn spawn(
                                         .await
                                     {
                                         send(UiEvent::SendFailed(e.to_string()));
+                                    }
+                                });
+                            }
+                            Some(Cmd::Avatar { jid }) => {
+                                let client = client.clone();
+                                let send = send.clone();
+                                let dir = avatar_dir.clone();
+                                tokio::spawn(async move {
+                                    if let Some(ev) = load_avatar(client, dir, jid).await {
+                                        send(ev);
                                     }
                                 });
                             }
