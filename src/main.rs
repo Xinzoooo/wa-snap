@@ -3,7 +3,7 @@ mod backend;
 use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver};
 
-use backend::{ChatMessage, Cmd, UiEvent};
+use backend::{ChatMessage, Cmd, HistChat, UiEvent};
 use eframe::egui::{self, Color32, RichText};
 use whatsapp_rust::Jid;
 
@@ -14,6 +14,68 @@ const BG_LIST: Color32 = Color32::from_rgb(0x11, 0x1b, 0x21);
 const BG_CHAT: Color32 = Color32::from_rgb(0x0b, 0x14, 0x1a);
 const BG_BAR: Color32 = Color32::from_rgb(0x20, 0x2c, 0x33);
 const TEXT_DIM: Color32 = Color32::from_rgb(0x86, 0x96, 0xa0);
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(default)]
+struct Settings {
+    notifications: bool,
+    preview: bool,
+    font_size: f32,
+    muted: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { notifications: true, preview: true, font_size: 14.0, muted: Vec::new() }
+    }
+}
+
+fn settings_path() -> std::path::PathBuf {
+    data_dir().join("settings.json")
+}
+
+fn load_settings() -> Settings {
+    std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn autostart_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(base.join("autostart/wa-snap.desktop"))
+}
+
+fn set_autostart(on: bool) -> std::io::Result<()> {
+    let Some(file) = autostart_file() else { return Ok(()) };
+    if on {
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let exe = std::env::current_exe()?;
+        let entry = include_str!("../assets/wa-snap.desktop")
+            .replace("@EXEC@", &format!("\"{}\"", exe.display()));
+        std::fs::write(file, entry)
+    } else if file.exists() {
+        std::fs::remove_file(file)
+    } else {
+        Ok(())
+    }
+}
+
+fn notify(title: String, body: String) {
+    // Eigener Thread: die Oberfläche wartet nie auf den Benachrichtigungsdienst.
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .appname("wa-snap")
+            .summary(&title)
+            .body(&body)
+            .icon("wa-snap")
+            .show();
+    });
+}
 
 struct Chat {
     jid: Jid,
@@ -44,6 +106,10 @@ struct App {
     search: String,
     input: String,
     error: Option<String>,
+    settings: Settings,
+    show_settings: bool,
+    autostart: bool,
+    focused: bool,
 }
 
 fn data_dir() -> std::path::PathBuf {
@@ -66,6 +132,19 @@ fn fmt_time(ts: i64) -> String {
         .single()
         .map(|d| d.format("%H:%M").to_string())
         .unwrap_or_default()
+}
+
+fn apply_font(ctx: &egui::Context, size: f32) {
+    ctx.style_mut(|st| {
+        for (ts, f) in st.text_styles.iter_mut() {
+            match ts {
+                egui::TextStyle::Body | egui::TextStyle::Button | egui::TextStyle::Monospace => f.size = size,
+                egui::TextStyle::Small => f.size = size - 3.0,
+                egui::TextStyle::Heading => f.size = size + 6.0,
+                _ => {}
+            }
+        }
+    });
 }
 
 fn avatar(ui: &mut egui::Ui, name: &str, size: f32) {
@@ -97,6 +176,7 @@ fn avatar(ui: &mut egui::Ui, name: &str, size: f32) {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        apply_font(&cc.egui_ctx, load_settings().font_size);
         let (tx, rx) = channel();
         let ctx = cc.egui_ctx.clone();
         let db = data_dir().join("whatsapp.db");
@@ -115,7 +195,47 @@ impl App {
             search: String::new(),
             input: String::new(),
             error: None,
+            settings: load_settings(),
+            show_settings: false,
+            autostart: autostart_file().map(|f| f.exists()).unwrap_or(false),
+            focused: true,
         }
+    }
+
+    fn ingest_history(&mut self, chats: Vec<HistChat>) {
+        for h in chats {
+            let key = h.jid.to_string();
+            let chat = self.chats.entry(key).or_insert_with(|| Chat {
+                jid: h.jid.clone(),
+                name: if h.name.is_empty() { h.jid.user.to_string() } else { h.name.clone() },
+                is_group: h.is_group,
+                messages: Vec::new(),
+                unread: 0,
+                last_ts: 0,
+            });
+            if !h.name.is_empty() {
+                chat.name = h.name.clone();
+            }
+            chat.unread = chat.unread.max(h.unread);
+            chat.last_ts = chat.last_ts.max(h.last_ts);
+            for m in h.msgs {
+                if !m.id.is_empty() && chat.messages.iter().any(|x| x.id == m.id) {
+                    continue;
+                }
+                chat.messages.push(m);
+            }
+            chat.messages.sort_by_key(|x| x.ts);
+        }
+    }
+
+    fn save_settings(&self) {
+        if let Ok(t) = serde_json::to_string_pretty(&self.settings) {
+            let _ = std::fs::write(settings_path(), t);
+        }
+    }
+
+    fn is_muted(&self, key: &str) -> bool {
+        self.settings.muted.iter().any(|m| m == key)
     }
 
     fn display_name(&self, chat: &Chat) -> String {
@@ -149,9 +269,29 @@ impl App {
         if !m.from_me && !selected {
             chat.unread += 1;
         }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let fresh = now - m.ts < 60; // keine Benachrichtigung für nachgeladene alte Nachrichten
+        let want_notify = !m.from_me && fresh && self.settings.notifications;
+        let note = (m.chat.to_string(), m.sender_name.clone(), m.text.clone(), m.is_group);
         chat.last_ts = chat.last_ts.max(m.ts);
         chat.messages.push(m);
         chat.messages.sort_by_key(|x| x.ts);
+
+        let (key, sender, text, is_group) = note;
+        if want_notify && !self.is_muted(&key) && (!selected || !self.focused) {
+            let title = self.chats.get(&key).map(|c| self.display_name(c)).unwrap_or_default();
+            let body = if !self.settings.preview {
+                "Neue Nachricht".to_owned()
+            } else if is_group && !sender.is_empty() {
+                format!("{sender}: {text}")
+            } else {
+                text
+            };
+            notify(title, body);
+        }
     }
 
     fn pump(&mut self) {
@@ -168,6 +308,7 @@ impl App {
                 }
                 UiEvent::LoggedOut => self.conn = Conn::LoggedOut,
                 UiEvent::Message(m) => self.ingest(m),
+                UiEvent::History(c) => self.ingest_history(c),
                 UiEvent::Contact { user, name, from_book } => {
                     // Adressbuch-Namen überschreiben Push-Namen, nicht umgekehrt.
                     let keep = matches!(self.names.get(&user), Some((_, true))) && !from_book;
@@ -236,6 +377,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.focused = ctx.input(|i| i.focused);
         self.pump();
 
         if self.conn != Conn::Online && self.chats.is_empty() {
@@ -280,6 +422,9 @@ impl eframe::App for App {
                             _ => ("● verbinde", Color32::YELLOW),
                         };
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Einstellungen").clicked() {
+                                self.show_settings = !self.show_settings;
+                            }
                             ui.label(RichText::new(txt).color(col).small());
                         });
                     });
@@ -296,6 +441,26 @@ impl eframe::App for App {
                 ui.add_space(6.0);
 
                 let needle = self.search.to_lowercase();
+                let digits: String = self.search.chars().filter(|c| c.is_ascii_digit()).collect();
+                let looks_like_number =
+                    self.search.chars().all(|c| c.is_ascii_digit() || c == '+' || c == ' ');
+                if digits.len() >= 7 && looks_like_number {
+                    if ui.button(format!("Chat mit +{digits} starten")).clicked() {
+                        let jid = Jid::pn(digits.clone());
+                        let key = jid.to_string();
+                        self.chats.entry(key.clone()).or_insert_with(|| Chat {
+                            jid,
+                            name: format!("+{digits}"),
+                            is_group: false,
+                            messages: Vec::new(),
+                            unread: 0,
+                            last_ts: 0,
+                        });
+                        self.selected = Some(key);
+                        self.show_settings = false;
+                        self.search.clear();
+                    }
+                }
                 let mut rows: Vec<(String, String, i64)> = self
                     .chats
                     .iter()
@@ -371,6 +536,7 @@ impl eframe::App for App {
                         c.unread = 0;
                     }
                     self.selected = Some(k);
+                    self.show_settings = false;
                 }
             });
 
@@ -406,12 +572,57 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG_CHAT))
             .show(ctx, |ui| {
+                if self.show_settings {
+                    let mut changed = false;
+                    ui.add_space(16.0);
+                    ui.heading("Einstellungen");
+                    ui.separator();
+                    changed |= ui
+                        .checkbox(&mut self.settings.notifications, "Benachrichtigungen bei neuen Nachrichten")
+                        .changed();
+                    changed |= ui
+                        .checkbox(&mut self.settings.preview, "Nachrichtentext in Benachrichtigungen anzeigen")
+                        .changed();
+                    if ui
+                        .checkbox(&mut self.autostart, "Beim Anmelden automatisch starten")
+                        .changed()
+                    {
+                        if let Err(e) = set_autostart(self.autostart) {
+                            self.error = Some(format!("Autostart: {e}"));
+                            self.autostart = !self.autostart;
+                        }
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Schriftgröße");
+                        if ui
+                            .add(egui::Slider::new(&mut self.settings.font_size, 11.0..=20.0))
+                            .changed()
+                        {
+                            apply_font(ctx, self.settings.font_size);
+                            changed = true;
+                        }
+                    });
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} stummgeschaltete Chats. Stumm schaltest du im jeweiligen Chat oben rechts.",
+                            self.settings.muted.len()
+                        ))
+                        .color(TEXT_DIM),
+                    );
+                    if changed {
+                        self.save_settings();
+                    }
+                    return;
+                }
                 let Some(key) = self.selected.clone() else {
                     ui.centered_and_justified(|ui| {
                         ui.label(RichText::new("Wähle links einen Chat").color(TEXT_DIM).size(18.0));
                     });
                     return;
                 };
+                let mut toggle_mute = false;
                 let Some(chat) = self.chats.get(&key) else { return };
                 let title = self.display_name(chat);
                 egui::Frame::new().fill(BG_BAR).inner_margin(10.0).show(ui, |ui| {
@@ -419,6 +630,12 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         avatar(ui, &title, 38.0);
                         ui.label(RichText::new(&title).size(17.0).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let muted = self.settings.muted.iter().any(|m| m == &key);
+                            if ui.button(if muted { "Stumm: an" } else { "Stumm: aus" }).clicked() {
+                                toggle_mute = true;
+                            }
+                        });
                     });
                 });
                 // Nur die letzten Nachrichten zeichnen: schnell auch bei langen Chats.
@@ -453,6 +670,14 @@ impl eframe::App for App {
                             });
                         }
                     });
+                if toggle_mute {
+                    if let Some(i) = self.settings.muted.iter().position(|m| m == &key) {
+                        self.settings.muted.remove(i);
+                    } else {
+                        self.settings.muted.push(key.clone());
+                    }
+                    self.save_settings();
+                }
             });
     }
 
@@ -461,10 +686,45 @@ impl eframe::App for App {
     }
 }
 
+/// `wa-snap --install-desktop`: legt Startmenü-Eintrag und Icon an, damit das Programm
+/// im Anwendungsmenü erscheint und an die Taskleiste angeheftet werden kann (Linux).
+fn install_desktop() -> std::io::Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| std::io::Error::other("HOME ist nicht gesetzt"))?;
+    let share = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    let exe = std::env::current_exe()?;
+    let apps = share.join("applications");
+    let icons = share.join("icons/hicolor/scalable/apps");
+    std::fs::create_dir_all(&apps)?;
+    std::fs::create_dir_all(&icons)?;
+    std::fs::write(icons.join("wa-snap.svg"), include_str!("../assets/wa-snap.svg"))?;
+    let desktop = include_str!("../assets/wa-snap.desktop")
+        .replace("@EXEC@", &format!("\"{}\"", exe.display()));
+    std::fs::write(apps.join("wa-snap.desktop"), desktop)?;
+    let _ = std::process::Command::new("update-desktop-database").arg(&apps).status();
+    let _ = std::process::Command::new("gtk-update-icon-cache")
+        .args(["-f", "-t"])
+        .arg(share.join("icons/hicolor"))
+        .status();
+    println!("Fertig. wa-snap steht jetzt im Anwendungsmenü und kann an die Taskleiste angeheftet werden.");
+    Ok(())
+}
+
 fn main() -> eframe::Result<()> {
+    if std::env::args().any(|a| a == "--install-desktop") {
+        if let Err(e) = install_desktop() {
+            eprintln!("Installation fehlgeschlagen: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 680.0])
+            .with_app_id("wa-snap")
             .with_title("wa-snap"),
         ..Default::default()
     };

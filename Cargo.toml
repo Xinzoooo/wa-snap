@@ -1,6 +1,6 @@
 [package]
 name = "wa-snap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Schneller nativer WhatsApp-Desktop-Client in Rust (inoffiziell)"
@@ -11,6 +11,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 eframe = "0.31"
 qrcode = { version = "0.14", default-features = false }
 chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+notify-rust = "4"
 
 [profile.release]
 lto = "thin"

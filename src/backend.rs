@@ -17,7 +17,18 @@ pub enum UiEvent {
     Message(ChatMessage),
     /// Anzeigename für eine Rufnummer/LID (Adressbuch hat Vorrang vor Push-Namen).
     Contact { user: String, name: String, from_book: bool },
+    /// Chats und Nachrichten aus dem Verlauf-Sync nach der Verknüpfung.
+    History(Vec<HistChat>),
     SendFailed(String),
+}
+
+pub struct HistChat {
+    pub jid: Jid,
+    pub name: String,
+    pub is_group: bool,
+    pub last_ts: i64,
+    pub unread: u32,
+    pub msgs: Vec<ChatMessage>,
 }
 
 /// Was die Oberfläche dem Backend aufträgt.
@@ -52,6 +63,68 @@ fn describe(message: &wa::Message, media_type: &str) -> String {
 /// Text noch Medien und werden nicht angezeigt.
 fn is_visible(message: &wa::Message, media_type: &str) -> bool {
     message.text_content().is_some() || message.get_caption().is_some() || !media_type.is_empty()
+}
+
+/// Verlauf-Sync (Chats, Nachrichten, Namen) in Anzeigedaten umwandeln.
+fn convert_history(h: &wa::HistorySync, send: &impl Fn(UiEvent)) {
+    for p in &h.pushnames {
+        if let (Some(id), Some(name)) = (&p.id, &p.pushname) {
+            let user = user_of(id);
+            if !user.is_empty() && !name.is_empty() {
+                send(UiEvent::Contact { user, name: name.clone(), from_book: false });
+            }
+        }
+    }
+    let mut chats = Vec::new();
+    for c in &h.conversations {
+        let Ok(jid) = c.id.parse::<Jid>() else { continue };
+        if jid.server == whatsapp_rust::Server::Broadcast || jid.server == whatsapp_rust::Server::Newsletter {
+            continue;
+        }
+        let is_group = jid.server == whatsapp_rust::Server::Group;
+        let mut msgs = Vec::new();
+        // Nur die letzten Nachrichten übernehmen, das hält den Start schnell.
+        let skip = c.messages.len().saturating_sub(60);
+        for hm in &c.messages[skip..] {
+            let wm = &hm.message;
+            let Some(inner) = wm.message.as_option() else { continue };
+            let text = match inner.text_content().or_else(|| inner.get_caption()) {
+                Some(t) => t.to_owned(),
+                None => continue,
+            };
+            let key = &wm.key;
+            msgs.push(ChatMessage {
+                chat: jid.clone(),
+                is_group,
+                from_me: key.from_me.unwrap_or(false),
+                sender_name: wm
+                    .push_name
+                    .clone()
+                    .or_else(|| wm.participant.as_deref().map(user_of))
+                    .unwrap_or_default(),
+                text,
+                ts: wm.message_timestamp.unwrap_or(0) as i64,
+                id: key.id.clone().unwrap_or_default(),
+            });
+        }
+        let last_ts = c
+            .conversation_timestamp
+            .or(c.last_msg_timestamp)
+            .map(|t| t as i64)
+            .or_else(|| msgs.last().map(|m| m.ts))
+            .unwrap_or(0);
+        chats.push(HistChat {
+            jid,
+            name: c.name.clone().unwrap_or_default(),
+            is_group,
+            last_ts,
+            unread: c.unread_count.unwrap_or(0),
+            msgs,
+        });
+    }
+    if !chats.is_empty() {
+        send(UiEvent::History(chats));
+    }
 }
 
 fn user_of(jid: &str) -> String {
@@ -137,7 +210,7 @@ pub fn spawn(
                         }
                     })
                     .on_event_for(
-                        &[EventKind::ContactUpdate, EventKind::PushNameUpdate],
+                        &[EventKind::ContactUpdate, EventKind::PushNameUpdate, EventKind::HistorySync],
                         move |event, _client| {
                             let s = s_ev.clone();
                             async move {
@@ -161,6 +234,11 @@ pub fn spawn(
                                         }
                                         for user in users.into_iter().filter(|u| !u.is_empty()) {
                                             s(UiEvent::Contact { user, name: name.clone(), from_book: true });
+                                        }
+                                    }
+                                    Event::HistorySync(h) => {
+                                        if let Some(hs) = h.get() {
+                                            convert_history(hs, &s);
                                         }
                                     }
                                     Event::PushNameUpdate(p) if !p.new_push_name.is_empty() => {

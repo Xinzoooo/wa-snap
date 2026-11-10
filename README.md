@@ -5,17 +5,21 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.1)
+## Funktionen (v0.2)
 
 - Verknüpfung per QR-Code, die Sitzung bleibt gespeichert
 - WhatsApp-ähnliche Oberfläche: Chatliste mit Rundbildern, Suche, Ungelesen-Zähler, grüne Sprechblasen
 - Namen aus dem Adressbuch (sobald WhatsApp sie synchronisiert hat), sonst Push-Namen
 - Interne Sync-Nachrichten werden ausgeblendet, Uhrzeit in deiner Zeitzone
 - Nachrichten empfangen und Textnachrichten senden (Enter)
+- Bestehende Chats, Gruppennamen und der letzte Verlauf werden nach der Verknüpfung aus dem Verlauf-Sync übernommen
+- Desktop-Benachrichtigungen (an/aus, mit oder ohne Textvorschau), Chats einzeln stummschalten
+- Einstellungen: Benachrichtigungen, Autostart (Linux), Schriftgröße
+- Neuer Chat per Telefonnummer (Nummer in die Suche tippen)
 - Medien erscheinen als Platzhalter, z. B. `[image]`
 - Dunkles Design, läuft unter Linux, Windows und macOS (getestet nur unter Linux)
 
-**Noch nicht vorhanden:** Nachrichtenverlauf nach Neustart, Gruppennamen, Profilbilder, Bilder/Dokumente/Sprachnachrichten, Anrufe. Der Login mit einem echten Konto ist bisher nicht ausführlich getestet. Fehler bitte als Issue melden.
+**Noch nicht vorhanden:** Nachrichtenverlauf nach Neustart (nur der Sync nach dem Verknüpfen), Profilbilder, Bilder/Dokumente/Sprachnachrichten, Anrufe, Antworten/Reaktionen, Gruppen anlegen. Der Login mit einem echten Konto ist bisher nicht ausführlich getestet. Fehler bitte als Issue melden.
 
 ## Download und Installation
 
@@ -37,6 +41,14 @@ cargo run --release
 ```
 
 Der erste Build dauert einige Minuten, danach startet das Programm sofort. Beim ersten Start erscheint ein QR-Code. Scanne ihn am Handy unter **WhatsApp → Verknüpfte Geräte → Gerät hinzufügen**.
+
+## Im Anwendungsmenü und in der Taskleiste (Linux)
+
+```bash
+wa-snap --install-desktop
+```
+
+Das legt einen Startmenü-Eintrag mit Icon an. Danach findest du wa-snap im Anwendungsmenü und kannst es per Rechtsklick an die Taskleiste anheften.
 
 ## Daten
 
