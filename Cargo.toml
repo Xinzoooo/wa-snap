@@ -19,3 +19,15 @@ notify-rust = "4"
 lto = "thin"
 strip = true
 codegen-units = 4
+
+[package.metadata.generate-rpm]
+name = "wa-snap"
+summary = "Schneller nativer WhatsApp-Desktop-Client (inoffiziell)"
+license = "MIT"
+url = "https://github.com/Xinzoooo/wa-snap"
+assets = [
+  { source = "target/release/wa-snap", dest = "/usr/bin/wa-snap", mode = "755" },
+  { source = "assets/wa-snap-system.desktop", dest = "/usr/share/applications/wa-snap.desktop", mode = "644" },
+  { source = "assets/wa-snap.svg", dest = "/usr/share/icons/hicolor/scalable/apps/wa-snap.svg", mode = "644" },
+  { source = "LICENSE", dest = "/usr/share/licenses/wa-snap/LICENSE", mode = "644", doc = true },
+]

@@ -1,0 +1,27 @@
+name: Release
+
+# Baut das RPM-Paket und hängt es an ein GitHub-Release.
+# Auslösen: neuen Tag pushen (git tag v0.2.1 && git push --tags)
+# oder unter Actions -> Release -> "Run workflow".
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rpm:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-generate-rpm --locked
+      - run: cargo build --release
+      - run: cargo generate-rpm
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: target/generate-rpm/*.rpm

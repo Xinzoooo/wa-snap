@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=wa-snap
+GenericName=WhatsApp-Client
+Comment=Schneller nativer WhatsApp-Desktop-Client
+Exec=wa-snap
+Icon=wa-snap
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+StartupWMClass=wa-snap

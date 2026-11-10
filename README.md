@@ -21,7 +21,17 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 **Noch nicht vorhanden:** Nachrichtenverlauf nach Neustart (nur der Sync nach dem Verknüpfen), Profilbilder, Bilder/Dokumente/Sprachnachrichten, Anrufe, Antworten/Reaktionen, Gruppen anlegen. Der Login mit einem echten Konto ist bisher nicht ausführlich getestet. Fehler bitte als Issue melden.
 
-## Download und Installation
+## Installation auf Fedora (empfohlen)
+
+Ein Befehl, danach findest du wa-snap in der Anwendungssuche und kannst es an die Taskleiste anheften:
+
+```bash
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.2.0-1.x86_64.rpm
+```
+
+Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
+
+## Aus dem Quellcode bauen
 
 Du brauchst [Rust](https://rustup.rs) (stabile Version) und einen C-Compiler (unter Fedora: `sudo dnf install gcc`, unter Debian/Ubuntu: `sudo apt install build-essential`).
 
