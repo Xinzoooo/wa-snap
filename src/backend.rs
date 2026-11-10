@@ -15,6 +15,8 @@ pub enum UiEvent {
     Connected,
     LoggedOut,
     Message(ChatMessage),
+    /// Anzeigename für eine Rufnummer/LID (Adressbuch hat Vorrang vor Push-Namen).
+    Contact { user: String, name: String, from_book: bool },
     SendFailed(String),
 }
 
@@ -43,11 +45,17 @@ fn describe(message: &wa::Message, media_type: &str) -> String {
     if let Some(c) = message.get_caption() {
         return format!("[{media_type}] {c}");
     }
-    if media_type.is_empty() {
-        "[nicht unterstützter Nachrichtentyp]".to_owned()
-    } else {
-        format!("[{media_type}]")
-    }
+    format!("[{media_type}]")
+}
+
+/// Interne Nachrichten (Schlüsselabgleich, Verlauf-Sync, Reaktionen …) haben weder
+/// Text noch Medien und werden nicht angezeigt.
+fn is_visible(message: &wa::Message, media_type: &str) -> bool {
+    message.text_content().is_some() || message.get_caption().is_some() || !media_type.is_empty()
+}
+
+fn user_of(jid: &str) -> String {
+    jid.split('@').next().unwrap_or("").split(':').next().unwrap_or("").to_owned()
 }
 
 pub fn spawn(
@@ -83,8 +91,13 @@ pub fn spawn(
                     }
                 };
 
-                let (s_qr, s_conn, s_out, s_msg) =
-                    (send.clone(), send.clone(), send.clone(), send.clone());
+                let (s_qr, s_conn, s_out, s_msg, s_ev) = (
+                    send.clone(),
+                    send.clone(),
+                    send.clone(),
+                    send.clone(),
+                    send.clone(),
+                );
 
                 let bot = Bot::builder()
                     .with_backend(store)
@@ -104,6 +117,9 @@ pub fn spawn(
                         let s = s_msg.clone();
                         async move {
                             let info = &ctx.info;
+                            if !is_visible(&ctx.message, &info.media_type) {
+                                return;
+                            }
                             let msg = ChatMessage {
                                 chat: info.source.chat.clone(),
                                 is_group: info.source.is_group,
@@ -120,6 +136,45 @@ pub fn spawn(
                             s(UiEvent::Message(msg));
                         }
                     })
+                    .on_event_for(
+                        &[EventKind::ContactUpdate, EventKind::PushNameUpdate],
+                        move |event, _client| {
+                            let s = s_ev.clone();
+                            async move {
+                                match &*event {
+                                    Event::ContactUpdate(c) => {
+                                        let a = &c.action;
+                                        let name = a
+                                            .full_name
+                                            .clone()
+                                            .or_else(|| a.first_name.clone())
+                                            .unwrap_or_default();
+                                        if name.is_empty() {
+                                            return;
+                                        }
+                                        let mut users = vec![c.jid.user.to_string()];
+                                        if let Some(l) = &a.lid_jid {
+                                            users.push(user_of(l));
+                                        }
+                                        if let Some(p) = &a.pn_jid {
+                                            users.push(user_of(p));
+                                        }
+                                        for user in users.into_iter().filter(|u| !u.is_empty()) {
+                                            s(UiEvent::Contact { user, name: name.clone(), from_book: true });
+                                        }
+                                    }
+                                    Event::PushNameUpdate(p) if !p.new_push_name.is_empty() => {
+                                        s(UiEvent::Contact {
+                                            user: p.jid.user.to_string(),
+                                            name: p.new_push_name.clone(),
+                                            from_book: false,
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        },
+                    )
                     .build()
                     .await;
 

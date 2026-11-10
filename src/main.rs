@@ -7,9 +7,13 @@ use backend::{ChatMessage, Cmd, UiEvent};
 use eframe::egui::{self, Color32, RichText};
 use whatsapp_rust::Jid;
 
-const GREEN: Color32 = Color32::from_rgb(0x1f, 0xa8, 0x55);
-const BUBBLE_ME: Color32 = Color32::from_rgb(0x0b, 0x5a, 0x3a);
-const BUBBLE_THEM: Color32 = Color32::from_rgb(0x2a, 0x33, 0x3a);
+const GREEN: Color32 = Color32::from_rgb(0x00, 0xa8, 0x84);
+const BUBBLE_ME: Color32 = Color32::from_rgb(0x00, 0x5c, 0x4b);
+const BUBBLE_THEM: Color32 = Color32::from_rgb(0x20, 0x2c, 0x33);
+const BG_LIST: Color32 = Color32::from_rgb(0x11, 0x1b, 0x21);
+const BG_CHAT: Color32 = Color32::from_rgb(0x0b, 0x14, 0x1a);
+const BG_BAR: Color32 = Color32::from_rgb(0x20, 0x2c, 0x33);
+const TEXT_DIM: Color32 = Color32::from_rgb(0x86, 0x96, 0xa0);
 
 struct Chat {
     jid: Jid,
@@ -35,6 +39,7 @@ struct App {
     status: String,
     qr: Option<String>,
     chats: HashMap<String, Chat>,
+    names: HashMap<String, (String, bool)>,
     selected: Option<String>,
     search: String,
     input: String,
@@ -55,9 +60,38 @@ fn data_dir() -> std::path::PathBuf {
 }
 
 fn fmt_time(ts: i64) -> String {
-    let secs = ts.rem_euclid(86_400);
-    // UTC-Anzeige; lokale Zeitzone bräuchte eine zusätzliche Abhängigkeit.
-    format!("{:02}:{:02}", secs / 3600, (secs % 3600) / 60)
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .map(|d| d.format("%H:%M").to_string())
+        .unwrap_or_default()
+}
+
+fn avatar(ui: &mut egui::Ui, name: &str, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let initial = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
+    let hue = name.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32)) % 6;
+    let colors = [
+        Color32::from_rgb(0x00, 0x80, 0x69),
+        Color32::from_rgb(0x53, 0x6e, 0xb5),
+        Color32::from_rgb(0x9b, 0x59, 0xb6),
+        Color32::from_rgb(0xc0, 0x6c, 0x2e),
+        Color32::from_rgb(0x2e, 0x86, 0x9e),
+        Color32::from_rgb(0xb0, 0x4a, 0x5a),
+    ];
+    ui.painter().circle_filled(rect.center(), size / 2.0, colors[hue as usize]);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        initial,
+        egui::FontId::proportional(size * 0.45),
+        Color32::WHITE,
+    );
 }
 
 impl App {
@@ -76,11 +110,22 @@ impl App {
             status: "Starte …".into(),
             qr: None,
             chats: HashMap::new(),
+            names: HashMap::new(),
             selected: None,
             search: String::new(),
             input: String::new(),
             error: None,
         }
+    }
+
+    fn display_name(&self, chat: &Chat) -> String {
+        if let Some((n, _)) = self.names.get(chat.jid.user.as_str()) {
+            return n.clone();
+        }
+        if chat.is_group {
+            return format!("Gruppe {}", chat.jid.user);
+        }
+        chat.name.clone()
     }
 
     fn ingest(&mut self, m: ChatMessage) {
@@ -123,6 +168,13 @@ impl App {
                 }
                 UiEvent::LoggedOut => self.conn = Conn::LoggedOut,
                 UiEvent::Message(m) => self.ingest(m),
+                UiEvent::Contact { user, name, from_book } => {
+                    // Adressbuch-Namen überschreiben Push-Namen, nicht umgekehrt.
+                    let keep = matches!(self.names.get(&user), Some((_, true))) && !from_book;
+                    if !keep {
+                        self.names.insert(user, (name, from_book));
+                    }
+                }
                 UiEvent::SendFailed(e) => self.error = Some(format!("Senden fehlgeschlagen: {e}")),
             }
         }
@@ -216,51 +268,98 @@ impl eframe::App for App {
 
         egui::SidePanel::left("chats")
             .resizable(true)
-            .default_width(300.0)
+            .default_width(340.0)
+            .frame(egui::Frame::new().fill(BG_LIST))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("Chats");
-                    let (txt, col) = match self.conn {
-                        Conn::Online => ("● online", GREEN),
-                        Conn::LoggedOut => ("● abgemeldet", Color32::LIGHT_RED),
-                        _ => ("● verbinde", Color32::YELLOW),
-                    };
-                    ui.label(RichText::new(txt).color(col).small());
+                egui::Frame::new().fill(BG_BAR).inner_margin(10.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("WhatsApp").size(20.0).strong().color(GREEN));
+                        let (txt, col) = match self.conn {
+                            Conn::Online => ("● online", GREEN),
+                            Conn::LoggedOut => ("● abgemeldet", Color32::LIGHT_RED),
+                            _ => ("● verbinde", Color32::YELLOW),
+                        };
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(txt).color(col).small());
+                        });
+                    });
                 });
-                ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Suchen …"));
-                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Suchen oder neuen Chat beginnen")
+                            .desired_width(ui.available_width() - 8.0),
+                    );
+                });
+                ui.add_space(6.0);
+
                 let needle = self.search.to_lowercase();
-                let mut keys: Vec<&String> = self
+                let mut rows: Vec<(String, String, i64)> = self
                     .chats
                     .iter()
-                    .filter(|(_, c)| needle.is_empty() || c.name.to_lowercase().contains(&needle))
-                    .map(|(k, _)| k)
+                    .map(|(k, c)| (k.clone(), self.display_name(c), c.last_ts))
+                    .filter(|(_, n, _)| needle.is_empty() || n.to_lowercase().contains(&needle))
                     .collect();
-                keys.sort_by_key(|k| std::cmp::Reverse(self.chats[*k].last_ts));
-                let keys: Vec<String> = keys.into_iter().cloned().collect();
+                rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+
                 let mut clicked = None;
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(
                     ui,
-                    44.0,
-                    keys.len(),
+                    64.0,
+                    rows.len(),
                     |ui, range| {
-                        for key in &keys[range] {
+                        for (key, name, ts) in &rows[range] {
                             let c = &self.chats[key];
-                            let last = c.messages.last().map(|m| m.text.as_str()).unwrap_or("");
                             let sel = self.selected.as_deref() == Some(key.as_str());
-                            let title = if c.unread > 0 {
-                                format!("{}  ({})", c.name, c.unread)
-                            } else {
-                                c.name.clone()
-                            };
-                            let preview: String = last.chars().take(34).collect();
-                            let resp = ui.add_sized(
-                                [ui.available_width(), 40.0],
-                                egui::SelectableLabel::new(
-                                    sel,
-                                    RichText::new(format!("{title}\n{preview}")),
-                                ),
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 64.0),
+                                egui::Sense::click(),
                             );
+                            let bg = if sel {
+                                BG_BAR
+                            } else if resp.hovered() {
+                                Color32::from_rgb(0x17, 0x22, 0x29)
+                            } else {
+                                BG_LIST
+                            };
+                            ui.painter().rect_filled(rect, 0.0, bg);
+                            let mut inner = ui.new_child(
+                                egui::UiBuilder::new()
+                                    .max_rect(rect.shrink2(egui::vec2(12.0, 8.0)))
+                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                            );
+                            avatar(&mut inner, name, 46.0);
+                            inner.add_space(10.0);
+                            let right_w = 44.0;
+                            let text_w = (inner.available_width() - right_w).max(20.0);
+                            inner.allocate_ui(egui::vec2(text_w, 46.0), |ui| {
+                                ui.vertical(|ui| {
+                                    ui.add(egui::Label::new(RichText::new(name).size(15.0).strong()).truncate());
+                                    let last = c.messages.last().map(|m| m.text.as_str()).unwrap_or("");
+                                    ui.add(
+                                        egui::Label::new(RichText::new(last).small().color(TEXT_DIM))
+                                            .truncate(),
+                                    );
+                                });
+                            });
+                            inner.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(fmt_time(*ts))
+                                        .small()
+                                        .color(if c.unread > 0 { GREEN } else { TEXT_DIM }),
+                                );
+                                if c.unread > 0 {
+                                    ui.label(
+                                        RichText::new(format!(" {} ", c.unread))
+                                            .small()
+                                            .strong()
+                                            .color(Color32::BLACK)
+                                            .background_color(GREEN),
+                                    );
+                                }
+                            });
                             if resp.clicked() {
                                 clicked = Some(key.clone());
                             }
@@ -275,62 +374,86 @@ impl eframe::App for App {
                 }
             });
 
-        egui::TopBottomPanel::bottom("input").show(ctx, |ui| {
-            if let Some(e) = self.error.clone() {
-                ui.colored_label(Color32::LIGHT_RED, e);
-            }
-            ui.horizontal(|ui| {
-                let enabled = self.selected.is_some() && self.conn == Conn::Online;
-                let resp = ui.add_enabled(
-                    enabled,
-                    egui::TextEdit::singleline(&mut self.input)
-                        .hint_text("Nachricht schreiben …")
-                        .desired_width(ui.available_width() - 80.0),
-                );
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let btn = ui.add_enabled(enabled, egui::Button::new("Senden"));
-                if enter || btn.clicked() {
-                    self.send_current();
-                    resp.request_focus();
+        egui::TopBottomPanel::bottom("input")
+            .frame(egui::Frame::new().fill(BG_BAR).inner_margin(10.0))
+            .show(ctx, |ui| {
+                if let Some(e) = self.error.clone() {
+                    ui.colored_label(Color32::LIGHT_RED, e);
                 }
-            });
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(key) = self.selected.clone() else {
-                ui.centered_and_justified(|ui| ui.label("Wähle links einen Chat."));
-                return;
-            };
-            let Some(chat) = self.chats.get(&key) else { return };
-            ui.heading(&chat.name);
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .stick_to_bottom(true)
-                .show_rows(ui, 38.0, chat.messages.len(), |ui, range| {
-                    for m in &chat.messages[range] {
-                        let (bg, align) = if m.from_me {
-                            (BUBBLE_ME, egui::Align::Max)
-                        } else {
-                            (BUBBLE_THEM, egui::Align::Min)
-                        };
-                        ui.with_layout(egui::Layout::top_down(align), |ui| {
-                            egui::Frame::new()
-                                .fill(bg)
-                                .corner_radius(8.0)
-                                .inner_margin(6.0)
-                                .show(ui, |ui| {
-                                    ui.set_max_width(ui.available_width() * 0.75);
-                                    if chat.is_group && !m.from_me {
-                                        ui.label(RichText::new(&m.sender_name).small().color(GREEN));
-                                    }
-                                    ui.label(&m.text);
-                                    ui.label(RichText::new(fmt_time(m.ts)).small().weak());
-                                });
-                        });
+                ui.horizontal(|ui| {
+                    let enabled = self.selected.is_some() && self.conn == Conn::Online;
+                    let resp = ui.add_enabled(
+                        enabled,
+                        egui::TextEdit::singleline(&mut self.input)
+                            .hint_text("Nachricht eingeben")
+                            .desired_width(ui.available_width() - 90.0)
+                            .margin(egui::vec2(10.0, 8.0)),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let btn = ui.add_enabled(
+                        enabled,
+                        egui::Button::new(RichText::new("Senden").strong().color(Color32::WHITE))
+                            .fill(GREEN)
+                            .min_size(egui::vec2(72.0, 34.0)),
+                    );
+                    if enter || btn.clicked() {
+                        self.send_current();
+                        resp.request_focus();
                     }
                 });
-        });
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(BG_CHAT))
+            .show(ctx, |ui| {
+                let Some(key) = self.selected.clone() else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("Wähle links einen Chat").color(TEXT_DIM).size(18.0));
+                    });
+                    return;
+                };
+                let Some(chat) = self.chats.get(&key) else { return };
+                let title = self.display_name(chat);
+                egui::Frame::new().fill(BG_BAR).inner_margin(10.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        avatar(ui, &title, 38.0);
+                        ui.label(RichText::new(&title).size(17.0).strong());
+                    });
+                });
+                // Nur die letzten Nachrichten zeichnen: schnell auch bei langen Chats.
+                let start = chat.messages.len().saturating_sub(300);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.add_space(8.0);
+                        for m in &chat.messages[start..] {
+                            let (bg, align) = if m.from_me {
+                                (BUBBLE_ME, egui::Align::Max)
+                            } else {
+                                (BUBBLE_THEM, egui::Align::Min)
+                            };
+                            ui.with_layout(egui::Layout::top_down(align), |ui| {
+                                egui::Frame::new()
+                                    .fill(bg)
+                                    .corner_radius(10.0)
+                                    .inner_margin(egui::Margin::symmetric(10, 6))
+                                    .outer_margin(egui::Margin::symmetric(14, 2))
+                                    .show(ui, |ui| {
+                                        ui.set_max_width((ui.available_width() * 0.72).max(120.0));
+                                        if chat.is_group && !m.from_me {
+                                            ui.label(RichText::new(&m.sender_name).small().strong().color(GREEN));
+                                        }
+                                        ui.label(&m.text);
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                            ui.label(RichText::new(fmt_time(m.ts)).size(10.5).color(TEXT_DIM));
+                                        });
+                                    });
+                            });
+                        }
+                    });
+            });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

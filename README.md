@@ -8,12 +8,14 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 ## Funktionen (v0.1)
 
 - Verknüpfung per QR-Code, die Sitzung bleibt gespeichert
-- Chatliste mit Suche, Ungelesen-Zähler und Sortierung nach letzter Nachricht
+- WhatsApp-ähnliche Oberfläche: Chatliste mit Rundbildern, Suche, Ungelesen-Zähler, grüne Sprechblasen
+- Namen aus dem Adressbuch (sobald WhatsApp sie synchronisiert hat), sonst Push-Namen
+- Interne Sync-Nachrichten werden ausgeblendet, Uhrzeit in deiner Zeitzone
 - Nachrichten empfangen und Textnachrichten senden (Enter)
 - Medien erscheinen als Platzhalter, z. B. `[image]`
 - Dunkles Design, läuft unter Linux, Windows und macOS (getestet nur unter Linux)
 
-**Noch nicht vorhanden:** Nachrichtenverlauf nach Neustart, Namen aus dem Adressbuch und Gruppennamen, Bilder/Dokumente/Sprachnachrichten, Anrufe, Zeitzone (Uhrzeiten sind UTC). Der Login mit einem echten Konto ist bisher nicht ausführlich getestet. Fehler bitte als Issue melden.
+**Noch nicht vorhanden:** Nachrichtenverlauf nach Neustart, Gruppennamen, Profilbilder, Bilder/Dokumente/Sprachnachrichten, Anrufe. Der Login mit einem echten Konto ist bisher nicht ausführlich getestet. Fehler bitte als Issue melden.
 
 ## Download und Installation
 

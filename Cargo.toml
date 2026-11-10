@@ -10,6 +10,7 @@ whatsapp-rust = { version = "0.7", default-features = false, features = ["tokio-
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 eframe = "0.31"
 qrcode = { version = "0.14", default-features = false }
+chrono = "0.4"
 
 [profile.release]
 lto = "thin"
