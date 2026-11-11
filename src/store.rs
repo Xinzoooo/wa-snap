@@ -6,6 +6,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+fn is_default_extra(x: &crate::backend::MsgExtra) -> bool {
+    *x == crate::backend::MsgExtra::default()
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "t")]
 pub enum Rec {
@@ -26,6 +30,8 @@ pub enum Rec {
         media: Option<crate::backend::MediaRef>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quote: Option<crate::backend::Quote>,
+        #[serde(default, skip_serializing_if = "is_default_extra")]
+        x: crate::backend::MsgExtra,
     },
     #[serde(rename = "chat")]
     Chat { jid: String, name: String, is_group: bool, last_ts: i64 },
@@ -42,6 +48,11 @@ pub enum Rec {
     Del { id: String },
     #[serde(rename = "ed")]
     Edit { id: String, text: String },
+    #[serde(rename = "star")]
+    Star { id: String, on: bool },
+    /// Stimme in einer Umfrage; `voter` leer = ich.
+    #[serde(rename = "vote")]
+    Vote { poll: String, voter: String, options: Vec<String> },
 }
 
 pub struct Store {
@@ -91,6 +102,7 @@ mod tests {
                 st: 2,
                 media: None,
                 quote: None,
+                x: Default::default(),
             });
             s.append(&Rec::Name { user: "49151".into(), name: "Anna".into(), book: true });
         }

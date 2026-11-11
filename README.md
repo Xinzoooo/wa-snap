@@ -5,7 +5,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.7)
+## Funktionen (v0.8)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - Bunte Emojis (Twemoji) in Nachrichten, Chatliste und Emoji-Auswahl mit Kategorien; reine Emoji-Nachrichten werden groß angezeigt
@@ -22,6 +22,13 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Knopf „Nach unten“ mit Zähler neuer Nachrichten; Klick auf ein Zitat springt zur Originalnachricht
 - Weiterleiten (auch Fotos, Sticker, Dokumente ohne neuen Upload)
 - Stummschalten für 8 Stunden, 1 Woche oder immer
+- Eigene Nachrichten bearbeiten (bis 15 Minuten), „Bearbeitet“-Hinweis
+- @Erwähnungen in Gruppen mit Vorschlagsliste; Erwähnungen werden mit Namen hervorgehoben
+- Nachrichten mit Stern markieren (abgeglichen mit WhatsApp), Übersicht über ☆ in der linken Leiste
+- Umfragen anzeigen und abstimmen, Standort (Öffnen in OpenStreetMap), Kontaktkarten mit „Chat starten“, Link-Vorschau
+- Einmal-Ansicht und selbstlöschende Nachrichten werden gekennzeichnet; in Chats mit Selbstlöschen gilt das auch für eigene Nachrichten
+- Suche über alle Chats: passende Nachrichten erscheinen unter der Suche, Klick springt hin
+- Ältere Nachrichten: Knopf oben im Chat zeigt mehr an bzw. lädt weitere vom Handy; beim Verknüpfen werden bis zu 300 Nachrichten pro Chat übernommen
 - Tastenkürzel: Strg+F Suche, Strg+N neuer Chat, Esc schließt, Alt+↑/↓ wechselt den Chat
 - Verknüpfung per QR-Code, die Sitzung bleibt gespeichert; beim Verknüpfen wird der Verlauf der letzten 365 Tage angefordert
 - Verlauf wird lokal gespeichert und ist nach dem Neustart wieder da
@@ -42,7 +49,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.7.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.8.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.

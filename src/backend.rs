@@ -46,6 +46,12 @@ pub enum UiEvent {
     Typing { chat: String, from: String, on: bool, recording: bool },
     /// Online-Status eines Kontakts; `last_seen` in Sekunden.
     Presence { user: String, online: bool, last_seen: Option<i64> },
+    /// Stern gesetzt/entfernt (auch vom Handy).
+    Starred { id: String, on: bool },
+    /// Entschlüsselte Stimme einer Umfrage; leere Liste = Stimme zurückgezogen.
+    PollVote { poll: String, voter: String, options: Vec<String> },
+    /// Gruppenmitglieder (für @Erwähnungen): Gruppe → [(Nummer/LID, Nummer)]
+    Members { group: String, members: Vec<(String, String)> },
     /// Eigene Nummer und LID (um eigene zitierte Nachrichten zu erkennen).
     Me(Vec<String>),
     /// Reaktion auf eine Nachricht; leeres Emoji = Reaktion entfernt.
@@ -60,7 +66,17 @@ pub enum UiEvent {
 
 /// Was die Oberfläche dem Backend aufträgt.
 pub enum Cmd {
-    Send { chat: Jid, text: String, temp: String, quote: Option<Quote> },
+    Send { chat: Jid, text: String, temp: String, quote: Option<Quote>, mentions: Vec<String>, expiration: u32 },
+    /// Eigene Nachricht bearbeiten.
+    Edit { chat: Jid, id: String, text: String },
+    /// Nachricht mit Stern markieren (oder Markierung entfernen).
+    Star { chat: Jid, id: String, from_me: bool, sender: String, on: bool },
+    /// Ältere Nachrichten vom Handy anfordern (vor der ältesten bekannten).
+    LoadOlder { chat: Jid, id: String, from_me: bool, ts: i64 },
+    /// In einer Umfrage abstimmen.
+    Vote { chat: Jid, poll: String, creator: String, secret: Vec<u8>, options: Vec<String> },
+    /// Gespeicherte Umfragen bekannt machen, damit Stimmen entschlüsselt werden können.
+    RegisterPolls(Vec<(String, Vec<u8>, String, Vec<String>)>),
     /// Mit Emoji reagieren (leer = Reaktion entfernen).
     React { chat: Jid, target: Quote, from_me: bool, emoji: String },
     /// Eigene Nachricht für alle löschen.
@@ -348,6 +364,124 @@ pub struct ChatMessage {
     pub status: u8,
     pub media: Option<MediaRef>,
     pub quote: Option<Quote>,
+    pub x: MsgExtra,
+}
+
+/// Weitere Eigenschaften einer Nachricht (Umfrage, Standort, Kontakt, Link, Markierungen).
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct MsgExtra {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<Extra>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub edited: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub view_once: bool,
+    /// Selbstlöschend nach so vielen Sekunden (0 = aus).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub expiration: u32,
+    /// Erwähnte Nummern/LIDs (ohne @server).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(tag = "t")]
+pub enum Extra {
+    Poll { name: String, options: Vec<String>, secret: Vec<u8>, multi: bool },
+    Location { lat: f64, lon: f64, name: String, address: String, live: bool },
+    Contact { name: String, vcard: String },
+    Link { url: String, title: String, description: String },
+}
+
+impl Extra {
+    pub fn label(&self) -> String {
+        match self {
+            Extra::Poll { name, .. } => format!("📊 {name}"),
+            Extra::Location { name, live, .. } => {
+                let base = if *live { "📍 Live-Standort" } else { "📍 Standort" };
+                if name.is_empty() { base.to_owned() } else { format!("{base}: {name}") }
+            }
+            Extra::Contact { name, .. } => format!("👤 {name}"),
+            Extra::Link { .. } => String::new(),
+        }
+    }
+}
+
+/// Umfragen, deren Stimmen das Backend entschlüsseln kann: ID → (Geheimnis, Ersteller, Optionen).
+static POLLS: std::sync::Mutex<Option<HashMap<String, (Vec<u8>, String, Vec<String>)>>> = std::sync::Mutex::new(None);
+
+fn remember_poll(id: &str, secret: &[u8], creator: &str, options: &[String]) {
+    if secret.is_empty() {
+        return;
+    }
+    if let Ok(mut g) = POLLS.lock() {
+        g.get_or_insert_with(HashMap::new).insert(id.to_owned(), (secret.to_vec(), creator.to_owned(), options.to_vec()));
+    }
+}
+
+/// Umfrage, Standort, Kontakt, Link, Einmal-Ansicht, Selbstlöschen und Erwähnungen lesen.
+pub fn extra_of(msg: &wa::Message) -> MsgExtra {
+    let b = msg.get_base_message();
+    let mut x = MsgExtra { view_once: msg.is_view_once(), ..Default::default() };
+    let secret = msg
+        .message_context_info
+        .as_option()
+        .and_then(|c| c.message_secret.clone())
+        .or_else(|| b.message_context_info.as_option().and_then(|c| c.message_secret.clone()))
+        .unwrap_or_default();
+    let poll = b
+        .poll_creation_message
+        .as_option()
+        .or_else(|| b.poll_creation_message_v2.as_option())
+        .or_else(|| b.poll_creation_message_v3.as_option());
+    if let Some(p) = poll {
+        x.kind = Some(Extra::Poll {
+            name: p.name.clone().unwrap_or_default(),
+            options: p.options.iter().filter_map(|o| o.option_name.clone()).collect(),
+            secret,
+            multi: p.selectable_options_count.unwrap_or(0) != 1,
+        });
+    } else if let Some(l) = b.location_message.as_option() {
+        x.kind = Some(Extra::Location {
+            lat: l.degrees_latitude.unwrap_or(0.0),
+            lon: l.degrees_longitude.unwrap_or(0.0),
+            name: l.name.clone().unwrap_or_default(),
+            address: l.address.clone().unwrap_or_default(),
+            live: false,
+        });
+    } else if let Some(l) = b.live_location_message.as_option() {
+        x.kind = Some(Extra::Location {
+            lat: l.degrees_latitude.unwrap_or(0.0),
+            lon: l.degrees_longitude.unwrap_or(0.0),
+            name: String::new(),
+            address: String::new(),
+            live: true,
+        });
+    } else if let Some(c) = b.contact_message.as_option() {
+        x.kind = Some(Extra::Contact { name: c.display_name.clone().unwrap_or_default(), vcard: c.vcard.clone().unwrap_or_default() });
+    } else if let Some(e) = b.extended_text_message.as_option() {
+        let url = e.matched_text.clone().unwrap_or_default();
+        let title = e.title.clone().unwrap_or_default();
+        if !url.is_empty() && !title.is_empty() {
+            x.kind = Some(Extra::Link { url, title, description: e.description.clone().unwrap_or_default() });
+        }
+    }
+    let ci = b
+        .extended_text_message
+        .as_option()
+        .and_then(|m| m.context_info.as_option())
+        .or_else(|| b.image_message.as_option().and_then(|m| m.context_info.as_option()))
+        .or_else(|| b.video_message.as_option().and_then(|m| m.context_info.as_option()))
+        .or_else(|| b.document_message.as_option().and_then(|m| m.context_info.as_option()));
+    if let Some(ci) = ci {
+        x.expiration = ci.expiration.unwrap_or(0);
+        x.mentions = ci.mentioned_jid.iter().map(|j| user_of(j)).collect();
+    }
+    x
 }
 
 /// Was das Backend für Benachrichtigungen wissen muss. Die Oberfläche hält es aktuell.
@@ -453,6 +587,7 @@ fn maybe_notify(state: &SharedNotify, m: &ChatMessage) {
             }
         });
         let text = match &m.media {
+            None if m.text.is_empty() => m.x.kind.as_ref().map(|k| k.label()).unwrap_or_default(),
             Some(md) if m.text.is_empty() => md.label(),
             Some(md) => format!("{} {}", md.label(), m.text),
             None => m.text.clone(),
@@ -526,16 +661,18 @@ fn convert_history(h: &wa::HistorySync, send: &impl Fn(UiEvent)) {
         let is_group = jid.server == whatsapp_rust::Server::Group;
         let mut msgs = Vec::new();
         // Nur die letzten Nachrichten übernehmen, das hält den Start schnell.
-        let skip = c.messages.len().saturating_sub(80);
+        let skip = c.messages.len().saturating_sub(300);
         for hm in &c.messages[skip..] {
             let wm = &hm.message;
             let Some(inner) = wm.message.as_option() else { continue };
             let key = &wm.key;
             let media = media_of(inner);
-            let text = match (inner.text_content(), &media) {
-                (Some(t), _) => t.to_owned(),
-                (None, Some((_, _, cap))) => cap.clone().unwrap_or_default(),
-                (None, None) => continue,
+            let x = extra_of(inner);
+            let text = match (inner.text_content(), &media, &x.kind) {
+                (Some(t), _, _) => t.to_owned(),
+                (None, Some((_, _, cap)), _) => cap.clone().unwrap_or_default(),
+                (None, None, Some(_)) => String::new(),
+                (None, None, None) => continue,
             };
             let id = key.id.clone().unwrap_or_default();
             if let Some((_, Some(th), _)) = &media {
@@ -563,7 +700,13 @@ fn convert_history(h: &wa::HistorySync, send: &impl Fn(UiEvent)) {
                 status: if from_me { 2 } else { 0 },
                 media: media.map(|m| m.0),
                 quote: quote_of(inner),
+                x,
             });
+            if let Some(m) = msgs.last() {
+                if let Some(Extra::Poll { secret, options, .. }) = &m.x.kind {
+                    remember_poll(&m.id, secret, &m.sender, options);
+                }
+            }
         }
         let last_ts = c
             .conversation_timestamp
@@ -773,6 +916,7 @@ async fn send_file(
         status: 0,
         media: Some(mref.clone()),
         quote: None,
+        x: Default::default(),
     }));
     let key = chat.to_string();
     let fail = |e: String| {
@@ -903,6 +1047,14 @@ pub fn spawn(
                             match client.groups().get_participating().await {
                                 Ok(map) => {
                                     log(format!("Gruppen vom Server: {}", map.len()));
+                                    for (j, m) in &map {
+                                        let members = m
+                                            .participants
+                                            .iter()
+                                            .map(|p| (p.jid.user.to_string(), p.phone_number.as_ref().map(|n| n.user.to_string()).unwrap_or_default()))
+                                            .collect();
+                                        s(UiEvent::Members { group: j.user.to_string(), members });
+                                    }
                                     s(UiEvent::Groups(
                                         map.into_iter().map(|(j, m)| (j, m.subject)).collect(),
                                     ));
@@ -923,6 +1075,7 @@ pub fn spawn(
                         let st = n_msg.clone();
                         async move {
                             let info = &ctx.info;
+                            let client = ctx.client.clone();
                             log(format!(
                                 "Nachricht {} von_mir={} typ='{}'",
                                 info.source.chat, info.source.is_from_me, info.media_type
@@ -932,6 +1085,36 @@ pub fn spawn(
                                 if let Some(target) = r.key.as_option().and_then(|k| k.id.clone()) {
                                     let from = if info.source.is_from_me { String::new() } else { info.source.sender.user.to_string() };
                                     s(UiEvent::Reaction { target, from, emoji: r.text.clone().unwrap_or_default() });
+                                }
+                                return;
+                            }
+                            if let Some(pu) = base.poll_update_message.as_option() {
+                                let poll_id = pu.poll_creation_message_key.as_option().and_then(|k| k.id.clone()).unwrap_or_default();
+                                let known = POLLS.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&poll_id).cloned()));
+                                let (Some((secret, creator, options)), Some(v)) = (known, pu.vote.as_option()) else {
+                                    log(format!("Stimme für unbekannte Umfrage {poll_id}"));
+                                    return;
+                                };
+                                let creator_jid = if creator.is_empty() {
+                                    client.pn().unwrap_or_default()
+                                } else {
+                                    creator.parse::<Jid>().unwrap_or_default()
+                                };
+                                let ct = whatsapp_rust::features::PollVoteCiphertext {
+                                    enc_payload: v.enc_payload.as_deref().unwrap_or(&[]),
+                                    enc_iv: v.enc_iv.as_deref().unwrap_or(&[]),
+                                };
+                                match client.polls().decrypt_vote(ct, &secret, &poll_id, &creator_jid, &info.source.sender).await {
+                                    Ok(hashes) => {
+                                        let chosen: Vec<String> = options
+                                            .iter()
+                                            .filter(|o| hashes.iter().any(|h| h.as_slice() == whatsapp_rust::wacore::poll::compute_option_hash(o).as_slice()))
+                                            .cloned()
+                                            .collect();
+                                        let voter = if info.source.is_from_me { String::new() } else { info.source.sender.user.to_string() };
+                                        s(UiEvent::PollVote { poll: poll_id, voter, options: chosen });
+                                    }
+                                    Err(e) => log(format!("Stimme entschlüsseln fehlgeschlagen: {e}")),
                                 }
                                 return;
                             }
@@ -949,7 +1132,8 @@ pub fn spawn(
                                 }
                                 return;
                             }
-                            if !is_visible(&ctx.message, &info.media_type) {
+                            let x = extra_of(&ctx.message);
+                            if !is_visible(&ctx.message, &info.media_type) && x.kind.is_none() {
                                 return;
                             }
                             let media = media_of(&ctx.message);
@@ -959,8 +1143,12 @@ pub fn spawn(
                             let text = match (&media, ctx.message.text_content()) {
                                 (_, Some(t)) => t.to_owned(),
                                 (Some((_, _, cap)), None) => cap.clone().unwrap_or_default(),
+                                (None, None) if x.kind.is_some() => String::new(),
                                 (None, None) => describe(&ctx.message, &info.media_type),
                             };
+                            if let Some(Extra::Poll { secret, options, .. }) = &x.kind {
+                                remember_poll(&info.id, secret, &info.source.sender.to_string(), options);
+                            }
                             let msg = ChatMessage {
                                 chat: info.source.chat.clone(),
                                 is_group: info.source.is_group,
@@ -977,6 +1165,7 @@ pub fn spawn(
                                 status: if info.source.is_from_me { 1 } else { 0 },
                                 media: media.map(|m| m.0),
                                 quote: quote_of(&ctx.message),
+                                x,
                             };
                             maybe_notify(&st, &msg);
                             s(UiEvent::Message(msg));
@@ -994,11 +1183,15 @@ pub fn spawn(
                             EventKind::Receipt,
                             EventKind::ChatPresence,
                             EventKind::Presence,
+                            EventKind::StarUpdate,
                         ],
                         move |event, client| {
                             let s = s_ev.clone();
                             async move {
                                 match &*event {
+                                    Event::StarUpdate(st) => {
+                                        s(UiEvent::Starred { id: st.message_id.clone(), on: st.action.starred.unwrap_or(false) });
+                                    }
                                     Event::ChatPresence(c) => {
                                         use whatsapp_rust::wacore::types::presence::{ChatPresence, ChatPresenceMedia};
                                         s(UiEvent::Typing {
@@ -1132,19 +1325,28 @@ pub fn spawn(
                             };
                             let (client, send) = (client.clone(), send.clone());
                             match cmd {
-                                Cmd::Send { chat, text, temp, quote } => {
+                                Cmd::Send { chat, text, temp, quote, mentions, expiration } => {
                                     tokio::spawn(async move {
                                         let key = chat.to_string();
-                                        let msg = match quote {
+                                        let mut ctx = match &quote {
                                             Some(q) => {
-                                                let sender = if q.sender.is_empty() { chat.clone() } else { q.sender.parse::<Jid>().unwrap_or_else(|_| chat.clone()) };
-                                                let ctx = whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
+                                                let sender = if q.sender.is_empty() {
+                                                    client.pn().unwrap_or_else(|| chat.clone())
+                                                } else {
+                                                    q.sender.parse::<Jid>().unwrap_or_else(|_| chat.clone())
+                                                };
+                                                whatsapp_rust::wacore::proto_helpers::build_quote_context_with_info(
                                                     q.id.clone(), &sender, &chat, &chat, &wa::Message::text(q.text.clone()),
-                                                );
-                                                wa::Message::text_with_context(text, ctx)
+                                                )
                                             }
-                                            None => wa::Message::text(text),
+                                            None => wa::ContextInfo::default(),
                                         };
+                                        ctx.mentioned_jid = mentions;
+                                        if expiration > 0 {
+                                            ctx.expiration = Some(expiration);
+                                        }
+                                        let plain = quote.is_none() && ctx.mentioned_jid.is_empty() && expiration == 0;
+                                        let msg = if plain { wa::Message::text(text) } else { wa::Message::text_with_context(text, ctx) };
                                         match client.send_message(&chat, msg).await {
                                             Ok(r) => send(UiEvent::Sent { chat: key, temp, id: r.message_id }),
                                             Err(e) => {
@@ -1153,6 +1355,47 @@ pub fn spawn(
                                             }
                                         }
                                     });
+                                }
+                                Cmd::Edit { chat, id, text } => {
+                                    tokio::spawn(async move {
+                                        match client.edit_message(chat, id.clone(), wa::Message::text(text.clone())).await {
+                                            Ok(_) => send(UiEvent::Edited { id, text }),
+                                            Err(e) => send(UiEvent::Info(format!("Bearbeiten fehlgeschlagen: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::Star { chat, id, from_me, sender, on } => {
+                                    tokio::spawn(async move {
+                                        let part = if chat.is_group() && !from_me { sender.parse::<Jid>().ok() } else { None };
+                                        let ca = client.chat_actions();
+                                        let r = if on {
+                                            ca.star_message(&chat, part.as_ref(), &id, from_me).await
+                                        } else {
+                                            ca.unstar_message(&chat, part.as_ref(), &id, from_me).await
+                                        };
+                                        report(&send, "Markieren", r.map_err(|e| e.to_string()));
+                                    });
+                                }
+                                Cmd::LoadOlder { chat, id, from_me, ts } => {
+                                    tokio::spawn(async move {
+                                        match client.fetch_message_history(&chat, &id, from_me, ts * 1000, 50).await {
+                                            Ok(_) => send(UiEvent::Info("Ältere Nachrichten werden vom Handy geladen …".into())),
+                                            Err(e) => send(UiEvent::Info(format!("Ältere Nachrichten: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::Vote { chat, poll, creator, secret, options } => {
+                                    tokio::spawn(async move {
+                                        let creator_jid = if creator.is_empty() { client.pn().unwrap_or_default() } else { creator.parse::<Jid>().unwrap_or_default() };
+                                        if let Err(e) = client.polls().vote(chat, &poll, &creator_jid, &secret, &options).await {
+                                            send(UiEvent::Info(format!("Abstimmen fehlgeschlagen: {e}")));
+                                        }
+                                    });
+                                }
+                                Cmd::RegisterPolls(list) => {
+                                    for (id, secret, creator, options) in list {
+                                        remember_poll(&id, &secret, &creator, &options);
+                                    }
                                 }
                                 Cmd::React { chat, target, from_me, emoji } => {
                                     tokio::spawn(async move {
@@ -1221,6 +1464,7 @@ pub fn spawn(
                                             status: 0,
                                             media: msg.media.clone(),
                                             quote: None,
+                                            x: MsgExtra { kind: msg.x.kind.clone(), ..Default::default() },
                                         }));
                                         let key = chat.to_string();
                                         match client.send_message(&chat, wm).await {
@@ -1400,6 +1644,7 @@ pub fn spawn(
                                             status: 0,
                                             media: Some(media),
                                             quote: None,
+                                            x: Default::default(),
                                         }));
                                         let key = chat.to_string();
                                         match client.send_message(&chat, msg).await {
