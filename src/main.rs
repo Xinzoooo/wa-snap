@@ -189,6 +189,13 @@ enum Filter {
     Groups,
 }
 
+/// Aktion auf eine einzelne Nachricht.
+enum MsgAct {
+    React(String, String),
+    Reply(String),
+    Revoke(String),
+}
+
 /// Aktion aus Kontextmenü oder Chat-Kopf.
 enum Act {
     Mute(String),
@@ -225,6 +232,15 @@ struct App {
     names_dirty: bool,
     temp_counter: u64,
     emoji: emoji::Cache,
+    /// Bilder/Sticker je Nachrichten-ID (Textur, volle Größe?).
+    images: HashMap<String, (egui::TextureHandle, bool)>,
+    img_requested: HashSet<String>,
+    show_stickers: bool,
+    /// Reaktionen je Nachrichten-ID: (Absender, Emoji); Absender leer = ich.
+    reactions: HashMap<String, Vec<(String, String)>>,
+    /// Antwort in Vorbereitung: (Chat, Zitat, zitierte Nachricht ist von mir).
+    reply_to: Option<(String, backend::Quote, bool)>,
+    me: Vec<String>,
 }
 
 fn user_of(key: &str) -> String {
@@ -465,6 +481,12 @@ impl App {
             names_dirty: true,
             temp_counter: 0,
             emoji: emoji::Cache::default(),
+            images: HashMap::new(),
+            img_requested: HashSet::new(),
+            show_stickers: false,
+            reactions: HashMap::new(),
+            reply_to: None,
+            me: Vec::new(),
         };
         for r in recs {
             app.apply_rec(r);
@@ -511,10 +533,52 @@ impl App {
                     ts: now - 86_400 * (i as i64 / 2) - 600 * (5 - j as i64),
                     id: format!("demo-{i}-{j}"),
                     status: if j == 3 { 2 } else { 3 },
+                    media: None,
+                    quote: None,
                 };
                 self.add_message(m, Source::Disk);
             }
         }
+        // Demo-Bild (Farbverlauf) als empfangenes Foto
+        let media_dir = data_dir().join("media");
+        let _ = std::fs::create_dir_all(&media_dir);
+        let img = image::RgbImage::from_fn(480, 320, |x, y| image::Rgb([(x / 2) as u8, (y * 3 / 4) as u8, 160]));
+        let _ = img.save(media_dir.join("demo-img.png"));
+        let anna = Jid::new("4915100000001", whatsapp_rust::Server::Pn);
+        self.add_message(
+            ChatMessage {
+                chat: anna.clone(),
+                is_group: false,
+                from_me: false,
+                sender_name: "Anna Berger".into(),
+                sender: String::new(),
+                text: "Schau mal, Sonnenuntergang 🌅".into(),
+                ts: now - 30,
+                id: "demo-img".into(),
+                status: 0,
+                media: Some(backend::MediaRef { kind: "image".into(), mime: "image/png".into(), w: 480, h: 320, ..Default::default() }),
+                quote: None,
+            },
+            Source::Disk,
+        );
+        self.add_message(
+            ChatMessage {
+                chat: anna,
+                is_group: false,
+                from_me: true,
+                sender_name: String::new(),
+                sender: String::new(),
+                text: String::new(),
+                ts: now - 10,
+                id: "demo-doc".into(),
+                status: 3,
+                media: Some(backend::MediaRef { kind: "document".into(), name: "Bewerbung.pdf".into(), mime: "application/pdf".into(), len: 245_000, ..Default::default() }),
+                quote: Some(backend::Quote { id: "demo-img".into(), sender: String::new(), name: "Anna Berger".into(), text: "Schau mal, Sonnenuntergang 🌅".into() }),
+            },
+            Source::Disk,
+        );
+        self.set_reaction("demo-img".into(), String::new(), "😍".into(), false);
+        self.set_reaction("demo-1-2".into(), "4915100000001".into(), "❤️".into(), false);
         self.settings.pinned = vec!["4915100000001".into(), "120363000000001".into()];
         self.settings.muted = vec!["120363000000002".into()];
         self.settings.archived = vec!["4915100000004".into()];
@@ -524,7 +588,7 @@ impl App {
 
     fn apply_rec(&mut self, rec: Rec) {
         match rec {
-            Rec::Msg { chat, is_group, from_me, sender, text, ts, id, sjid, st } => {
+            Rec::Msg { chat, is_group, from_me, sender, text, ts, id, sjid, st, media, quote } => {
                 let Ok(jid) = chat.parse::<Jid>() else { return };
                 self.add_message(
                     ChatMessage {
@@ -537,6 +601,8 @@ impl App {
                         ts,
                         id,
                         status: if from_me && st == 0 { 1 } else { st },
+                        media,
+                        quote,
                     },
                     Source::Disk,
                 );
@@ -553,6 +619,9 @@ impl App {
                 self.names.insert(user, (name, book));
             }
             Rec::Status { id, st } => self.set_status(&id, st, false),
+            Rec::React { target, from, emoji } => self.set_reaction(target, from, emoji, false),
+            Rec::Del { id } => self.revoke_local(&id, false),
+            Rec::Edit { id, text } => self.edit_local(&id, text, false),
         }
     }
 
@@ -619,6 +688,8 @@ impl App {
             id: m.id.clone(),
             sjid: m.sender.clone(),
             st: m.status,
+            media: m.media.clone(),
+            quote: m.quote.clone(),
         });
     }
 
@@ -700,6 +771,91 @@ impl App {
         if self.conn == Conn::Online && (had_unread || !msgs.is_empty()) {
             let _ = self.cmd.send(Cmd::MarkRead { jid: c.jid.clone(), msgs, last });
         }
+    }
+
+    fn run_msg_act(&mut self, a: MsgAct) {
+        let id = match &a {
+            MsgAct::React(id, _) | MsgAct::Reply(id) | MsgAct::Revoke(id) => id.clone(),
+        };
+        let Some(key) = self.msg_index.get(&id).cloned() else { return };
+        let Some(chat) = self.chats.get(&key) else { return };
+        let jid = chat.jid.clone();
+        let Some(m) = chat.messages.iter().rev().find(|m| m.id == id).cloned() else { return };
+        let quote = backend::Quote {
+            id: m.id.clone(),
+            sender: if m.from_me { String::new() } else if m.sender.is_empty() { jid.to_string() } else { m.sender.clone() },
+            name: if m.from_me { "Du".into() } else { m.sender_name.clone() },
+            text: match &m.media {
+                Some(md) if m.text.is_empty() => md.label(),
+                _ => m.text.clone(),
+            },
+        };
+        match a {
+            MsgAct::React(_, emoji) => {
+                self.set_reaction(id, String::new(), emoji.clone(), true);
+                let _ = self.cmd.send(Cmd::React { chat: jid, target: quote, from_me: m.from_me, emoji });
+            }
+            MsgAct::Reply(_) => {
+                self.reply_to = Some((key, quote, m.from_me));
+            }
+            MsgAct::Revoke(_) => {
+                let _ = self.cmd.send(Cmd::Revoke { chat: jid, id });
+            }
+        }
+    }
+
+    fn set_reaction(&mut self, target: String, from: String, emoji: String, persist: bool) {
+        if persist {
+            self.store.append(&Rec::React { target: target.clone(), from: from.clone(), emoji: emoji.clone() });
+        }
+        let list = self.reactions.entry(target).or_default();
+        list.retain(|(f, _)| *f != from);
+        if !emoji.is_empty() {
+            list.push((from, emoji));
+        }
+    }
+
+    fn find_msg_mut(&mut self, id: &str) -> Option<&mut ChatMessage> {
+        let key = self.msg_index.get(id)?.clone();
+        self.chats.get_mut(&key)?.messages.iter_mut().rev().find(|m| m.id == id)
+    }
+
+    fn revoke_local(&mut self, id: &str, persist: bool) {
+        if let Some(m) = self.find_msg_mut(id) {
+            m.text = "🚫 Diese Nachricht wurde gelöscht.".into();
+            m.media = None;
+            m.quote = None;
+            if persist {
+                self.store.append(&Rec::Del { id: id.to_owned() });
+            }
+        }
+        self.reactions.remove(id);
+    }
+
+    fn edit_local(&mut self, id: &str, text: String, persist: bool) {
+        if let Some(m) = self.find_msg_mut(id) {
+            m.text = format!("{text}");
+            if persist {
+                self.store.append(&Rec::Edit { id: id.to_owned(), text });
+            }
+        }
+    }
+
+    /// Zuletzt empfangene/gesendete Sticker (ohne Doppelte), neueste zuerst.
+    fn known_stickers(&self) -> Vec<(String, backend::MediaRef)> {
+        let mut all: Vec<(i64, String, backend::MediaRef)> = self
+            .chats
+            .values()
+            .flat_map(|c| c.messages.iter())
+            .filter_map(|m| m.media.as_ref().filter(|md| md.kind == "sticker" && !md.direct_path.is_empty()).map(|md| (m.ts, m.id.clone(), md.clone())))
+            .collect();
+        all.sort_by_key(|x| std::cmp::Reverse(x.0));
+        let mut seen = HashSet::new();
+        all.into_iter()
+            .filter(|(_, _, md)| seen.insert(md.sha.clone()))
+            .take(48)
+            .map(|(_, id, md)| (id, md))
+            .collect()
     }
 
     fn last_msg(&self, key: &str) -> Option<backend::LastMsg> {
@@ -799,6 +955,9 @@ impl App {
                         }
                     }
                     if let Some(m) = done {
+                        if let Some(t) = self.images.remove(&temp) {
+                            self.images.insert(id.clone(), t);
+                        }
                         self.msg_index.insert(id, chat.clone());
                         self.persist_msg(&chat, &m);
                     }
@@ -816,7 +975,19 @@ impl App {
                         self.set_status(&id, status, true);
                     }
                 }
-                UiEvent::Info(m) => self.info = Some(m),
+                UiEvent::Info(m) => self.info = if m.is_empty() { None } else { Some(m) },
+                UiEvent::Me(users) => self.me = users,
+                UiEvent::Reaction { target, from, emoji } => self.set_reaction(target, from, emoji, true),
+                UiEvent::Revoked { id } => self.revoke_local(&id, true),
+                UiEvent::Edited { id, text } => self.edit_local(&id, text, true),
+                UiEvent::Image { id, size, rgba, full } => {
+                    if self.images.get(&id).map(|t| t.1 && !full).unwrap_or(false) {
+                        continue;
+                    }
+                    let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                    let tex = ctx.load_texture(format!("img-{id}"), img, egui::TextureOptions::LINEAR);
+                    self.images.insert(id, (tex, full));
+                }
                 UiEvent::Groups(list) => {
                     for (jid, name) in list {
                         if name.is_empty() {
@@ -873,6 +1044,10 @@ impl App {
         if text.is_empty() {
             return;
         }
+        let quote = match self.reply_to.take() {
+            Some((k, q, _)) if k == key => Some(q),
+            _ => None,
+        };
         if let Some(chat) = self.chats.get(&key) {
             let jid = chat.jid.clone();
             self.temp_counter += 1;
@@ -887,9 +1062,11 @@ impl App {
                 ts: now_ts(),
                 id: temp.clone(),
                 status: 0,
+                media: None,
+                quote: quote.clone(),
             };
             self.add_message(m, Source::Live);
-            let _ = self.cmd.send(Cmd::Send { chat: jid, text, temp });
+            let _ = self.cmd.send(Cmd::Send { chat: jid, text, temp, quote });
         }
         self.input.clear();
     }
@@ -1311,11 +1488,12 @@ impl App {
                             } else {
                                 ""
                             };
-                            let preview = if prefix == "~" {
-                                format!("{}: {}", m.sender_name, m.text.replace('\n', " "))
-                            } else {
-                                m.text.replace('\n', " ")
+                            let body = match &m.media {
+                                Some(md) if m.text.is_empty() => md.label(),
+                                Some(md) => format!("{} {}", md.label(), m.text.replace('\n', " ")),
+                                None => m.text.replace('\n', " "),
                             };
+                            let preview = if prefix == "~" { format!("{}: {}", m.sender_name, body) } else { body };
                             let pclip = egui::Rect::from_min_max(
                                 egui::pos2(px, y2 - 10.0),
                                 egui::pos2(txt_rect.right() - icons_w - 6.0, y2 + 10.0),
@@ -1368,6 +1546,8 @@ impl App {
     fn input_bar(&mut self, ctx: &egui::Context, pal: &Palette) {
         let input_id = egui::Id::new("wa_input");
         let mut do_send = false;
+        let mut attach = false;
+        let mut sticker_send: Option<backend::MediaRef> = None;
         egui::TopBottomPanel::bottom("input")
             .frame(egui::Frame::new().fill(pal.chat).inner_margin(egui::Margin { left: 16, right: 16, top: 6, bottom: 12 }))
             .show(ctx, |ui| {
@@ -1379,6 +1559,30 @@ impl App {
                 {
                     do_send = true;
                 }
+                let reply = self.reply_to.clone().filter(|(k, _, _)| Some(k) == self.selected.as_ref());
+                if let Some((_, q, _)) = reply {
+                    egui::Frame::new()
+                        .fill(pal.bubble_them)
+                        .corner_radius(12.0)
+                        .inner_margin(egui::Margin { left: 14, right: 10, top: 8, bottom: 8 })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    ui.label(RichText::new(format!("Antwort an {}", q.name)).size(12.5).family(theme::bold()).color(pal.accent));
+                                    let t: String = q.text.replace('\n', " ").chars().take(120).collect();
+                                    ui.add(egui::Label::new(RichText::new(t).size(13.0).color(pal.dim)).truncate());
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button("✕").on_hover_text("Antwort abbrechen").clicked() {
+                                        self.reply_to = None;
+                                    }
+                                });
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
                 egui::Frame::new()
                     .fill(pal.bubble_them)
                     .corner_radius(26.0)
@@ -1386,7 +1590,9 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            icon_button(ui, "📎", 19.0, pal.dim, pal, "Anhänge (kommt in einer späteren Version)");
+                            if icon_button(ui, "📎", 19.0, pal.dim, pal, "Foto oder Datei senden (Text im Eingabefeld wird Bildunterschrift)").clicked() && enabled {
+                                attach = true;
+                            }
                             let emoji_btn = icon_button(ui, "", 19.0, pal.dim, pal, "Emoji");
                             {
                                 // Smiley als Umriss, wie das Symbol bei WhatsApp
@@ -1416,6 +1622,43 @@ impl App {
                                 egui::PopupCloseBehavior::CloseOnClickOutside,
                                 |ui| {
                                     ui.set_width(372.0);
+                                    ui.horizontal(|ui| {
+                                        if chip(ui, "Emoji", !self.show_stickers, pal) {
+                                            self.show_stickers = false;
+                                        }
+                                        if chip(ui, "Sticker", self.show_stickers, pal) {
+                                            self.show_stickers = true;
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    if self.show_stickers {
+                                        let list = self.known_stickers();
+                                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                            if list.is_empty() {
+                                                ui.label(RichText::new("Noch keine Sticker. Sticker, die du bekommst, erscheinen hier und können weitergeschickt werden.").small().color(pal.dim));
+                                            }
+                                            ui.horizontal_wrapped(|ui| {
+                                                for (id, md) in list {
+                                                    match self.images.get(&id) {
+                                                        Some((t, _)) => {
+                                                            if ui.add(egui::Button::image(egui::Image::new((t.id(), egui::vec2(72.0, 72.0)))).frame(false)).clicked() {
+                                                                sticker_send = Some(md);
+                                                                ui.memory_mut(|m| m.close_popup());
+                                                            }
+                                                        }
+                                                        None => {
+                                                            ui.add_sized([72.0, 72.0], egui::Spinner::new());
+                                                            if !self.img_requested.contains(&id) {
+                                                                self.img_requested.insert(id.clone());
+                                                                let _ = self.cmd.send(Cmd::LoadMedia { id, media: md });
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        });
+                                        return;
+                                    }
                                     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                                         for (cat, list) in theme::EMOJI_CATS {
                                             ui.label(RichText::new(*cat).small().color(pal.dim));
@@ -1466,11 +1709,31 @@ impl App {
             self.send_current();
             ctx.memory_mut(|m| m.request_focus(input_id));
         }
+        // Dateien per Ziehen-und-Ablegen oder über 📎 senden
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if let Some(jid) = self.selected.as_ref().and_then(|k| self.chats.get(k)).map(|c| c.jid.clone()) {
+            if self.conn == Conn::Online {
+                for (i, path) in dropped.into_iter().enumerate() {
+                    let caption = if i == 0 { std::mem::take(&mut self.input).trim().to_owned() } else { String::new() };
+                    let _ = self.cmd.send(Cmd::SendFile { chat: jid.clone(), path: Some(path), caption });
+                }
+                if attach {
+                    let caption = std::mem::take(&mut self.input).trim().to_owned();
+                    let _ = self.cmd.send(Cmd::SendFile { chat: jid.clone(), path: None, caption });
+                }
+                if let Some(media) = sticker_send {
+                    let _ = self.cmd.send(Cmd::SendSticker { chat: jid, media });
+                }
+            }
+        }
     }
 
     fn chat_view(&mut self, ctx: &egui::Context, pal: &Palette) {
         let mut act: Option<Act> = None;
         let mut ecache = std::mem::take(&mut self.emoji);
+        let mut media_req: Vec<(String, backend::MediaRef)> = Vec::new();
+        let mut open_req: Vec<(String, backend::MediaRef)> = Vec::new();
+        let mut msg_act: Option<MsgAct> = None;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.chat)).show(ctx, |ui| {
             if self.show_settings {
                 self.settings_view(ui, ctx, pal);
@@ -1616,11 +1879,15 @@ impl App {
                         let first = prev != Some((m.from_me, m.sender_name.as_str()));
                         prev = Some((m.from_me, m.sender_name.as_str()));
                         ui.add_space(if first { 6.0 } else { 1.0 });
-                        let (bg, align) = if m.from_me {
+                        let (mut bg, align) = if m.from_me {
                             (pal.bubble_me, egui::Align::Max)
                         } else {
                             (pal.bubble_them, egui::Align::Min)
                         };
+                        let sticker = m.media.as_ref().map(|x| x.kind == "sticker").unwrap_or(false);
+                        if sticker {
+                            bg = Color32::TRANSPARENT;
+                        }
                         let margin_side = (full_w * 0.06).clamp(16.0, 63.0) as i8;
                         ui.with_layout(egui::Layout::top_down(align), |ui| {
                             let resp = egui::Frame::new()
@@ -1638,7 +1905,12 @@ impl App {
                                         0.0
                                     };
                                     let meta_w = if m.from_me { 58.0 } else { 40.0 };
-                                    let w = (tw + 8.0 + meta_w).max(sw).min(max_w);
+                                    let media_w = match &m.media {
+                                        Some(md) if md.is_picture() => media_size(md, self.images.get(&m.id), max_w).x,
+                                        Some(_) => 260.0_f32.min(max_w),
+                                        None => 0.0,
+                                    };
+                                    let w = (tw + 8.0 + meta_w).max(sw).max(media_w).min(max_w);
                                     ui.set_max_width(w);
                                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                                     if is_group && !m.from_me && first && !m.sender_name.is_empty() {
@@ -1649,10 +1921,42 @@ impl App {
                                                 .color(theme::sender_color(&m.sender_name, dark)),
                                         );
                                     }
+                                    if let Some(q) = &m.quote {
+                                        // Zitat: farbiger Balken links, Name und Text gekürzt
+                                        let qname = if q.sender.is_empty() || self.me.contains(&user_of(&q.sender)) {
+                                            "Du".to_owned()
+                                        } else {
+                                            let u = user_of(&q.sender);
+                                            self.names.get(&u).map(|n| n.0.clone()).unwrap_or_else(|| if q.name.is_empty() { format!("+{u}") } else { q.name.clone() })
+                                        };
+                                        let col = theme::sender_color(&qname, dark);
+                                        let fr = egui::Frame::new()
+                                            .fill(if dark { Color32::from_black_alpha(60) } else { Color32::from_black_alpha(12) })
+                                            .corner_radius(6.0)
+                                            .inner_margin(egui::Margin { left: 10, right: 8, top: 5, bottom: 5 })
+                                            .show(ui, |ui| {
+                                                ui.set_min_width((w - 16.0).max(120.0));
+                                                ui.label(RichText::new(&qname).size(12.5).family(theme::bold()).color(col));
+                                                let t: String = q.text.replace('\n', " ").chars().take(120).collect();
+                                                ui.add(egui::Label::new(RichText::new(t).size(13.0).color(pal.dim)).truncate());
+                                            });
+                                        let r = fr.response.rect;
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_max(r.left_top(), egui::pos2(r.left() + 4.0, r.bottom())),
+                                            egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 },
+                                            col,
+                                        );
+                                        ui.add_space(3.0);
+                                    }
+                                    if let Some(md) = &m.media {
+                                        self.media_block(ui, m, md, max_w, pal, &mut media_req, &mut open_req);
+                                    }
                                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| ui.horizontal_wrapped(|ui| {
                                         ui.spacing_mut().item_spacing.x = 8.0;
-                                        rich_label(ui, &m.text, self.settings.font_size + 0.5, &mut ecache);
-                                        ui.add_space(8.0);
+                                        if !m.text.is_empty() {
+                                            rich_label(ui, &m.text, self.settings.font_size + 0.5, &mut ecache);
+                                            ui.add_space(8.0);
+                                        }
                                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Max), |ui| {
                                             ui.spacing_mut().item_spacing.x = 3.0;
                                             ui.label(RichText::new(fmt_time(m.ts)).size(11.0).color(pal.dim));
@@ -1663,8 +1967,85 @@ impl App {
                                     }));
                                     });
                                 });
+                            // Reaktionen unter der Blase
+                            if let Some(list) = self.reactions.get(&m.id).filter(|l| !l.is_empty()) {
+                                let mut uniq: Vec<&str> = Vec::new();
+                                for (_, e) in list {
+                                    if !uniq.contains(&e.as_str()) {
+                                        uniq.push(e);
+                                    }
+                                }
+                                let r = resp.response.rect;
+                                let esz = 16.0;
+                                let count = if list.len() > 1 { list.len().to_string() } else { String::new() };
+                                let cw = if count.is_empty() { 0.0 } else { 6.0 + 7.0 * count.len() as f32 };
+                                let pw = uniq.len().min(3) as f32 * (esz + 2.0) + cw + 12.0;
+                                let x = if m.from_me { r.right() - margin_side as f32 - pw - 6.0 } else { r.left() + margin_side as f32 + 6.0 };
+                                let pill = egui::Rect::from_min_size(egui::pos2(x, r.bottom() - 4.0), egui::vec2(pw, 24.0));
+                                ui.allocate_space(egui::vec2(0.0, 18.0));
+                                let p = ui.painter();
+                                p.rect_filled(pill, 12.0, pal.bubble_them);
+                                p.rect_stroke(pill, 12.0, egui::Stroke::new(1.0_f32, pal.chat), egui::StrokeKind::Outside);
+                                let mut ex = pill.left() + 6.0;
+                                for e in uniq.iter().take(3) {
+                                    let k: String = e.chars().filter(|c| *c != '\u{FE0F}').collect();
+                                    if let Some(id) = ecache.get(ui.ctx(), &k) {
+                                        let er = egui::Rect::from_min_size(egui::pos2(ex, pill.center().y - esz / 2.0), egui::vec2(esz, esz));
+                                        p.image(id, er, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                                    }
+                                    ex += esz + 2.0;
+                                }
+                                if !count.is_empty() {
+                                    p.text(egui::pos2(ex + 2.0, pill.center().y), egui::Align2::LEFT_CENTER, count, egui::FontId::proportional(12.0), pal.dim);
+                                }
+                                let tip: Vec<String> = list
+                                    .iter()
+                                    .map(|(f, e)| {
+                                        let n = if f.is_empty() { "Du".to_owned() } else { self.names.get(f).map(|n| n.0.clone()).unwrap_or_else(|| format!("+{f}")) };
+                                        format!("{e} {n}")
+                                    })
+                                    .collect();
+                                ui.interact(pill, egui::Id::new(("react", &m.id)), egui::Sense::hover()).on_hover_text(tip.join("\n"));
+                            }
+                            // Rechtsklick-Menü der Nachricht
+                            let mine = self.reactions.get(&m.id).and_then(|l| l.iter().find(|(f, _)| f.is_empty()).map(|x| x.1.clone()));
+                            resp.response.interact(egui::Sense::click()).context_menu(|ui| {
+                                ui.horizontal(|ui| {
+                                    for e in ["👍", "❤️", "😂", "😮", "😢", "🙏"] {
+                                        let k: String = e.chars().filter(|c| *c != '\u{FE0F}').collect();
+                                        let on = mine.as_deref() == Some(e);
+                                        let clicked = match ecache.get(ui.ctx(), &k) {
+                                            Some(id) => ui.add(egui::Button::image(egui::Image::new((id, egui::vec2(24.0, 24.0)))).frame(on)).clicked(),
+                                            None => ui.button(e).clicked(),
+                                        };
+                                        if clicked {
+                                            msg_act = Some(MsgAct::React(m.id.clone(), if on { String::new() } else { e.to_owned() }));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                                ui.separator();
+                                if ui.button("Antworten").clicked() {
+                                    msg_act = Some(MsgAct::Reply(m.id.clone()));
+                                    ui.close_menu();
+                                }
+                                if !m.text.is_empty() && ui.button("Text kopieren").clicked() {
+                                    ui.ctx().copy_text(m.text.clone());
+                                    ui.close_menu();
+                                }
+                                if m.media.is_some() && ui.button("Öffnen").clicked() {
+                                    if let Some(md) = &m.media {
+                                        open_req.push((m.id.clone(), md.clone()));
+                                    }
+                                    ui.close_menu();
+                                }
+                                if m.from_me && !m.id.starts_with("local-") && now_ts() - m.ts < 2 * 86_400 && ui.button("Für alle löschen").clicked() {
+                                    msg_act = Some(MsgAct::Revoke(m.id.clone()));
+                                    ui.close_menu();
+                                }
+                            });
                             // kleiner Zipfel an der ersten Blase einer Folge
-                            if first {
+                            if first && !sticker {
                                 let r = resp.response.rect;
                                 let p = ui.painter();
                                 let (a, b, c) = if m.from_me {
@@ -1682,10 +2063,116 @@ impl App {
                 });
         });
         self.emoji = ecache;
+        for (id, media) in media_req {
+            if self.img_requested.insert(id.clone()) {
+                let _ = self.cmd.send(Cmd::LoadMedia { id, media });
+            }
+        }
+        for (id, media) in open_req {
+            let _ = self.cmd.send(Cmd::OpenMedia { id, media });
+        }
+        if let Some(a) = msg_act {
+            self.run_msg_act(a);
+        }
         if let Some(a) = act {
             self.run_act(a);
         }
     }
+
+    /// Bild, Sticker oder Anhang in einer Blase.
+    fn media_block(
+        &self,
+        ui: &mut egui::Ui,
+        m: &ChatMessage,
+        md: &backend::MediaRef,
+        max_w: f32,
+        pal: &Palette,
+        media_req: &mut Vec<(String, backend::MediaRef)>,
+        open_req: &mut Vec<(String, backend::MediaRef)>,
+    ) {
+        let tex = self.images.get(&m.id);
+        if !self.img_requested.contains(&m.id) && tex.map(|t| !t.1).unwrap_or(true) {
+            media_req.push((m.id.clone(), md.clone()));
+        }
+        if md.is_picture() {
+            let size = media_size(md, tex, max_w);
+            let resp = match tex {
+                Some((t, _)) => ui.add(
+                    egui::Image::new((t.id(), size))
+                        .corner_radius(if md.kind == "sticker" { 0.0 } else { 6.0 })
+                        .sense(egui::Sense::click()),
+                ),
+                None => {
+                    let (r, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                    ui.painter().rect_filled(r, 6.0, pal.hover);
+                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "Lädt …", egui::FontId::proportional(13.0), pal.dim);
+                    resp
+                }
+            };
+            if resp.on_hover_text("Öffnen").clicked() {
+                open_req.push((m.id.clone(), md.clone()));
+            }
+            return;
+        }
+        // Video/GIF mit Vorschaubild
+        if let (Some((t, _)), true) = (tex, md.kind == "video" || md.kind == "gif") {
+            let size = media_size(md, Some(&(t.clone(), false)), max_w);
+            let resp = ui.add(egui::Image::new((t.id(), size)).corner_radius(6.0).sense(egui::Sense::click()));
+            let c = resp.rect.center();
+            ui.painter().circle_filled(c, 22.0, Color32::from_black_alpha(150));
+            let pts = vec![c + egui::vec2(-6.0, -9.0), c + egui::vec2(10.0, 0.0), c + egui::vec2(-6.0, 9.0)];
+            ui.painter().add(egui::Shape::convex_polygon(pts, Color32::WHITE, egui::Stroke::NONE));
+            if md.kind == "gif" {
+                ui.painter().text(resp.rect.left_bottom() + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, "GIF", egui::FontId::new(12.0, theme::bold()), Color32::WHITE);
+            }
+            if resp.on_hover_text("Im Standardprogramm abspielen").clicked() {
+                open_req.push((m.id.clone(), md.clone()));
+            }
+            return;
+        }
+        // Dokument, Audio, Sprachnachricht, Video ohne Vorschau
+        let resp = egui::Frame::new()
+            .fill(pal.hover.gamma_multiply(0.9))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(240.0_f32.min(max_w - 20.0));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(md.label()).size(14.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if md.len > 0 {
+                            ui.label(RichText::new(fmt_size(md.len)).size(11.0).color(pal.dim));
+                        }
+                    });
+                });
+            })
+            .response
+            .interact(egui::Sense::click());
+        if resp.on_hover_text("Herunterladen und öffnen").clicked() {
+            open_req.push((m.id.clone(), md.clone()));
+        }
+        ui.add_space(2.0);
+    }
+}
+
+fn fmt_size(n: u64) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / 1048576.0)
+    } else {
+        format!("{} KB", (n / 1024).max(1))
+    }
+}
+
+/// Anzeigegröße eines Bildes/Stickers in der Blase.
+fn media_size(md: &backend::MediaRef, tex: Option<&(egui::TextureHandle, bool)>, max_w: f32) -> egui::Vec2 {
+    let (w, h) = match tex {
+        Some((t, _)) => (t.size()[0] as f32, t.size()[1] as f32),
+        None if md.w > 0 && md.h > 0 => (md.w as f32, md.h as f32),
+        None => (300.0, 300.0),
+    };
+    let limit = if md.kind == "sticker" { 150.0 } else { 320.0_f32.min(max_w - 16.0) };
+    let scale = (limit / w).min(380.0 / h);
+    egui::vec2(w * scale, h * scale)
 }
 
 impl eframe::App for App {

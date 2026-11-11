@@ -1,6 +1,6 @@
 [package]
 name = "wa-snap"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 description = "Schneller nativer WhatsApp-Desktop-Client in Rust (inoffiziell)"
@@ -15,7 +15,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 notify-rust = "4"
 ureq = "3"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 
 [profile.release]
 lto = "thin"

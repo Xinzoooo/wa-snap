@@ -22,6 +22,10 @@ pub enum Rec {
         sjid: String,
         #[serde(default)]
         st: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media: Option<crate::backend::MediaRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quote: Option<crate::backend::Quote>,
     },
     #[serde(rename = "chat")]
     Chat { jid: String, name: String, is_group: bool, last_ts: i64 },
@@ -30,6 +34,14 @@ pub enum Rec {
     /// Zustellstatus einer eigenen Nachricht (2 = zugestellt, 3 = gelesen).
     #[serde(rename = "st")]
     Status { id: String, st: u8 },
+    /// Reaktion (leeres Emoji = entfernt); `from` leer = ich.
+    #[serde(rename = "re")]
+    React { target: String, from: String, emoji: String },
+    /// Für alle gelöscht.
+    #[serde(rename = "del")]
+    Del { id: String },
+    #[serde(rename = "ed")]
+    Edit { id: String, text: String },
 }
 
 pub struct Store {
@@ -77,6 +89,8 @@ mod tests {
                 id: "A1".into(),
                 sjid: String::new(),
                 st: 2,
+                media: None,
+                quote: None,
             });
             s.append(&Rec::Name { user: "49151".into(), name: "Anna".into(), book: true });
         }

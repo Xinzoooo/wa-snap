@@ -5,7 +5,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.5)
+## Funktionen (v0.6)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - Bunte Emojis (Twemoji) in Nachrichten, Chatliste und Emoji-Auswahl mit Kategorien; reine Emoji-Nachrichten werden groß angezeigt
@@ -20,17 +20,20 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Mehrzeilig schreiben (Shift+Enter), senden mit Enter
 - WhatsApp-Profil (Name, Info) in den Einstellungen änderbar; Autostart, Schriftgröße
 - Neuer Chat per Telefonnummer (Nummer in die Suche tippen)
-- Medien erscheinen als Hinweis, z. B. „📷 Foto“
+- Fotos und Sticker werden im Chat angezeigt (Klick öffnet in voller Größe); Videos, GIFs, Sprachnachrichten und Dokumente laden per Klick und öffnen im Standardprogramm
+- Fotos und Dateien senden: 📎 oder Datei ins Fenster ziehen; Text im Eingabefeld wird zur Bildunterschrift
+- Sticker: empfangene Sticker erscheinen in der Emoji-Auswahl unter „Sticker“ und lassen sich weiterschicken
+- Rechtsklick auf eine Nachricht: Reagieren, Antworten, Text kopieren, für alle löschen; Reaktionen, Antworten (Zitate), gelöschte und bearbeitete Nachrichten von anderen werden angezeigt
 - Diagnose-Log: `~/.local/share/wa-snap/wa-snap.log`
 
-**Noch nicht vorhanden:** Bilder/Dokumente/Sprachnachrichten anzeigen und senden, GIFs und Sticker, Antworten/Reaktionen, Datenschutz-Einstellungen, Gruppen anlegen, Anrufe. Fehler bitte als Issue melden.
+**Noch nicht vorhanden:** GIF-Suche (bräuchte einen API-Schlüssel von Tenor/Giphy), Videos und Sprachnachrichten direkt in der App abspielen, Sprachnachrichten aufnehmen, eigene Sticker erstellen, Datenschutz-Einstellungen, Gruppen anlegen, Anrufe. Fehler bitte als Issue melden.
 
 ## Installation auf Fedora (empfohlen)
 
 Ein Befehl, danach findest du wa-snap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.5.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.6.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
@@ -66,7 +69,7 @@ Das legt einen Startmenü-Eintrag mit Icon an. Danach findest du wa-snap im Anwe
 
 ## Daten
 
-Die Sitzung liegt in `~/.local/share/wa-snap/whatsapp.db` (Linux). Die Datei enthält deine Schlüssel: nicht weitergeben und nie in ein Repo hochladen. Zum Abmelden löschst du die Datei und entfernst das Gerät in der WhatsApp-App.
+Die Sitzung liegt in `~/.local/share/wa-snap/whatsapp.db` (Linux), heruntergeladene Medien in `~/.local/share/wa-snap/media/`. Die Datei enthält deine Schlüssel: nicht weitergeben und nie in ein Repo hochladen. Zum Abmelden löschst du die Datei und entfernst das Gerät in der WhatsApp-App.
 
 ## Lizenz
 
