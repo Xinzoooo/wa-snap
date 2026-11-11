@@ -22,6 +22,25 @@ pub enum UiEvent {
     /// Profilbild als RGBA-Pixel (96x96 oder kleiner), Schlüssel ist die Rufnummer/LID.
     Avatar { user: String, size: [usize; 2], rgba: Vec<u8> },
     SendFailed(String),
+    /// Stumm/Angeheftet/Archiviert wie bei WhatsApp (vom Handy oder von hier).
+    Muted { jid: String, on: bool },
+    Pinned { jid: String, on: bool },
+    Archived { jid: String, on: bool },
+    /// Rückmeldung zu einer Einstellungsänderung (Text für die Statuszeile).
+    Info(String),
+    /// Alle Gruppen mit Namen (direkt vom Server abgefragt).
+    Groups(Vec<(Jid, String)>),
+}
+
+static LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Diagnose-Log (`wa-snap.log` im Datenordner), damit sich Sync-Probleme nachvollziehen lassen.
+pub fn log(msg: impl AsRef<str>) {
+    use std::io::Write;
+    let Some(p) = LOG_PATH.get() else { return };
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        let _ = writeln!(f, "{} {}", chrono::Local::now().format("%F %T"), msg.as_ref());
+    }
 }
 
 pub struct HistChat {
@@ -37,6 +56,11 @@ pub struct HistChat {
 pub enum Cmd {
     Send { chat: Jid, text: String },
     Avatar { jid: Jid },
+    SetMute { jid: Jid, on: bool },
+    SetPin { jid: Jid, on: bool },
+    SetArchive { jid: Jid, on: bool },
+    SetPushName(String),
+    SetAbout(String),
     Quit,
 }
 
@@ -70,6 +94,11 @@ fn is_visible(message: &wa::Message, media_type: &str) -> bool {
 
 /// Verlauf-Sync (Chats, Nachrichten, Namen) in Anzeigedaten umwandeln.
 fn convert_history(h: &wa::HistorySync, send: &impl Fn(UiEvent)) {
+    log(format!(
+        "HistorySync: {} Chats, {} Push-Namen",
+        h.conversations.len(),
+        h.pushnames.len()
+    ));
     for p in &h.pushnames {
         if let (Some(id), Some(name)) = (&p.id, &p.pushname) {
             let user = user_of(id);
@@ -177,6 +206,8 @@ async fn load_avatar(client: Arc<Client>, dir: std::path::PathBuf, jid: Jid) -> 
     .flatten()
 }
 
+static CONTACTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn user_of(jid: &str) -> String {
     jid.split('@').next().unwrap_or("").split(':').next().unwrap_or("").to_owned()
 }
@@ -206,6 +237,13 @@ pub fn spawn(
                     }
                 };
 
+                let _ = std::fs::create_dir_all(&dir);
+                let lp = dir.join("wa-snap.log");
+                if std::fs::metadata(&lp).map(|m| m.len() > 512_000).unwrap_or(false) {
+                    let _ = std::fs::remove_file(&lp);
+                }
+                let _ = LOG_PATH.set(lp);
+                log("--- Start ---");
                 let avatar_dir = dir.join("avatars");
                 let store = match SqliteStore::new(&dir.join("whatsapp.db").to_string_lossy()).await {
                     Ok(s) => s,
@@ -223,24 +261,55 @@ pub fn spawn(
                     send.clone(),
                 );
 
+                // Beim Verknüpfen den vollständigen Verlauf (365 Tage) und das Adressbuch anfordern.
+                let props = whatsapp_rust::wacore::store::DevicePropsOverride::new()
+                    .with_platform_type(wa::device_props::PlatformType::UWP)
+                    .with_require_full_sync(true)
+                    .with_history_sync_config(wa::device_props::HistorySyncConfig {
+                        full_sync_days_limit: Some(365),
+                        on_demand_ready: Some(true),
+                        complete_on_demand_ready: Some(true),
+                        ..whatsapp_rust::wacore::store::device::default_history_sync_config()
+                    });
+
                 let bot = Bot::builder()
                     .with_backend(store)
+                    .with_device_props(props)
                     .on_qr_code(move |code, _timeout| {
                         let s = s_qr.clone();
                         async move { s(UiEvent::Qr(code)) }
                     })
-                    .on_connected(move |_client| {
+                    .on_connected(move |client| {
                         let s = s_conn.clone();
-                        async move { s(UiEvent::Connected) }
+                        async move {
+                            log("Verbunden");
+                            s(UiEvent::Connected);
+                            match client.groups().get_participating().await {
+                                Ok(map) => {
+                                    log(format!("Gruppen vom Server: {}", map.len()));
+                                    s(UiEvent::Groups(
+                                        map.into_iter().map(|(j, m)| (j, m.subject)).collect(),
+                                    ));
+                                }
+                                Err(e) => log(format!("Gruppenliste fehlgeschlagen: {e}")),
+                            }
+                        }
                     })
                     .on_logged_out(move |_info| {
                         let s = s_out.clone();
-                        async move { s(UiEvent::LoggedOut) }
+                        async move {
+                            log("Abgemeldet");
+                            s(UiEvent::LoggedOut)
+                        }
                     })
                     .on_message(move |ctx| {
                         let s = s_msg.clone();
                         async move {
                             let info = &ctx.info;
+                            log(format!(
+                                "Nachricht {} von_mir={} typ='{}'",
+                                info.source.chat, info.source.is_from_me, info.media_type
+                            ));
                             if !is_visible(&ctx.message, &info.media_type) {
                                 return;
                             }
@@ -261,12 +330,42 @@ pub fn spawn(
                         }
                     })
                     .on_event_for(
-                        &[EventKind::ContactUpdate, EventKind::PushNameUpdate, EventKind::HistorySync],
+                        &[
+                            EventKind::ContactUpdate,
+                            EventKind::PushNameUpdate,
+                            EventKind::HistorySync,
+                            EventKind::MuteUpdate,
+                            EventKind::PinUpdate,
+                            EventKind::ArchiveUpdate,
+                        ],
                         move |event, _client| {
                             let s = s_ev.clone();
                             async move {
                                 match &*event {
+                                    Event::MuteUpdate(m) => {
+                                        let end = m.action.mute_end_timestamp.unwrap_or(0);
+                                        let now_ms = chrono::Utc::now().timestamp_millis();
+                                        let on = m.action.muted.unwrap_or(false)
+                                            && (end <= 0 || end > now_ms);
+                                        s(UiEvent::Muted { jid: m.jid.to_string(), on });
+                                    }
+                                    Event::PinUpdate(p) => {
+                                        s(UiEvent::Pinned {
+                                            jid: p.jid.to_string(),
+                                            on: p.action.pinned.unwrap_or(false),
+                                        });
+                                    }
+                                    Event::ArchiveUpdate(a) => {
+                                        s(UiEvent::Archived {
+                                            jid: a.jid.to_string(),
+                                            on: a.action.archived.unwrap_or(false),
+                                        });
+                                    }
                                     Event::ContactUpdate(c) => {
+                                        let n = CONTACTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                        if n == 1 || n % 50 == 0 {
+                                            log(format!("Adressbuch-Einträge empfangen: {n}"));
+                                        }
                                         let a = &c.action;
                                         let name = a
                                             .full_name
@@ -343,6 +442,70 @@ pub fn spawn(
                                     if let Some(ev) = load_avatar(client, dir, jid).await {
                                         send(ev);
                                     }
+                                });
+                            }
+                            Some(Cmd::SetMute { jid, on }) => {
+                                let (client, send) = (client.clone(), send.clone());
+                                tokio::spawn(async move {
+                                    let r = if on {
+                                        client.chat_actions().mute_chat(&jid).await
+                                    } else {
+                                        client.chat_actions().unmute_chat(&jid).await
+                                    };
+                                    if let Err(e) = r {
+                                        log(format!("Stumm fehlgeschlagen: {e}"));
+                                        send(UiEvent::Info(format!("Stummschalten fehlgeschlagen: {e}")));
+                                    }
+                                });
+                            }
+                            Some(Cmd::SetPin { jid, on }) => {
+                                let (client, send) = (client.clone(), send.clone());
+                                tokio::spawn(async move {
+                                    let r = if on {
+                                        client.chat_actions().pin_chat(&jid).await
+                                    } else {
+                                        client.chat_actions().unpin_chat(&jid).await
+                                    };
+                                    if let Err(e) = r {
+                                        log(format!("Anheften fehlgeschlagen: {e}"));
+                                        send(UiEvent::Info(format!("Anheften fehlgeschlagen: {e}")));
+                                    }
+                                });
+                            }
+                            Some(Cmd::SetArchive { jid, on }) => {
+                                let (client, send) = (client.clone(), send.clone());
+                                tokio::spawn(async move {
+                                    let r = if on {
+                                        client.chat_actions().archive_chat(&jid, None).await
+                                    } else {
+                                        client.chat_actions().unarchive_chat(&jid, None).await
+                                    };
+                                    if let Err(e) = r {
+                                        log(format!("Archivieren fehlgeschlagen: {e}"));
+                                        send(UiEvent::Info(format!("Archivieren fehlgeschlagen: {e}")));
+                                    }
+                                });
+                            }
+                            Some(Cmd::SetPushName(n)) => {
+                                let (client, send) = (client.clone(), send.clone());
+                                tokio::spawn(async move {
+                                    let m = match client.profile().set_push_name(&n).await {
+                                        Ok(_) => "Profilname gespeichert".to_owned(),
+                                        Err(e) => format!("Profilname: {e}"),
+                                    };
+                                    log(&m);
+                                    send(UiEvent::Info(m));
+                                });
+                            }
+                            Some(Cmd::SetAbout(t)) => {
+                                let (client, send) = (client.clone(), send.clone());
+                                tokio::spawn(async move {
+                                    let m = match client.profile().set_status_text(&t).await {
+                                        Ok(_) => "Info-Text gespeichert".to_owned(),
+                                        Err(e) => format!("Info-Text: {e}"),
+                                    };
+                                    log(&m);
+                                    send(UiEvent::Info(m));
                                 });
                             }
                             Some(Cmd::Quit) | None => {

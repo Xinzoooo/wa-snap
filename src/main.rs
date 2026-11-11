@@ -19,11 +19,26 @@ struct Settings {
     font_size: f32,
     dark: bool,
     muted: Vec<String>,
+    pinned: Vec<String>,
+    archived: Vec<String>,
+    /// Eigener Name und Info-Text (wie bei WhatsApp), nur zum Bearbeiten hier.
+    profile_name: String,
+    profile_about: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { notifications: true, preview: true, font_size: 14.0, dark: true, muted: Vec::new() }
+        Self {
+            notifications: true,
+            preview: true,
+            font_size: 14.0,
+            dark: true,
+            muted: Vec::new(),
+            pinned: Vec::new(),
+            archived: Vec::new(),
+            profile_name: String::new(),
+            profile_about: String::new(),
+        }
     }
 }
 
@@ -75,15 +90,36 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
     }
 }
 
+fn set_flag(list: &mut Vec<String>, key: String, on: bool) {
+    let pos = list.iter().position(|k| k == &key);
+    match (on, pos) {
+        (true, None) => list.push(key),
+        (false, Some(i)) => {
+            list.remove(i);
+        }
+        _ => {}
+    }
+}
+
 fn notify(title: String, body: String) {
     // Eigener Thread: die Oberfläche wartet nie auf den Benachrichtigungsdienst.
     std::thread::spawn(move || {
-        let _ = notify_rust::Notification::new()
+        let r = notify_rust::Notification::new()
             .appname("wa-snap")
             .summary(&title)
             .body(&body)
             .icon("wa-snap")
             .show();
+        match r {
+            Ok(_) => backend::log("Benachrichtigung gesendet"),
+            Err(e) => {
+                backend::log(format!("Benachrichtigung (D-Bus) fehlgeschlagen: {e}; versuche notify-send"));
+                let r2 = std::process::Command::new("notify-send")
+                    .args(["-a", "wa-snap", "-i", "wa-snap", &title, &body])
+                    .status();
+                backend::log(format!("notify-send: {r2:?}"));
+            }
+        }
     });
 }
 
@@ -183,6 +219,7 @@ struct App {
     error: Option<String>,
     settings: Settings,
     show_settings: bool,
+    show_archive: bool,
     autostart: bool,
     focused: bool,
 }
@@ -246,6 +283,7 @@ impl App {
             error: None,
             settings,
             show_settings: false,
+            show_archive: false,
             autostart: autostart_file().map(|f| f.exists()).unwrap_or(false),
             focused: true,
         };
@@ -391,9 +429,19 @@ Dann können wir alles besprechen.",
             self.store.append(&rec);
         }
         let (from_me, ts, sender, text, is_group) = notify_data;
+        if src == Source::Live && !from_me {
+            backend::log(format!(
+                "Benachrichtigung? einstellung={} stumm={} alt={}s gewaehlt={} fokus={}",
+                self.settings.notifications,
+                self.is_muted(&key),
+                now_ts() - ts,
+                selected,
+                self.focused
+            ));
+        }
         if src == Source::Live
             && !from_me
-            && now_ts() - ts < 60
+            && now_ts() - ts < 120
             && self.settings.notifications
             && !self.is_muted(&key)
             && (!selected || !self.focused)
@@ -470,6 +518,35 @@ Dann können wir alles besprechen.",
                     self.avatars.insert(user, tex);
                 }
                 UiEvent::SendFailed(e) => self.error = Some(format!("Senden fehlgeschlagen: {e}")),
+                UiEvent::Info(m) => self.error = Some(m),
+                UiEvent::Groups(list) => {
+                    for (jid, name) in list {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let c = self.chat_entry(&jid, true);
+                        c.name = name.clone();
+                        let last_ts = c.last_ts;
+                        self.store.append(&Rec::Chat {
+                            jid: jid.to_string(),
+                            name,
+                            is_group: true,
+                            last_ts,
+                        });
+                    }
+                }
+                UiEvent::Muted { jid, on } => {
+                    set_flag(&mut self.settings.muted, jid, on);
+                    self.save_settings();
+                }
+                UiEvent::Pinned { jid, on } => {
+                    set_flag(&mut self.settings.pinned, jid, on);
+                    self.save_settings();
+                }
+                UiEvent::Archived { jid, on } => {
+                    set_flag(&mut self.settings.archived, jid, on);
+                    self.save_settings();
+                }
             }
         }
     }
@@ -534,6 +611,26 @@ Dann können wir alles besprechen.",
             ui.vertical(|ui| {
                 ui.label(RichText::new("Einstellungen").size(22.0).strong());
                 ui.add_space(12.0);
+                ui.label(RichText::new("WhatsApp-Profil").strong().color(pal.dim));
+                ui.label(RichText::new("Name").small().color(pal.dim));
+                ui.add(egui::TextEdit::singleline(&mut self.settings.profile_name).desired_width(300.0));
+                ui.label(RichText::new("Info").small().color(pal.dim));
+                ui.add(egui::TextEdit::singleline(&mut self.settings.profile_about).desired_width(300.0));
+                if ui.button("Profil bei WhatsApp speichern").clicked() {
+                    if !self.settings.profile_name.trim().is_empty() {
+                        let _ = self.cmd.send(Cmd::SetPushName(self.settings.profile_name.trim().to_owned()));
+                    }
+                    if !self.settings.profile_about.trim().is_empty() {
+                        let _ = self.cmd.send(Cmd::SetAbout(self.settings.profile_about.trim().to_owned()));
+                    }
+                    changed = true;
+                }
+                ui.label(
+                    RichText::new("Stumm, Anheften und Archiv werden im Chat-Kopf mit WhatsApp abgeglichen.")
+                        .small()
+                        .color(pal.dim),
+                );
+                ui.add_space(14.0);
                 ui.label(RichText::new("Benachrichtigungen").strong().color(pal.dim));
                 changed |= ui
                     .checkbox(&mut self.settings.notifications, "Bei neuen Nachrichten benachrichtigen")
@@ -683,13 +780,30 @@ impl eframe::App for App {
                     });
                 }
 
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    let n_arch = self.settings.archived.len();
+                    let lbl = if self.show_archive {
+                        "← Zurück zu Chats".to_owned()
+                    } else {
+                        format!("Archiviert ({n_arch})")
+                    };
+                    if n_arch > 0 || self.show_archive {
+                        if ui.add(egui::Button::new(RichText::new(lbl).small())).clicked() {
+                            self.show_archive = !self.show_archive;
+                        }
+                    }
+                });
+                let (pins, arch, show_archive) =
+                    (&self.settings.pinned, &self.settings.archived, self.show_archive);
                 let mut rows: Vec<(String, String, i64)> = self
                     .chats
                     .iter()
+                    .filter(|(k, _)| arch.contains(*k) == show_archive)
                     .map(|(k, c)| (k.clone(), self.display_name(c), c.last_ts))
                     .filter(|(_, n, _)| needle.is_empty() || n.to_lowercase().contains(&needle))
                     .collect();
-                rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+                rows.sort_by_key(|r| (!pins.contains(&r.0), std::cmp::Reverse(r.2)));
 
                 let mut clicked = None;
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show_rows(
@@ -733,8 +847,13 @@ impl eframe::App for App {
                                 ui.set_max_width(text_w);
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 2.0;
+                                    let shown = if self.settings.pinned.contains(key) {
+                                        format!("{name}  ·  angeheftet")
+                                    } else {
+                                        name.clone()
+                                    };
                                     ui.add(
-                                        egui::Label::new(RichText::new(name).size(15.0).strong())
+                                        egui::Label::new(RichText::new(shown).size(15.0).strong())
                                             .truncate(),
                                     );
                                     let last = c
@@ -856,6 +975,8 @@ impl eframe::App for App {
 
         // ---------- Mitte: Chat oder Einstellungen ----------
         let mut toggle_mute = false;
+        let mut toggle_pin = false;
+        let mut toggle_arch = false;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.chat)).show(ctx, |ui| {
             if self.show_settings {
                 self.settings_view(ui, ctx, &pal);
@@ -871,6 +992,8 @@ impl eframe::App for App {
             let title = self.display_name(chat);
             let user = chat.jid.user.to_string();
             let muted = self.settings.muted.iter().any(|m| m == &key);
+            let pinned = self.settings.pinned.iter().any(|m| m == &key);
+            let archived = self.settings.archived.iter().any(|m| m == &key);
             egui::Frame::new()
                 .fill(pal.bar)
                 .stroke(egui::Stroke::new(1.0_f32, pal.border))
@@ -892,10 +1015,18 @@ impl eframe::App for App {
                             let label = if muted { "Stumm" } else { "Laut" };
                             if ui
                                 .add(egui::Button::new(RichText::new(label).small()))
-                                .on_hover_text("Benachrichtigungen für diesen Chat umschalten")
+                                .on_hover_text("Stummschalten (wird mit WhatsApp abgeglichen)")
                                 .clicked()
                             {
                                 toggle_mute = true;
+                            }
+                            let pl = if pinned { "Angeheftet" } else { "Anheften" };
+                            if ui.add(egui::Button::new(RichText::new(pl).small())).clicked() {
+                                toggle_pin = true;
+                            }
+                            let al = if archived { "Aus Archiv" } else { "Archivieren" };
+                            if ui.add(egui::Button::new(RichText::new(al).small())).clicked() {
+                                toggle_arch = true;
                             }
                         });
                     });
@@ -965,15 +1096,25 @@ impl eframe::App for App {
                     ui.add_space(8.0);
                 });
         });
+        let Some(key) = self.selected.clone() else { return };
+        let Some(jid) = self.chats.get(&key).map(|c| c.jid.clone()) else { return };
         if toggle_mute {
-            if let Some(key) = self.selected.clone() {
-                if let Some(i) = self.settings.muted.iter().position(|m| m == &key) {
-                    self.settings.muted.remove(i);
-                } else {
-                    self.settings.muted.push(key);
-                }
-                self.save_settings();
-            }
+            let on = !self.is_muted(&key);
+            set_flag(&mut self.settings.muted, key.clone(), on);
+            let _ = self.cmd.send(Cmd::SetMute { jid: jid.clone(), on });
+        }
+        if toggle_pin {
+            let on = !self.settings.pinned.contains(&key);
+            set_flag(&mut self.settings.pinned, key.clone(), on);
+            let _ = self.cmd.send(Cmd::SetPin { jid: jid.clone(), on });
+        }
+        if toggle_arch {
+            let on = !self.settings.archived.contains(&key);
+            set_flag(&mut self.settings.archived, key.clone(), on);
+            let _ = self.cmd.send(Cmd::SetArchive { jid, on });
+        }
+        if toggle_mute || toggle_pin || toggle_arch {
+            self.save_settings();
         }
     }
 
