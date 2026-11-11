@@ -34,7 +34,7 @@ pub enum UiEvent {
     Receipt { ids: Vec<String>, status: u8 },
     /// Stumm/Angeheftet/Archiviert/Gelesen wie bei WhatsApp. `users` enthält
     /// Rufnummer und LID, damit der Chat in beiden Schreibweisen gefunden wird.
-    Muted { users: Vec<String>, on: bool },
+    Muted { users: Vec<String>, on: bool, until: Option<i64> },
     Pinned { users: Vec<String>, on: bool },
     Archived { users: Vec<String>, on: bool },
     ChatRead { users: Vec<String>, read: bool },
@@ -42,6 +42,10 @@ pub enum UiEvent {
     Info(String),
     /// Alle Gruppen mit Namen (direkt vom Server abgefragt).
     Groups(Vec<(Jid, String)>),
+    /// Jemand tippt (oder nimmt auf) in einem Chat.
+    Typing { chat: String, from: String, on: bool, recording: bool },
+    /// Online-Status eines Kontakts; `last_seen` in Sekunden.
+    Presence { user: String, online: bool, last_seen: Option<i64> },
     /// Eigene Nummer und LID (um eigene zitierte Nachrichten zu erkennen).
     Me(Vec<String>),
     /// Reaktion auf eine Nachricht; leeres Emoji = Reaktion entfernt.
@@ -62,7 +66,16 @@ pub enum Cmd {
     /// Eigene Nachricht für alle löschen.
     Revoke { chat: Jid, id: String },
     Avatar { jid: Jid },
-    SetMute { jid: Jid, on: bool },
+    /// Stummschalten; `until_ms` = Ende in Millisekunden, None = dauerhaft.
+    SetMute { jid: Jid, on: bool, until_ms: Option<i64> },
+    /// Eigenen Tippstatus senden.
+    Typing { chat: Jid, on: bool },
+    /// Online (Fenster aktiv) oder offline melden.
+    SetOnline(bool),
+    /// Online-Status eines Kontakts abonnieren.
+    Subscribe(Jid),
+    /// Nachricht weiterleiten (Medien ohne neuen Upload).
+    Forward { chat: Jid, msg: ChatMessage },
     SetPin { jid: Jid, on: bool },
     SetArchive { jid: Jid, on: bool, last: Option<LastMsg> },
     /// Chat gelesen: Lesebestätigungen senden und Ungelesen-Markierung abgleichen.
@@ -386,7 +399,7 @@ pub fn log(msg: impl AsRef<str>) {
 /// Blockiert kurz, deshalb immer in einem eigenen Thread aufrufen.
 pub fn show_notification(title: &str, body: &str) -> Result<(), String> {
     let r = notify_rust::Notification::new()
-        .appname("wa-snap")
+        .appname("WhatsSnap")
         .summary(title)
         .body(body)
         .icon("wa-snap")
@@ -399,7 +412,7 @@ pub fn show_notification(title: &str, body: &str) -> Result<(), String> {
         Err(e) => {
             log(format!("Benachrichtigung über D-Bus fehlgeschlagen: {e}"));
             match std::process::Command::new("notify-send")
-                .args(["-a", "wa-snap", "-i", "wa-snap", title, body])
+                .args(["-a", "WhatsSnap", "-i", "wa-snap", title, body])
                 .status()
             {
                 Ok(s) if s.success() => {
@@ -453,6 +466,7 @@ fn maybe_notify(state: &SharedNotify, m: &ChatMessage) {
         };
         (chat_name, body)
     };
+    crate::tray::BADGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::thread::spawn(move || {
         let _ = show_notification(&title, &body);
     });
@@ -646,6 +660,66 @@ fn range_of(chat: &Jid, last: Option<LastMsg>) -> Option<whatsapp_rust::features
     };
     let key = whatsapp_rust::features::message_key(l.id, chat, l.from_me, participant.as_ref());
     Some(whatsapp_rust::features::message_range(l.ts, None, vec![(key, l.ts)]))
+}
+
+/// Nachricht zum Weiterleiten bauen (Medien verweisen auf dieselbe CDN-Datei).
+fn forward_message(m: &ChatMessage) -> wa::Message {
+    use whatsapp_rust::waproto::buffa::MessageField as F;
+    let ci = || F::some(wa::ContextInfo { is_forwarded: Some(true), forwarding_score: Some(1), ..Default::default() });
+    let cap = if m.text.is_empty() { None } else { Some(m.text.clone()) };
+    let Some(md) = &m.media else {
+        return wa::Message {
+            extended_text_message: F::some(wa::message::ExtendedTextMessage { text: Some(m.text.clone()), context_info: ci(), ..Default::default() }),
+            ..Default::default()
+        };
+    };
+    let (url, dp, key, sha, enc, len, mime) = (
+        Some(md.url.clone()),
+        Some(md.direct_path.clone()),
+        Some(md.key.clone()),
+        Some(md.sha.clone()),
+        Some(md.enc_sha.clone()),
+        Some(md.len),
+        Some(md.mime.clone()),
+    );
+    match md.kind.as_str() {
+        "image" => wa::Message {
+            image_message: F::some(wa::message::ImageMessage {
+                url, direct_path: dp, media_key: key, file_sha256: sha, file_enc_sha256: enc, file_length: len, mimetype: mime,
+                width: Some(md.w), height: Some(md.h), caption: cap, context_info: ci(), ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "sticker" => wa::Message {
+            sticker_message: F::some(wa::message::StickerMessage {
+                url, direct_path: dp, media_key: key, file_sha256: sha, file_enc_sha256: enc, file_length: len, mimetype: mime,
+                width: Some(md.w), height: Some(md.h), is_animated: Some(md.animated), context_info: ci(), ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "video" | "gif" => wa::Message {
+            video_message: F::some(wa::message::VideoMessage {
+                url, direct_path: dp, media_key: key, file_sha256: sha, file_enc_sha256: enc, file_length: len, mimetype: mime,
+                width: Some(md.w), height: Some(md.h), seconds: Some(md.seconds), gif_playback: Some(md.kind == "gif"),
+                caption: cap, context_info: ci(), ..Default::default()
+            }),
+            ..Default::default()
+        },
+        "audio" | "ptt" => wa::Message {
+            audio_message: F::some(wa::message::AudioMessage {
+                url, direct_path: dp, media_key: key, file_sha256: sha, file_enc_sha256: enc, file_length: len, mimetype: mime,
+                seconds: Some(md.seconds), ptt: Some(md.kind == "ptt"), context_info: ci(), ..Default::default()
+            }),
+            ..Default::default()
+        },
+        _ => wa::Message {
+            document_message: F::some(wa::message::DocumentMessage {
+                url, direct_path: dp, media_key: key, file_sha256: sha, file_enc_sha256: enc, file_length: len, mimetype: mime,
+                file_name: Some(md.name.clone()), title: Some(md.name.clone()), caption: cap, context_info: ci(), ..Default::default()
+            }),
+            ..Default::default()
+        },
+    }
 }
 
 /// Datei hochladen und als Foto (Bilder) oder Dokument senden.
@@ -918,11 +992,29 @@ pub fn spawn(
                             EventKind::ArchiveUpdate,
                             EventKind::MarkChatAsReadUpdate,
                             EventKind::Receipt,
+                            EventKind::ChatPresence,
+                            EventKind::Presence,
                         ],
                         move |event, client| {
                             let s = s_ev.clone();
                             async move {
                                 match &*event {
+                                    Event::ChatPresence(c) => {
+                                        use whatsapp_rust::wacore::types::presence::{ChatPresence, ChatPresenceMedia};
+                                        s(UiEvent::Typing {
+                                            chat: c.source.chat.user.to_string(),
+                                            from: c.source.sender.user.to_string(),
+                                            on: matches!(c.state, ChatPresence::Composing),
+                                            recording: matches!(c.media, ChatPresenceMedia::Audio),
+                                        });
+                                    }
+                                    Event::Presence(p) => {
+                                        s(UiEvent::Presence {
+                                            user: p.from.user.to_string(),
+                                            online: !p.unavailable,
+                                            last_seen: p.last_seen.map(|t| t.timestamp()),
+                                        });
+                                    }
                                     Event::MuteUpdate(m) => {
                                         let end = m.action.mute_end_timestamp.unwrap_or(0);
                                         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -930,7 +1022,7 @@ pub fn spawn(
                                             && (end <= 0 || end > now_ms);
                                         let users = aliases(&client, &m.jid).await;
                                         log(format!("Stumm-Abgleich {} -> {on} {users:?}", m.jid));
-                                        s(UiEvent::Muted { users, on });
+                                        s(UiEvent::Muted { users, on, until: if on && end > 0 { Some(end / 1000) } else { None } });
                                     }
                                     Event::PinUpdate(p) => {
                                         let on = p.action.pinned.unwrap_or(false);
@@ -1093,6 +1185,50 @@ pub fn spawn(
                                         }
                                     });
                                 }
+                                Cmd::Typing { chat, on } => {
+                                    tokio::spawn(async move {
+                                        let cs = client.chatstate();
+                                        let _ = if on { cs.send_composing(&chat).await } else { cs.send_paused(&chat).await };
+                                    });
+                                }
+                                Cmd::SetOnline(on) => {
+                                    tokio::spawn(async move {
+                                        let p = client.presence();
+                                        let r = if on { p.set_available().await } else { p.set_unavailable().await };
+                                        if let Err(e) = r {
+                                            log(format!("Online-Status: {e}"));
+                                        }
+                                    });
+                                }
+                                Cmd::Subscribe(jid) => {
+                                    tokio::spawn(async move {
+                                        let _ = client.presence().subscribe(jid).await;
+                                    });
+                                }
+                                Cmd::Forward { chat, msg } => {
+                                    tokio::spawn(async move {
+                                        let wm = forward_message(&msg);
+                                        let temp = format!("local-fw-{}", chrono::Utc::now().timestamp_millis());
+                                        send(UiEvent::Message(ChatMessage {
+                                            chat: chat.clone(),
+                                            is_group: chat.is_group(),
+                                            from_me: true,
+                                            sender_name: String::new(),
+                                            sender: String::new(),
+                                            text: msg.text.clone(),
+                                            ts: chrono::Utc::now().timestamp(),
+                                            id: temp.clone(),
+                                            status: 0,
+                                            media: msg.media.clone(),
+                                            quote: None,
+                                        }));
+                                        let key = chat.to_string();
+                                        match client.send_message(&chat, wm).await {
+                                            Ok(r) => send(UiEvent::Sent { chat: key, temp, id: r.message_id }),
+                                            Err(e) => send(UiEvent::SendFailed { chat: key, temp, err: e.to_string() }),
+                                        }
+                                    });
+                                }
                                 Cmd::Avatar { jid } => {
                                     let dir = avatar_dir.clone();
                                     tokio::spawn(async move {
@@ -1101,10 +1237,14 @@ pub fn spawn(
                                         }
                                     });
                                 }
-                                Cmd::SetMute { jid, on } => {
+                                Cmd::SetMute { jid, on, until_ms } => {
                                     tokio::spawn(async move {
                                         let ca = client.chat_actions();
-                                        let r = if on { ca.mute_chat(&jid).await } else { ca.unmute_chat(&jid).await };
+                                        let r = match (on, until_ms) {
+                                            (true, Some(t)) => ca.mute_chat_until(&jid, t).await,
+                                            (true, None) => ca.mute_chat(&jid).await,
+                                            (false, _) => ca.unmute_chat(&jid).await,
+                                        };
                                         report(&send, &format!("Stummschalten {jid}"), r.map_err(|e| e.to_string()));
                                     });
                                 }
@@ -1166,7 +1306,7 @@ pub fn spawn(
                                 }
                                 Cmd::TestNotify => {
                                     std::thread::spawn(move || {
-                                        let m = match show_notification("wa-snap", "Test-Benachrichtigung") {
+                                        let m = match show_notification("WhatsSnap", "Test-Benachrichtigung") {
                                             Ok(()) => "Test-Benachrichtigung verschickt. Wenn keine erschien, blockiert das System sie (Systemeinstellungen → Benachrichtigungen).".to_owned(),
                                             Err(e) => format!("Benachrichtigung fehlgeschlagen: {e}"),
                                         };

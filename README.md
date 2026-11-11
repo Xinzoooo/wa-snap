@@ -1,11 +1,11 @@
-# wa-snap
+# WhatsSnap
 
 **Schneller, nativer WhatsApp-Desktop-Client in Rust.**
 Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk/egui), das WhatsApp-Protokoll kommt von [`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust). Dadurch startet das Programm schnell und braucht deutlich weniger Speicher als die Web-Versionen zum Herunterladen.
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.6)
+## Funktionen (v0.7)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - Bunte Emojis (Twemoji) in Nachrichten, Chatliste und Emoji-Auswahl mit Kategorien; reine Emoji-Nachrichten werden groß angezeigt
@@ -14,6 +14,15 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Stumm, Anheften und Archiv über Rechtsklick auf einen Chat oder das Menü im Chat-Kopf, abgeglichen mit WhatsApp (Nummer und LID werden beide zugeordnet)
 - Benachrichtigungen kommen auch, wenn das Fenster minimiert ist; Test-Knopf in den Einstellungen
 - Suche in der Chatliste und im geöffneten Chat
+- Symbol in der Leiste (Tray): Fenster schließen lässt WhatsSnap weiterlaufen, roter Punkt bei Ungelesenem, Rechtsklick → Beenden (abschaltbar in den Einstellungen); ein zweiter Start öffnet nur das vorhandene Fenster; Autostart startet unsichtbar in der Leiste
+- Formatierung wie bei WhatsApp: `*fett*`, `_kursiv_`, `~durchgestrichen~`, `` `Code` ``
+- Bilder mit Strg+V aus der Zwischenablage senden (mit Vorschau)
+- Entwürfe bleiben pro Chat erhalten, „Entwurf:“ in der Chatliste
+- „schreibt …“, „nimmt Sprachnachricht auf …“, „online“ und „zuletzt online“; du erscheinst online, solange das Fenster aktiv ist
+- Knopf „Nach unten“ mit Zähler neuer Nachrichten; Klick auf ein Zitat springt zur Originalnachricht
+- Weiterleiten (auch Fotos, Sticker, Dokumente ohne neuen Upload)
+- Stummschalten für 8 Stunden, 1 Woche oder immer
+- Tastenkürzel: Strg+F Suche, Strg+N neuer Chat, Esc schließt, Alt+↑/↓ wechselt den Chat
 - Verknüpfung per QR-Code, die Sitzung bleibt gespeichert; beim Verknüpfen wird der Verlauf der letzten 365 Tage angefordert
 - Verlauf wird lokal gespeichert und ist nach dem Neustart wieder da
 - Namen aus dem Adressbuch, Gruppennamen direkt vom Server, Profilbilder mit Zwischenspeicher
@@ -30,10 +39,10 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 ## Installation auf Fedora (empfohlen)
 
-Ein Befehl, danach findest du wa-snap in der Anwendungssuche und kannst es an die Taskleiste anheften:
+Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.6.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.7.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
@@ -65,7 +74,7 @@ Der erste Build dauert einige Minuten, danach startet das Programm sofort. Beim 
 wa-snap --install-desktop
 ```
 
-Das legt einen Startmenü-Eintrag mit Icon an. Danach findest du wa-snap im Anwendungsmenü und kannst es per Rechtsklick an die Taskleiste anheften.
+Das legt einen Startmenü-Eintrag mit Icon an. Danach findest du WhatsSnap im Anwendungsmenü und kannst es per Rechtsklick an die Taskleiste anheften.
 
 ## Daten
 

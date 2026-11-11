@@ -1,6 +1,6 @@
 [package]
 name = "wa-snap"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 description = "Schneller nativer WhatsApp-Desktop-Client in Rust (inoffiziell)"
@@ -17,6 +17,8 @@ notify-rust = "4"
 ureq = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+ksni = { version = "0.3", features = ["blocking"] }
+arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 
 [profile.release]
 lto = "thin"
@@ -36,3 +38,7 @@ assets = [
   { source = "assets/fonts/OFL.txt", dest = "/usr/share/licenses/wa-snap/Inter-OFL.txt", mode = "644", doc = true },
   { source = "assets/TWEMOJI-LICENSE.txt", dest = "/usr/share/licenses/wa-snap/Twemoji-CC-BY-4.0.txt", mode = "644", doc = true },
 ]
+
+[patch.crates-io]
+# Strg+V mit Bild in der Zwischenablage durchreichen (siehe vendor/egui-winit/src/lib.rs, "wa-snap:")
+egui-winit = { path = "vendor/egui-winit" }

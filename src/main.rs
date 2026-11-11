@@ -2,6 +2,7 @@ mod backend;
 mod emoji;
 mod store;
 mod theme;
+mod tray;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver};
@@ -25,6 +26,10 @@ struct Settings {
     /// Eigener Name und Info-Text (wie bei WhatsApp), nur zum Bearbeiten hier.
     profile_name: String,
     profile_about: String,
+    /// Fenster schließen lässt WhatsSnap im Tray weiterlaufen.
+    background: bool,
+    /// Ende einer befristeten Stummschaltung (Unix-Sekunden) je Nummer/LID.
+    muted_until: HashMap<String, i64>,
 }
 
 impl Default for Settings {
@@ -39,6 +44,8 @@ impl Default for Settings {
             archived: Vec::new(),
             profile_name: String::new(),
             profile_about: String::new(),
+            background: true,
+            muted_until: HashMap::new(),
         }
     }
 }
@@ -82,7 +89,7 @@ fn set_autostart(on: bool) -> std::io::Result<()> {
         }
         let exe = std::env::current_exe()?;
         let entry = include_str!("../assets/wa-snap.desktop")
-            .replace("@EXEC@", &format!("\"{}\"", exe.display()));
+            .replace("@EXEC@", &format!("\"{}\" --hidden", exe.display()));
         std::fs::write(file, entry)
     } else if file.exists() {
         std::fs::remove_file(file)
@@ -189,16 +196,20 @@ enum Filter {
     Groups,
 }
 
+const MUTE_OPTS: &[(&str, Option<i64>)] = &[("8 Stunden", Some(8 * 3600)), ("1 Woche", Some(7 * 86_400)), ("Immer", None)];
+
 /// Aktion auf eine einzelne Nachricht.
 enum MsgAct {
     React(String, String),
     Reply(String),
     Revoke(String),
+    Forward(String),
 }
 
 /// Aktion aus Kontextmenü oder Chat-Kopf.
 enum Act {
-    Mute(String),
+    /// Stummschalten umschalten; Sekunden = Dauer (None = dauerhaft).
+    Mute(String, Option<i64>),
     Pin(String),
     Archive(String),
     Read(String),
@@ -241,6 +252,24 @@ struct App {
     /// Antwort in Vorbereitung: (Chat, Zitat, zitierte Nachricht ist von mir).
     reply_to: Option<(String, backend::Quote, bool)>,
     me: Vec<String>,
+    drafts: HashMap<String, String>,
+    /// Tippt gerade: Chat-Nummer → (Absender, nimmt auf, Zeitpunkt)
+    typing: HashMap<String, (String, bool, std::time::Instant)>,
+    /// Online-Status: Nummer → (online, zuletzt online)
+    presence: HashMap<String, (bool, Option<i64>)>,
+    /// Zuletzt gesendeter eigener Tippstatus (Chat, Zeitpunkt)
+    my_typing: Option<(String, std::time::Instant)>,
+    /// Reihenfolge der sichtbaren Chats (für Alt+↑/↓)
+    row_keys: Vec<String>,
+    at_bottom: bool,
+    new_below: u32,
+    scroll_bottom: bool,
+    jump_to: Option<String>,
+    highlight: Option<(String, std::time::Instant)>,
+    /// Weiterleiten-Dialog: (Nachrichten-ID, Suchtext)
+    forward: Option<(String, String)>,
+    /// Bild aus der Zwischenablage, wartet auf Bestätigung
+    pending_paste: Option<(std::path::PathBuf, egui::TextureHandle)>,
 }
 
 fn user_of(key: &str) -> String {
@@ -307,9 +336,93 @@ fn draw_ticks(ui: &mut egui::Ui, status: u8, pal: &Palette) {
     }
 }
 
+/// WhatsApp-Formatierung: *fett*, _kursiv_, ~durchgestrichen~, `Code`/```Code```.
+/// Ergebnis: Textstücke mit Stil-Bits (1 fett, 2 kursiv, 4 durchgestrichen, 8 Code).
+fn fmt_spans(t: &str, base: u8) -> Vec<(String, u8)> {
+    let chars: Vec<char> = t.chars().collect();
+    let mut out: Vec<(String, u8)> = Vec::new();
+    let mut buf = String::new();
+    let boundary = |c: Option<&char>| c.map(|c| !c.is_alphanumeric()).unwrap_or(true);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if base & 8 == 0 && matches!(c, '*' | '_' | '~' | '`') {
+            // ```Block```
+            let triple = c == '`' && chars.get(i + 1) == Some(&'`') && chars.get(i + 2) == Some(&'`');
+            let mlen = if triple { 3 } else { 1 };
+            let open_ok = (i == 0 || boundary(chars.get(i - 1))) && chars.get(i + mlen).map(|n| !n.is_whitespace()).unwrap_or(false);
+            if open_ok {
+                let mut j = i + mlen;
+                let mut close = None;
+                while j < chars.len() {
+                    if chars[j] == '\n' && !triple {
+                        break;
+                    }
+                    let is_close = if triple {
+                        chars[j] == '`' && chars.get(j + 1) == Some(&'`') && chars.get(j + 2) == Some(&'`')
+                    } else {
+                        chars[j] == c
+                    };
+                    if is_close && j > i + mlen && !chars[j - 1].is_whitespace() && boundary(chars.get(j + mlen)) {
+                        close = Some(j);
+                        break;
+                    }
+                    j += 1;
+                }
+                if let Some(j) = close {
+                    if !buf.is_empty() {
+                        out.push((std::mem::take(&mut buf), base));
+                    }
+                    let inner: String = chars[i + mlen..j].iter().collect();
+                    let bit = match c {
+                        '*' => 1,
+                        '_' => 2,
+                        '~' => 4,
+                        _ => 8,
+                    };
+                    if bit == 8 {
+                        out.push((inner, base | 8));
+                    } else {
+                        out.extend(fmt_spans(&inner, base | bit));
+                    }
+                    i = j + mlen;
+                    continue;
+                }
+            }
+        }
+        buf.push(c);
+        i += 1;
+    }
+    if !buf.is_empty() {
+        out.push((buf, base));
+    }
+    out
+}
+
+fn has_format(t: &str) -> bool {
+    t.contains(['*', '_', '~', '`'])
+}
+
+fn styled(t: String, style: u8, size: f32) -> RichText {
+    let mut r = RichText::new(t).size(size);
+    if style & 8 != 0 {
+        r = r.code();
+    }
+    if style & 1 != 0 {
+        r = r.family(theme::bold());
+    }
+    if style & 2 != 0 {
+        r = r.italics();
+    }
+    if style & 4 != 0 {
+        r = r.strikethrough();
+    }
+    r
+}
+
 /// Text mit bunten Emojis in einer Umbruch-Zeile ausgeben. Nur Emojis (bis 3) werden groß gezeigt.
 fn rich_label(ui: &mut egui::Ui, text: &str, size: f32, cache: &mut emoji::Cache) {
-    if !emoji::has_emoji(text) {
+    if !emoji::has_emoji(text) && !has_format(text) {
         ui.add(egui::Label::new(RichText::new(text).size(size)).selectable(true));
         return;
     }
@@ -320,7 +433,9 @@ fn rich_label(ui: &mut egui::Ui, text: &str, size: f32, cache: &mut emoji::Cache
     for s in segs {
         match s {
             emoji::Seg::Text(t) => {
-                ui.add(egui::Label::new(RichText::new(t).size(size)).selectable(true));
+                for (part, style) in fmt_spans(t, 0) {
+                    ui.add(egui::Label::new(styled(part, style, size)).selectable(true));
+                }
             }
             emoji::Seg::Emoji(k) => match cache.get(ui.ctx(), &k) {
                 Some(id) => {
@@ -435,7 +550,7 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, size: f32, color: Color32, pal: &P
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, core: Core) -> Self {
         let mut settings = load_settings();
         // Ältere Versionen speicherten volle JIDs; jetzt zählt nur die Nummer/LID.
         for list in [&mut settings.muted, &mut settings.pinned, &mut settings.archived] {
@@ -447,11 +562,8 @@ impl App {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, settings.dark, settings.font_size);
 
-        let (tx, rx) = channel();
-        let ctx = cc.egui_ctx.clone();
+        let Core { rx, cmd, notify } = core;
         let dir = data_dir();
-        let notify: backend::SharedNotify = Default::default();
-        let cmd = backend::spawn(dir.clone(), tx, notify.clone(), move || ctx.request_repaint());
         let (store, recs) = Store::open(&dir.join("history.jsonl"));
 
         let mut app = Self {
@@ -487,6 +599,18 @@ impl App {
             reactions: HashMap::new(),
             reply_to: None,
             me: Vec::new(),
+            drafts: HashMap::new(),
+            typing: HashMap::new(),
+            presence: HashMap::new(),
+            my_typing: None,
+            row_keys: Vec::new(),
+            at_bottom: true,
+            new_below: 0,
+            scroll_bottom: false,
+            jump_to: None,
+            highlight: None,
+            forward: None,
+            pending_paste: None,
         };
         for r in recs {
             app.apply_rec(r);
@@ -512,7 +636,7 @@ impl App {
         let texts = [
             ("Hey, bist du später noch online?", false),
             ("Klar, ich melde mich gegen 20 Uhr.\nDann können wir alles besprechen.", true),
-            ("Perfekt, bis dann! 👍", false),
+            ("Perfekt, *bis dann*! 👍 _Bring_ ~Kuchen~ `Pizza` mit", false),
             ("Super 😊 bis später ❤️", true),
             ("😂👍", false),
         ];
@@ -722,6 +846,15 @@ impl App {
         if src != Source::Disk && !m.id.starts_with("local-") {
             self.persist_msg(&key, &m);
         }
+        if src == Source::Live && !m.from_me {
+            self.typing.remove(m.chat.user.as_str());
+        }
+        if src == Source::Live && selected && !self.at_bottom && !m.from_me {
+            self.new_below += 1;
+        }
+        if src == Source::Live && m.from_me && selected {
+            self.scroll_bottom = true;
+        }
         if src == Source::Live && !m.from_me && selected && focused {
             self.mark_read(&key);
         }
@@ -773,9 +906,45 @@ impl App {
         }
     }
 
+    /// Chat öffnen: Entwurf des alten Chats merken, den des neuen laden.
+    fn select_chat(&mut self, key: String) {
+        if self.selected.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        if let Some(old) = self.selected.take() {
+            let d = std::mem::take(&mut self.input);
+            if d.trim().is_empty() {
+                self.drafts.remove(&old);
+            } else {
+                self.drafts.insert(old.clone(), d);
+            }
+            if let Some((k, _)) = &self.my_typing {
+                if *k == old {
+                    if let Some(c) = self.chats.get(&old) {
+                        let _ = self.cmd.send(Cmd::Typing { chat: c.jid.clone(), on: false });
+                    }
+                    self.my_typing = None;
+                }
+            }
+        }
+        self.input = self.drafts.remove(&key).unwrap_or_default();
+        self.show_settings = false;
+        self.chat_search = None;
+        self.at_bottom = true;
+        self.new_below = 0;
+        self.scroll_bottom = true;
+        if let Some(c) = self.chats.get(&key) {
+            if !c.is_group && self.conn == Conn::Online {
+                let _ = self.cmd.send(Cmd::Subscribe(c.jid.clone()));
+            }
+        }
+        self.selected = Some(key.clone());
+        self.mark_read(&key);
+    }
+
     fn run_msg_act(&mut self, a: MsgAct) {
         let id = match &a {
-            MsgAct::React(id, _) | MsgAct::Reply(id) | MsgAct::Revoke(id) => id.clone(),
+            MsgAct::React(id, _) | MsgAct::Reply(id) | MsgAct::Revoke(id) | MsgAct::Forward(id) => id.clone(),
         };
         let Some(key) = self.msg_index.get(&id).cloned() else { return };
         let Some(chat) = self.chats.get(&key) else { return };
@@ -800,6 +969,9 @@ impl App {
             }
             MsgAct::Revoke(_) => {
                 let _ = self.cmd.send(Cmd::Revoke { chat: jid, id });
+            }
+            MsgAct::Forward(_) => {
+                self.forward = Some((id, String::new()));
             }
         }
     }
@@ -877,15 +1049,24 @@ impl App {
 
     fn run_act(&mut self, act: Act) {
         let key = match &act {
-            Act::Mute(k) | Act::Pin(k) | Act::Archive(k) | Act::Read(k) => k.clone(),
+            Act::Mute(k, _) | Act::Pin(k) | Act::Archive(k) | Act::Read(k) => k.clone(),
         };
         let Some(jid) = self.chats.get(&key).map(|c| c.jid.clone()) else { return };
         let user = jid.user.to_string();
         match act {
-            Act::Mute(_) => {
+            Act::Mute(_, secs) => {
                 let on = !Self::has(&self.settings.muted, &key);
-                set_flag(&mut self.settings.muted, user, on);
-                let _ = self.cmd.send(Cmd::SetMute { jid, on });
+                set_flag(&mut self.settings.muted, user.clone(), on);
+                let until = if on { secs.map(|d| now_ts() + d) } else { None };
+                match until {
+                    Some(t) => {
+                        self.settings.muted_until.insert(user, t);
+                    }
+                    None => {
+                        self.settings.muted_until.remove(&user);
+                    }
+                }
+                let _ = self.cmd.send(Cmd::SetMute { jid, on, until_ms: until.map(|t| t * 1000) });
             }
             Act::Pin(_) => {
                 let on = !Self::has(&self.settings.pinned, &key);
@@ -977,6 +1158,22 @@ impl App {
                 }
                 UiEvent::Info(m) => self.info = if m.is_empty() { None } else { Some(m) },
                 UiEvent::Me(users) => self.me = users,
+                UiEvent::Typing { chat, from, on, recording } => {
+                    if on {
+                        self.typing.insert(chat, (from, recording, std::time::Instant::now()));
+                    } else {
+                        self.typing.remove(&chat);
+                    }
+                }
+                UiEvent::Presence { user, online, last_seen } => {
+                    let e = self.presence.entry(user).or_insert((false, None));
+                    e.0 = online;
+                    if last_seen.is_some() {
+                        e.1 = last_seen;
+                    } else if !online {
+                        e.1 = Some(now_ts());
+                    }
+                }
                 UiEvent::Reaction { target, from, emoji } => self.set_reaction(target, from, emoji, true),
                 UiEvent::Revoked { id } => self.revoke_local(&id, true),
                 UiEvent::Edited { id, text } => self.edit_local(&id, text, true),
@@ -1003,7 +1200,19 @@ impl App {
                     }
                     self.names_dirty = true;
                 }
-                UiEvent::Muted { users, on } => self.apply_flag(0, users, on),
+                UiEvent::Muted { users, on, until } => {
+                    for u in &users {
+                        match until {
+                            Some(t) if on => {
+                                self.settings.muted_until.insert(u.clone(), t);
+                            }
+                            _ => {
+                                self.settings.muted_until.remove(u);
+                            }
+                        }
+                    }
+                    self.apply_flag(0, users, on)
+                }
                 UiEvent::Pinned { users, on } => self.apply_flag(1, users, on),
                 UiEvent::Archived { users, on } => self.apply_flag(2, users, on),
                 UiEvent::ChatRead { users, read } => {
@@ -1019,6 +1228,16 @@ impl App {
 
     /// Zustand für Benachrichtigungen im Backend aktuell halten.
     fn sync_notify_state(&mut self) {
+        // Abgelaufene befristete Stummschaltungen aufheben.
+        let now = now_ts();
+        let expired: Vec<String> = self.settings.muted_until.iter().filter(|(_, t)| **t <= now).map(|(u, _)| u.clone()).collect();
+        if !expired.is_empty() {
+            for u in &expired {
+                self.settings.muted_until.remove(u);
+                set_flag(&mut self.settings.muted, u.clone(), false);
+            }
+            self.save_settings();
+        }
         let Ok(mut st) = self.notify.lock() else { return };
         st.enabled = self.settings.notifications;
         st.preview = self.settings.preview;
@@ -1187,6 +1406,9 @@ impl App {
                     });
 
                     section(ui, "SYSTEM");
+                    changed |= ui
+                        .checkbox(&mut self.settings.background, "Beim Schließen im Hintergrund weiterlaufen (Symbol in der Leiste)")
+                        .changed();
                     if ui.checkbox(&mut self.autostart, "Beim Anmelden automatisch starten").changed() {
                         if let Err(e) = set_autostart(self.autostart) {
                             self.info = Some(format!("Autostart: {e}"));
@@ -1197,7 +1419,7 @@ impl App {
                         if ui.button("Log-Ordner öffnen").clicked() {
                             let _ = std::process::Command::new("xdg-open").arg(data_dir()).spawn();
                         }
-                        ui.label(RichText::new(format!("wa-snap {}", env!("CARGO_PKG_VERSION"))).small().color(pal.dim));
+                        ui.label(RichText::new(format!("WhatsSnap {}", env!("CARGO_PKG_VERSION"))).small().color(pal.dim));
                     });
                     ui.add_space(24.0);
                 });
@@ -1351,8 +1573,7 @@ impl App {
                             let key = jid.to_string();
                             let c = self.chat_entry(&jid, false);
                             c.name = format!("+{digits}");
-                            self.selected = Some(key);
-                            self.show_settings = false;
+                            self.select_chat(key);
                             self.search.clear();
                         }
                     });
@@ -1392,6 +1613,7 @@ impl App {
                     .filter(|(_, n, _, _)| needle.is_empty() || n.to_lowercase().contains(&needle))
                     .collect();
                 rows.sort_by_key(|r| (!r.3, std::cmp::Reverse(r.2)));
+                self.row_keys = rows.iter().map(|r| r.0.clone()).collect();
                 if rows.is_empty() {
                     ui.add_space(30.0);
                     ui.vertical_centered(|ui| {
@@ -1473,7 +1695,23 @@ impl App {
                             icons_w += 22.0;
                         }
                         let mut px = txt_rect.left();
-                        if let Some(m) = c.messages.last() {
+                        let typing = self.typing.get(user.as_str()).filter(|t| t.2.elapsed().as_secs() < 12);
+                        let draft = if sel { None } else { self.drafts.get(key).filter(|d| !d.trim().is_empty()) };
+                        if let Some((from, rec, _)) = typing {
+                            let what = if *rec { "nimmt Sprachnachricht auf …" } else { "schreibt …" };
+                            let t = if c.is_group {
+                                format!("{} {what}", self.names.get(from).map(|n| n.0.clone()).unwrap_or_else(|| format!("+{from}")))
+                            } else {
+                                what.to_owned()
+                            };
+                            p.text(egui::pos2(px, y2), egui::Align2::LEFT_CENTER, t, egui::FontId::proportional(14.0), pal.accent);
+                        } else if let Some(d) = draft {
+                            let g = p.layout_no_wrap("Entwurf: ".into(), egui::FontId::proportional(14.0), pal.accent);
+                            let w = g.size().x;
+                            p.galley(egui::pos2(px, y2 - g.size().y / 2.0), g, pal.accent);
+                            let pclip = egui::Rect::from_min_max(egui::pos2(px, y2 - 10.0), egui::pos2(txt_rect.right() - icons_w - 6.0, y2 + 10.0));
+                            paint_rich_line(&p.with_clip_rect(pclip), ui.ctx(), &mut ecache, egui::pos2(px + w, y2), &d.replace('\n', " "), egui::FontId::proportional(14.0), pal.dim);
+                        } else if let Some(m) = c.messages.last() {
                             if m.from_me {
                                 let mut tick_ui = ui.new_child(
                                     egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(egui::pos2(px, y2 - 6.0), egui::vec2(18.0, 12.0))),
@@ -1511,9 +1749,20 @@ impl App {
                                 act = Some(Act::Archive(k.clone()));
                                 ui.close_menu();
                             }
-                            if ui.button(if is_muted { "Stummschaltung aufheben" } else { "Benachrichtigungen stummschalten" }).clicked() {
-                                act = Some(Act::Mute(k.clone()));
-                                ui.close_menu();
+                            if is_muted {
+                                if ui.button("Stummschaltung aufheben").clicked() {
+                                    act = Some(Act::Mute(k.clone(), None));
+                                    ui.close_menu();
+                                }
+                            } else {
+                                ui.menu_button("Stummschalten", |ui| {
+                                    for (l, d) in MUTE_OPTS {
+                                        if ui.button(*l).clicked() {
+                                            act = Some(Act::Mute(k.clone(), *d));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
                             }
                             if ui.button(if *pinned { "Chat loslösen" } else { "Chat anheften" }).clicked() {
                                 act = Some(Act::Pin(k.clone()));
@@ -1527,10 +1776,7 @@ impl App {
                     }
                 });
                 if let Some(k) = clicked {
-                    self.selected = Some(k.clone());
-                    self.show_settings = false;
-                    self.chat_search = None;
-                    self.mark_read(&k);
+                    self.select_chat(k);
                 }
             });
         self.emoji = ecache;
@@ -1547,6 +1793,8 @@ impl App {
         let input_id = egui::Id::new("wa_input");
         let mut do_send = false;
         let mut attach = false;
+        let mut paste_send: Option<std::path::PathBuf> = None;
+        let mut typed = false;
         let mut sticker_send: Option<backend::MediaRef> = None;
         egui::TopBottomPanel::bottom("input")
             .frame(egui::Frame::new().fill(pal.chat).inner_margin(egui::Margin { left: 16, right: 16, top: 6, bottom: 12 }))
@@ -1558,6 +1806,36 @@ impl App {
                     && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                 {
                     do_send = true;
+                }
+                if enabled && ctx.memory(|m| m.has_focus(input_id)) && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+                    self.try_paste_image(ctx);
+                }
+                if let Some((path, tex)) = self.pending_paste.clone() {
+                    egui::Frame::new()
+                        .fill(pal.bubble_them)
+                        .corner_radius(12.0)
+                        .inner_margin(egui::Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let sz = tex.size_vec2();
+                                let k = (96.0 / sz.y).min(1.0);
+                                ui.add(egui::Image::new((tex.id(), sz * k)).corner_radius(6.0));
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new("Bild aus der Zwischenablage senden?").family(theme::bold()));
+                                    ui.label(RichText::new("Text im Eingabefeld wird zur Bildunterschrift.").small().color(pal.dim));
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Senden").clicked() {
+                                            paste_send = Some(path.clone());
+                                        }
+                                        if ui.button("Abbrechen").clicked() {
+                                            self.pending_paste = None;
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                    ui.add_space(4.0);
                 }
                 let reply = self.reply_to.clone().filter(|(k, _, _)| Some(k) == self.selected.as_ref());
                 if let Some((_, q, _)) = reply {
@@ -1683,7 +1961,7 @@ impl App {
                             );
                             let has_text = !self.input.trim().is_empty();
                             let send_w = 44.0;
-                            ui.add_enabled(
+                            typed = ui.add_enabled(
                                 enabled,
                                 egui::TextEdit::multiline(&mut self.input)
                                     .id(input_id)
@@ -1692,7 +1970,7 @@ impl App {
                                     .desired_rows(1)
                                     .margin(egui::vec2(6.0, 9.0))
                                     .desired_width(ui.available_width() - send_w),
-                            );
+                            ).changed();
                             let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::click());
                             let c = rect.center();
                             let (bg, fg) = if has_text { (pal.accent, pal.on_accent) } else { (Color32::TRANSPARENT, pal.dim) };
@@ -1717,6 +1995,23 @@ impl App {
                     let caption = if i == 0 { std::mem::take(&mut self.input).trim().to_owned() } else { String::new() };
                     let _ = self.cmd.send(Cmd::SendFile { chat: jid.clone(), path: Some(path), caption });
                 }
+                if let Some(path) = paste_send {
+                    self.pending_paste = None;
+                    let caption = std::mem::take(&mut self.input).trim().to_owned();
+                    let _ = self.cmd.send(Cmd::SendFile { chat: jid.clone(), path: Some(path), caption });
+                }
+                // Eigenen Tippstatus senden (höchstens alle 8 Sekunden)
+                let key = jid.to_string();
+                if typed && !self.input.trim().is_empty() {
+                    let fresh = matches!(&self.my_typing, Some((k, t)) if *k == key && t.elapsed().as_secs() < 8);
+                    if !fresh {
+                        let _ = self.cmd.send(Cmd::Typing { chat: jid.clone(), on: true });
+                        self.my_typing = Some((key, std::time::Instant::now()));
+                    }
+                } else if (typed || do_send) && self.my_typing.is_some() {
+                    let _ = self.cmd.send(Cmd::Typing { chat: jid.clone(), on: false });
+                    self.my_typing = None;
+                }
                 if attach {
                     let caption = std::mem::take(&mut self.input).trim().to_owned();
                     let _ = self.cmd.send(Cmd::SendFile { chat: jid.clone(), path: None, caption });
@@ -1734,6 +2029,9 @@ impl App {
         let mut media_req: Vec<(String, backend::MediaRef)> = Vec::new();
         let mut open_req: Vec<(String, backend::MediaRef)> = Vec::new();
         let mut msg_act: Option<MsgAct> = None;
+        let mut jump_req: Option<String> = None;
+        let mut jumped = false;
+        let mut scroll_out: Option<(f32, egui::Rect)> = None;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.chat)).show(ctx, |ui| {
             if self.show_settings {
                 self.settings_view(ui, ctx, pal);
@@ -1742,7 +2040,7 @@ impl App {
             let Some(key) = self.selected.clone() else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.35);
-                    ui.label(RichText::new("wa-snap für Linux").size(28.0).family(theme::bold()));
+                    ui.label(RichText::new("WhatsSnap für Linux").size(28.0).family(theme::bold()));
                     ui.add_space(6.0);
                     ui.label(RichText::new("Nachrichten senden und empfangen, ohne Browser.").color(pal.dim));
                     ui.add_space(24.0);
@@ -1772,14 +2070,31 @@ impl App {
                             ui.spacing_mut().item_spacing.y = 0.0;
                             ui.add_space(2.0);
                             ui.label(RichText::new(&title).size(16.0).family(theme::bold()));
-                            let sub = if is_group {
-                                "Gruppe".to_owned()
+                            let typing = self.typing.get(user.as_str()).filter(|t| t.2.elapsed().as_secs() < 12);
+                            let (sub, col) = if let Some((from, rec, _)) = typing {
+                                let what = if *rec { "nimmt Sprachnachricht auf …" } else { "schreibt …" };
+                                let t = if is_group {
+                                    format!("{} {what}", self.names.get(from).map(|n| n.0.clone()).unwrap_or_else(|| format!("+{from}")))
+                                } else {
+                                    what.to_owned()
+                                };
+                                (t, pal.accent)
+                            } else if is_group {
+                                ("Gruppe".to_owned(), pal.dim)
+                            } else if let Some((online, seen)) = self.presence.get(user.as_str()) {
+                                if *online {
+                                    ("online".to_owned(), pal.dim)
+                                } else if let Some(t) = seen {
+                                    (format!("zuletzt online {}", fmt_last_seen(*t)), pal.dim)
+                                } else {
+                                    (format!("+{user}"), pal.dim)
+                                }
                             } else if chat.jid.server == whatsapp_rust::Server::Pn {
-                                format!("+{user}")
+                                (format!("+{user}"), pal.dim)
                             } else {
-                                "Kontakt".to_owned()
+                                ("Kontakt".to_owned(), pal.dim)
                             };
-                            ui.label(RichText::new(sub).size(12.5).color(pal.dim));
+                            ui.label(RichText::new(sub).size(12.5).color(col));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let dots = icon_button(ui, "", 17.0, pal.dim, pal, "Menü");
@@ -1792,9 +2107,17 @@ impl App {
                             }
                             egui::popup::popup_below_widget(ui, menu_id, &dots, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                                 ui.set_min_width(240.0);
-                                if ui.button(if muted { "Stummschaltung aufheben" } else { "Benachrichtigungen stummschalten" }).clicked() {
-                                    act = Some(Act::Mute(key.clone()));
-                                    ui.close_menu();
+                                if muted {
+                                    if ui.button("Stummschaltung aufheben").clicked() {
+                                        act = Some(Act::Mute(key.clone(), None));
+                                    }
+                                } else {
+                                    ui.label(RichText::new("Stummschalten für").small().color(pal.dim));
+                                    for (l, d) in MUTE_OPTS {
+                                        if ui.button(format!("   {l}")).clicked() {
+                                            act = Some(Act::Mute(key.clone(), *d));
+                                        }
+                                    }
                                 }
                                 if ui.button(if pinned { "Chat loslösen" } else { "Chat anheften" }).clicked() {
                                     act = Some(Act::Pin(key.clone()));
@@ -1853,9 +2176,11 @@ impl App {
             } else {
                 chat.messages.iter().filter(|m| m.text.to_lowercase().contains(&needle)).collect()
             };
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .stick_to_bottom(true)
+            let mut area = egui::ScrollArea::vertical().auto_shrink([false; 2]).stick_to_bottom(true);
+            if self.scroll_bottom {
+                area = area.vertical_scroll_offset(f32::MAX);
+            }
+            let out = area
                 .show(ui, |ui| {
                     ui.add_space(10.0);
                     let full_w = ui.available_width();
@@ -1940,6 +2265,9 @@ impl App {
                                                 let t: String = q.text.replace('\n', " ").chars().take(120).collect();
                                                 ui.add(egui::Label::new(RichText::new(t).size(13.0).color(pal.dim)).truncate());
                                             });
+                                        if fr.response.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                            jump_req = Some(q.id.clone());
+                                        }
                                         let r = fr.response.rect;
                                         ui.painter().rect_filled(
                                             egui::Rect::from_min_max(r.left_top(), egui::pos2(r.left() + 4.0, r.bottom())),
@@ -1967,6 +2295,17 @@ impl App {
                                     }));
                                     });
                                 });
+                            if self.jump_to.as_deref() == Some(m.id.as_str()) {
+                                resp.response.scroll_to_me(Some(egui::Align::Center));
+                                jumped = true;
+                            }
+                            if let Some((hid, t)) = &self.highlight {
+                                if *hid == m.id && t.elapsed().as_millis() < 1600 {
+                                    let a = 1.0 - t.elapsed().as_millis() as f32 / 1600.0;
+                                    ui.painter().rect_stroke(resp.response.rect.shrink2(egui::vec2(margin_side as f32, 0.0)), 8.0, egui::Stroke::new(2.0_f32, pal.accent.gamma_multiply(a)), egui::StrokeKind::Outside);
+                                    ui.ctx().request_repaint();
+                                }
+                            }
                             // Reaktionen unter der Blase
                             if let Some(list) = self.reactions.get(&m.id).filter(|l| !l.is_empty()) {
                                 let mut uniq: Vec<&str> = Vec::new();
@@ -2029,6 +2368,10 @@ impl App {
                                     msg_act = Some(MsgAct::Reply(m.id.clone()));
                                     ui.close_menu();
                                 }
+                                if ui.button("Weiterleiten").clicked() {
+                                    msg_act = Some(MsgAct::Forward(m.id.clone()));
+                                    ui.close_menu();
+                                }
                                 if !m.text.is_empty() && ui.button("Text kopieren").clicked() {
                                     ui.ctx().copy_text(m.text.clone());
                                     ui.close_menu();
@@ -2061,8 +2404,59 @@ impl App {
                     }
                     ui.add_space(10.0);
                 });
+            let dist = out.content_size.y - (out.state.offset.y + out.inner_rect.height());
+            scroll_out = Some((dist, out.inner_rect));
         });
         self.emoji = ecache;
+        self.scroll_bottom = false;
+        if jumped {
+            if let Some(id) = self.jump_to.take() {
+                self.highlight = Some((id, std::time::Instant::now()));
+            }
+        }
+        if let Some(id) = jump_req {
+            if self.msg_index.contains_key(&id) {
+                self.jump_to = Some(id);
+            } else {
+                self.info = Some("Die zitierte Nachricht ist nicht im geladenen Verlauf.".into());
+            }
+        }
+        // Knopf "Nach unten" mit Zähler neuer Nachrichten
+        if let Some((dist, rect)) = scroll_out {
+            self.at_bottom = dist < 80.0;
+            if self.at_bottom {
+                self.new_below = 0;
+            } else if !self.show_settings {
+                let c = rect.right_bottom() + egui::vec2(-36.0, -30.0);
+                let r = egui::Rect::from_center_size(c, egui::vec2(40.0, 40.0));
+                let pal2 = *pal;
+                let n = self.new_below;
+                let clicked = egui::Area::new(egui::Id::new("to_bottom"))
+                    .fixed_pos(r.min)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        let (rr, resp) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::click());
+                        let p = ui.painter();
+                        p.circle_filled(rr.center(), 20.0, pal2.bubble_them);
+                        p.circle_stroke(rr.center(), 20.0, egui::Stroke::new(1.0_f32, pal2.border));
+                        let cc = rr.center();
+                        let st = egui::Stroke::new(2.0_f32, pal2.dim);
+                        p.line_segment([cc + egui::vec2(-6.0, -3.0), cc + egui::vec2(0.0, 3.0)], st);
+                        p.line_segment([cc + egui::vec2(0.0, 3.0), cc + egui::vec2(6.0, -3.0)], st);
+                        if n > 0 {
+                            let bc = rr.right_top() + egui::vec2(-4.0, 4.0);
+                            p.circle_filled(bc, 10.0, pal2.accent);
+                            p.text(bc, egui::Align2::CENTER_CENTER, n.min(99).to_string(), egui::FontId::new(11.0, theme::bold()), pal2.on_accent);
+                        }
+                        resp.on_hover_text("Nach unten").clicked()
+                    })
+                    .inner;
+                if clicked {
+                    self.scroll_bottom = true;
+                    self.new_below = 0;
+                }
+            }
+        }
         for (id, media) in media_req {
             if self.img_requested.insert(id.clone()) {
                 let _ = self.cmd.send(Cmd::LoadMedia { id, media });
@@ -2155,6 +2549,16 @@ impl App {
     }
 }
 
+fn fmt_last_seen(ts: i64) -> String {
+    let label = day_label(ts);
+    let t = fmt_time(ts);
+    match label.as_str() {
+        "Heute" => format!("heute um {t}"),
+        "Gestern" => format!("gestern um {t}"),
+        d => format!("am {d} um {t}"),
+    }
+}
+
 fn fmt_size(n: u64) -> String {
     if n >= 1024 * 1024 {
         format!("{:.1} MB", n as f64 / 1048576.0)
@@ -2180,6 +2584,11 @@ impl eframe::App for App {
         let was_focused = self.focused;
         self.focused = ctx.input(|i| i.focused);
         self.pump(ctx);
+        // Online-Status wie bei WhatsApp Web: online, solange das Fenster aktiv ist.
+        if self.focused != was_focused && self.conn == Conn::Online {
+            let _ = self.cmd.send(Cmd::SetOnline(self.focused));
+        }
+        self.shortcuts(ctx);
         // Fenster wieder im Vordergrund: offenen Chat als gelesen markieren.
         if self.focused && !was_focused {
             if let Some(k) = self.selected.clone() {
@@ -2189,6 +2598,13 @@ impl eframe::App for App {
             }
         }
         self.sync_notify_state();
+        let unread: u32 = self
+            .chats
+            .iter()
+            .filter(|(k, c)| c.unread > 0 && !Self::has(&self.settings.archived, k) && !Self::has(&self.settings.muted, k))
+            .map(|(_, c)| c.unread)
+            .sum();
+        tray::BADGE.store(unread, std::sync::atomic::Ordering::Relaxed);
         let pal = Palette::of(self.settings.dark);
 
         if self.conn != Conn::Online && self.chats.is_empty() {
@@ -2215,7 +2631,7 @@ impl eframe::App for App {
                             );
                         }
                         _ => {
-                            ui.label(RichText::new("wa-snap").size(26.0).family(theme::bold()));
+                            ui.label(RichText::new("WhatsSnap").size(26.0).family(theme::bold()));
                             ui.label(RichText::new(&self.status).color(pal.dim));
                             ui.add_space(8.0);
                             ui.spinner();
@@ -2232,11 +2648,246 @@ impl eframe::App for App {
             self.input_bar(ctx, &pal);
         }
         self.chat_view(ctx, &pal);
+        self.forward_dialog(ctx, &pal);
+    }
+}
+
+impl App {
+    /// Tastenkürzel: Strg+F Suche, Strg+N neuer Chat, Esc schließen, Alt+↑/↓ Chat wechseln.
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+        let (find, new, esc, up, down) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::COMMAND, Key::F),
+                i.consume_key(Modifiers::COMMAND, Key::N),
+                i.key_pressed(Key::Escape),
+                i.consume_key(Modifiers::ALT, Key::ArrowUp),
+                i.consume_key(Modifiers::ALT, Key::ArrowDown),
+            )
+        });
+        if find || new {
+            self.show_settings = false;
+            self.show_archive = false;
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("list_search")));
+            if new {
+                self.info = Some("Telefonnummer mit Ländervorwahl in die Suche tippen, z. B. +49 151 …".into());
+            }
+        }
+        if esc && !ctx.memory(|m| m.any_popup_open()) {
+            if self.forward.is_some() {
+                self.forward = None;
+            } else if self.pending_paste.is_some() {
+                self.pending_paste = None;
+            } else if self.reply_to.is_some() {
+                self.reply_to = None;
+            } else if self.chat_search.is_some() {
+                self.chat_search = None;
+            } else if self.show_settings {
+                self.show_settings = false;
+            } else if !self.search.is_empty() {
+                self.search.clear();
+            } else if let Some(k) = self.selected.clone() {
+                let d = std::mem::take(&mut self.input);
+                if !d.trim().is_empty() {
+                    self.drafts.insert(k, d);
+                }
+                self.selected = None;
+            }
+        }
+        if (up || down) && !self.row_keys.is_empty() {
+            let pos = self.selected.as_ref().and_then(|k| self.row_keys.iter().position(|r| r == k));
+            let next = match (pos, down) {
+                (None, _) => 0,
+                (Some(p), true) => (p + 1).min(self.row_keys.len() - 1),
+                (Some(p), false) => p.saturating_sub(1),
+            };
+            let k = self.row_keys[next].clone();
+            self.select_chat(k);
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("wa_input")));
+        }
+    }
+
+    fn forward_dialog(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some((id, mut q)) = self.forward.take() else { return };
+        let mut open = true;
+        let mut target: Option<String> = None;
+        egui::Window::new("Weiterleiten an …")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text("Chat suchen").desired_width(f32::INFINITY).margin(egui::vec2(10.0, 7.0)));
+                r.request_focus();
+                ui.add_space(6.0);
+                let needle = q.to_lowercase();
+                let mut list: Vec<(String, String, i64)> = self
+                    .chats
+                    .iter()
+                    .map(|(k, c)| (k.clone(), self.display_name(c), c.last_ts))
+                    .filter(|(_, n, _)| needle.is_empty() || n.to_lowercase().contains(&needle))
+                    .collect();
+                list.sort_by_key(|x| std::cmp::Reverse(x.2));
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for (k, n, _) in list.into_iter().take(80) {
+                        let user = self.chats[&k].jid.user.to_string();
+                        let resp = ui
+                            .horizontal(|ui| {
+                                draw_avatar(ui, self.avatars.get(&user), &n, 32.0, self.settings.dark);
+                                ui.label(RichText::new(&n).size(15.0));
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        if resp.hovered() {
+                            ui.painter().rect_filled(resp.rect, 6.0, pal.hover.gamma_multiply(0.5));
+                        }
+                        if resp.clicked() {
+                            target = Some(k);
+                        }
+                    }
+                });
+            });
+        match target {
+            Some(k) => {
+                let msg = self
+                    .msg_index
+                    .get(&id)
+                    .and_then(|ck| self.chats.get(ck))
+                    .and_then(|c| c.messages.iter().rev().find(|m| m.id == id).cloned());
+                if let (Some(msg), Some(c)) = (msg, self.chats.get(&k)) {
+                    let name = self.display_name(c);
+                    let _ = self.cmd.send(Cmd::Forward { chat: c.jid.clone(), msg });
+                    self.info = Some(format!("Weitergeleitet an {name}"));
+                }
+            }
+            None if open => self.forward = Some((id, q)),
+            None => {}
+        }
+    }
+
+    /// Strg+V mit Bild in der Zwischenablage: Bild übernehmen und Vorschau zeigen.
+    fn try_paste_image(&mut self, ctx: &egui::Context) {
+        let img = match arboard::Clipboard::new().and_then(|mut c| c.get_image()) {
+            Ok(i) => i,
+            Err(e) => {
+                backend::log(format!("Zwischenablage: {e}"));
+                return;
+            }
+        };
+        let Some(rgba) = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned()) else { return };
+        let dir = data_dir().join("tmp");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("Zwischenablage-{}.png", now_ts()));
+        if let Err(e) = rgba.save(&path) {
+            self.info = Some(format!("Bild aus der Zwischenablage: {e}"));
+            return;
+        }
+        let thumb = image::DynamicImage::ImageRgba8(rgba).thumbnail(240, 240).to_rgba8();
+        let ci = egui::ColorImage::from_rgba_unmultiplied([thumb.width() as usize, thumb.height() as usize], thumb.as_raw());
+        let tex = ctx.load_texture("paste", ci, egui::TextureOptions::LINEAR);
+        self.pending_paste = Some((path, tex));
+    }
+}
+
+/// Verbindung zum Backend; lebt länger als ein einzelnes Fenster.
+struct Core {
+    rx: Receiver<UiEvent>,
+    cmd: tokio::sync::mpsc::UnboundedSender<Cmd>,
+    notify: backend::SharedNotify,
+}
+
+thread_local! {
+    /// Zustand der Oberfläche, solange das Fenster geschlossen ist (App läuft im Tray weiter).
+    static STASH: std::cell::RefCell<Option<App>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Aktuelles egui-Fenster, damit Backend und Tray es neu zeichnen oder nach vorne holen können.
+static CTX: std::sync::Mutex<Option<egui::Context>> = std::sync::Mutex::new(None);
+static WINDOW_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn with_ctx(f: impl FnOnce(&egui::Context)) {
+    if let Ok(g) = CTX.lock() {
+        if let Some(c) = g.as_ref() {
+            f(c);
+        }
+    }
+}
+
+/// Hülle um die App: beim Schließen des Fensters wird der Zustand aufgehoben statt verworfen.
+struct Shell {
+    app: Option<App>,
+}
+
+impl Shell {
+    fn new(cc: &eframe::CreationContext<'_>, core: &mut Option<Core>) -> Self {
+        if let Ok(mut g) = CTX.lock() {
+            *g = Some(cc.egui_ctx.clone());
+        }
+        WINDOW_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        let app = match STASH.with(|s| s.borrow_mut().take()) {
+            Some(mut app) => {
+                // Texturen gehörten zum alten Fenster und müssen neu geladen werden.
+                theme::install_fonts(&cc.egui_ctx);
+                theme::apply(&cc.egui_ctx, app.settings.dark, app.settings.font_size);
+                app.avatars.clear();
+                app.avatar_requested.clear();
+                app.images.clear();
+                app.img_requested.clear();
+                app.emoji = emoji::Cache::default();
+                app
+            }
+            None => App::new(cc, core.take().expect("Backend")),
+        };
+        Shell { app: Some(app) }
+    }
+}
+
+impl eframe::App for Shell {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(app) = self.app.as_mut() {
+            app.update(ctx, frame);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = self.cmd.send(Cmd::Quit);
+        WINDOW_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut g) = CTX.lock() {
+            *g = None;
+        }
+        if let Some(mut app) = self.app.take() {
+            if app.conn == Conn::Online {
+                let _ = app.cmd.send(Cmd::SetOnline(false));
+            }
+            app.focused = false;
+            app.sync_notify_state();
+            app.save_settings();
+            STASH.with(|s| *s.borrow_mut() = Some(app));
+        }
     }
+}
+
+/// Nur eine laufende Instanz: ein zweiter Start bittet die erste, ihr Fenster zu öffnen.
+fn single_instance(tx: std::sync::mpsc::Sender<tray::TrayMsg>) -> bool {
+    use std::io::Write;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(data_dir);
+    let sock = dir.join("wa-snap.sock");
+    if let Ok(mut s) = UnixStream::connect(&sock) {
+        let _ = s.write_all(b"open");
+        return false;
+    }
+    let _ = std::fs::remove_file(&sock);
+    if let Ok(listener) = UnixListener::bind(&sock) {
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                drop(conn);
+                let _ = tx.send(tray::TrayMsg::Open);
+            }
+        });
+    }
+    true
 }
 
 fn install_desktop() -> std::io::Result<()> {
@@ -2261,7 +2912,7 @@ fn install_desktop() -> std::io::Result<()> {
         .arg(share.join("icons/hicolor"))
         .status();
     println!(
-        "Fertig. wa-snap steht jetzt im Anwendungsmenü und kann an die Taskleiste angeheftet werden."
+        "Fertig. WhatsSnap steht jetzt im Anwendungsmenü und kann an die Taskleiste angeheftet werden."
     );
     Ok(())
 }
@@ -2274,13 +2925,93 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
-    let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1040.0, 700.0])
-            .with_min_inner_size([640.0, 420.0])
-            .with_app_id("wa-snap")
-            .with_title("wa-snap"),
-        ..Default::default()
-    };
-    eframe::run_native("wa-snap", opts, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    // Tray-Klicks, zweiter Programmstart und Menü landen alle hier.
+    let (ev_tx, ev_rx) = channel::<tray::TrayMsg>();
+    if !single_instance(ev_tx.clone()) {
+        println!("WhatsSnap läuft schon, das Fenster wird geöffnet.");
+        return Ok(());
+    }
+
+    let (tx, rx) = channel();
+    let notify: backend::SharedNotify = Default::default();
+    let cmd = backend::spawn(data_dir(), tx, notify.clone(), || with_ctx(|c| c.request_repaint()));
+    let has_tray = tray::start(ev_tx.clone());
+    let mut core = Some(Core { rx, cmd: cmd.clone(), notify });
+
+    // Ereignisse verteilen: bei offenem Fenster direkt dorthin, sonst an die Hauptschleife.
+    let (main_tx, main_rx) = channel::<tray::TrayMsg>();
+    std::thread::spawn(move || {
+        for msg in ev_rx {
+            let open = WINDOW_OPEN.load(std::sync::atomic::Ordering::SeqCst);
+            match msg {
+                tray::TrayMsg::Open if open => with_ctx(|c| {
+                    c.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    c.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }),
+                tray::TrayMsg::Quit if open => {
+                    QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                    with_ctx(|c| c.send_viewport_cmd(egui::ViewportCommand::Close));
+                }
+                m => {
+                    let _ = main_tx.send(m);
+                }
+            }
+        }
+    });
+
+    let mut show = !(has_tray && std::env::args().any(|a| a == "--hidden"));
+    loop {
+        if show {
+            let opts = eframe::NativeOptions {
+                viewport: egui::ViewportBuilder::default()
+                    .with_inner_size([1040.0, 700.0])
+                    .with_min_inner_size([640.0, 420.0])
+                    .with_app_id("wa-snap")
+                    .with_title("WhatsSnap"),
+                run_and_return: true,
+                ..Default::default()
+            };
+            let core_ref = &mut core;
+            eframe::run_native("WhatsSnap", opts, Box::new(|cc| Ok(Box::new(Shell::new(cc, core_ref)))))?;
+        }
+        show = true;
+        let background = STASH.with(|s| s.borrow().as_ref().map(|a| a.settings.background).unwrap_or(true));
+        if QUIT.load(std::sync::atomic::Ordering::SeqCst) || !has_tray || !background {
+            break;
+        }
+        match main_rx.recv() {
+            Ok(tray::TrayMsg::Open) => continue,
+            _ => break,
+        }
+    }
+    let _ = cmd.send(Cmd::Quit);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    Ok(())
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::fmt_spans;
+
+    #[test]
+    fn bold_italic_strike_code() {
+        let v = fmt_spans("a *fett* _kursiv_ ~weg~ `x*y` b", 0);
+        let got: Vec<(&str, u8)> = v.iter().map(|(t, s)| (t.as_str(), *s)).collect();
+        assert_eq!(
+            got,
+            vec![("a ", 0), ("fett", 1), (" ", 0), ("kursiv", 2), (" ", 0), ("weg", 4), (" ", 0), ("x*y", 8), (" b", 0)]
+        );
+    }
+
+    #[test]
+    fn no_format_inside_words_or_spaces() {
+        let v = fmt_spans("2*3*4 und * nicht *", 0);
+        assert_eq!(v, vec![("2*3*4 und * nicht *".to_owned(), 0)]);
+    }
+
+    #[test]
+    fn nested() {
+        let v = fmt_spans("*_beides_*", 0);
+        assert_eq!(v, vec![("beides".to_owned(), 3)]);
+    }
 }
