@@ -33,6 +33,22 @@ struct Settings {
     muted_until: HashMap<String, i64>,
     /// Eigener Giphy-API-Schlüssel für die GIF-Suche.
     giphy_key: String,
+    /// Benachrichtigungen auch für Gruppen
+    notify_groups: bool,
+    /// Ton bei Benachrichtigungen
+    sound: bool,
+    /// Enter sendet (sonst Strg+Enter)
+    enter_sends: bool,
+    /// Fotos und Sticker automatisch laden
+    autoload: bool,
+    /// Online anzeigen, solange das Fenster aktiv ist
+    show_online: bool,
+    /// „schreibt …“ an andere senden
+    send_typing: bool,
+    /// Zuletzt benutzte Emojis
+    recent_emojis: Vec<String>,
+    /// Hautton 0 = Standard, 1–5 = hell bis dunkel
+    skin_tone: u8,
 }
 
 impl Default for Settings {
@@ -50,6 +66,14 @@ impl Default for Settings {
             background: true,
             muted_until: HashMap::new(),
             giphy_key: String::new(),
+            notify_groups: true,
+            sound: true,
+            enter_sends: true,
+            autoload: true,
+            show_online: true,
+            send_typing: true,
+            recent_emojis: Vec::new(),
+            skin_tone: 0,
         }
     }
 }
@@ -308,6 +332,21 @@ struct App {
     gif_query: String,
     gif_results: Vec<(backend::GifItem, Option<egui::TextureHandle>)>,
     gif_loading: bool,
+    /// Einstellungsseite: 0 Profil, 1 Konto, 2 Datenschutz, 3 Chats, 4 Benachrichtigungen, 5 Speicher, 6 WhatsSnap, 7 Hilfe
+    settings_page: u8,
+    privacy: HashMap<String, String>,
+    privacy_loaded: bool,
+    blocklist: Vec<String>,
+    confirm: Option<u8>,
+    emoji_search: String,
+    emoji_jump: Option<usize>,
+    show_info: bool,
+    group_info: HashMap<String, backend::GroupDetails>,
+    group_requested: HashSet<String>,
+    add_numbers: String,
+    rename_buf: String,
+    /// Neue Gruppe: (Name, ausgewählte Chats, zusätzliche Nummern)
+    new_group: Option<(String, HashSet<String>, String)>,
 }
 
 fn user_of(key: &str) -> String {
@@ -577,6 +616,26 @@ fn paint_rich_line(
     }
 }
 
+/// Schalter wie bei WhatsApp (Text links, grüner Schalter rechts).
+fn toggle(ui: &mut egui::Ui, on: &mut bool, label: &str, pal: &Palette) -> egui::Response {
+    let w = ui.available_width().min(520.0);
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(w, 40.0), egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let p = ui.painter();
+    let galley = p.layout(label.to_owned(), egui::FontId::proportional(14.5), pal.text, w - 70.0);
+    p.galley(egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, pal.text);
+    let t = ui.ctx().animate_bool(resp.id, *on);
+    let sw = egui::Rect::from_center_size(egui::pos2(rect.right() - 24.0, rect.center().y), egui::vec2(38.0, 20.0));
+    let bg = if *on { pal.accent } else { pal.border.gamma_multiply(2.0) };
+    p.rect_filled(sw, 10.0, bg);
+    let knob = egui::pos2(egui::lerp(sw.left() + 10.0..=sw.right() - 10.0, t), sw.center().y);
+    p.circle_filled(knob, 7.5, if *on { pal.on_accent } else { pal.text });
+    resp
+}
+
 /// Runder Filter-Knopf ("Alle", "Ungelesen", …).
 fn chip(ui: &mut egui::Ui, label: &str, on: bool, pal: &Palette) -> bool {
     let font = egui::FontId::new(13.5, if on { theme::bold() } else { egui::FontFamily::Proportional });
@@ -682,6 +741,19 @@ impl App {
             gif_query: String::new(),
             gif_results: Vec::new(),
             gif_loading: false,
+            settings_page: 0,
+            privacy: HashMap::new(),
+            privacy_loaded: false,
+            blocklist: Vec::new(),
+            confirm: None,
+            emoji_search: String::new(),
+            emoji_jump: None,
+            show_info: false,
+            group_info: HashMap::new(),
+            group_requested: HashSet::new(),
+            add_numbers: String::new(),
+            rename_buf: String::new(),
+            new_group: None,
         };
         for r in recs {
             app.apply_rec(r);
@@ -838,6 +910,25 @@ impl App {
                 },
                 Source::Disk,
             );
+        }
+        self.group_info.insert(
+            "120363000000001".into(),
+            backend::GroupDetails {
+                group: "120363000000001".into(),
+                subject: "Wichtig".into(),
+                description: "Alles fürs Grillen am Rhein 🔥".into(),
+                members: vec![
+                    ("4915100000001@s.whatsapp.net".into(), "4915100000001".into(), true, true),
+                    ("4915100000002@s.whatsapp.net".into(), "4915100000002".into(), false, false),
+                    ("4915100000009@s.whatsapp.net".into(), "4915100000009".into(), false, false),
+                ],
+                created: 0,
+                i_am_admin: true,
+            },
+        );
+        self.group_requested.insert("120363000000001".into());
+        if std::env::var_os("WA_SNAP_DEMO_INFO").is_some() {
+            self.show_info = true;
         }
         let v = self.votes.entry("demo-poll".into()).or_default();
         v.insert("1".into(), vec!["Samstag".into()]);
@@ -1351,6 +1442,10 @@ impl App {
                 UiEvent::Connected => {
                     self.conn = Conn::Online;
                     self.qr = None;
+                    let _ = self.cmd.send(Cmd::FetchBlocklist);
+                    if !self.settings.show_online {
+                        let _ = self.cmd.send(Cmd::SetOnline(false));
+                    }
                 }
                 UiEvent::LoggedOut => self.conn = Conn::LoggedOut,
                 UiEvent::Message(m) => {
@@ -1405,7 +1500,12 @@ impl App {
                         self.set_status(&id, status, true);
                     }
                 }
-                UiEvent::Info(m) => self.info = if m.is_empty() { None } else { Some(m) },
+                UiEvent::Info(m) => {
+                    if let Some(link) = m.strip_prefix("Einladungslink (in die Zwischenablage kopiert): ") {
+                        ctx.copy_text(link.to_owned());
+                    }
+                    self.info = if m.is_empty() { None } else { Some(m) };
+                }
                 UiEvent::Me(users) => self.me = users,
                 UiEvent::Starred { id, on } => {
                     self.store.append(&Rec::Star { id: id.clone(), on });
@@ -1418,6 +1518,15 @@ impl App {
                 UiEvent::PollVote { poll, voter, options } => {
                     self.store.append(&Rec::Vote { poll: poll.clone(), voter: voter.clone(), options: options.clone() });
                     self.votes.entry(poll).or_default().insert(voter, options);
+                }
+                UiEvent::Privacy(list) => {
+                    self.privacy = list.into_iter().collect();
+                }
+                UiEvent::Blocklist(list) => self.blocklist = list,
+                UiEvent::GroupInfo(d) => {
+                    let members: Vec<(String, String)> = d.members.iter().map(|(j, pn, _, _)| (user_of(j), pn.clone())).collect();
+                    self.members.insert(d.group.clone(), members);
+                    self.group_info.insert(d.group.clone(), d);
                 }
                 UiEvent::FileReady { id, path } => {
                     if self.want_play.as_ref().map(|w| w.0 == id).unwrap_or(false) {
@@ -1546,6 +1655,8 @@ impl App {
         }
         let Ok(mut st) = self.notify.lock() else { return };
         st.enabled = self.settings.notifications;
+        st.groups = self.settings.notify_groups;
+        st.sound = self.settings.sound;
         st.preview = self.settings.preview;
         st.focused = self.focused;
         st.selected_user = self.selected.as_deref().map(user_of);
@@ -1690,80 +1801,73 @@ fn paint_pattern(ui: &egui::Ui, rect: egui::Rect, pal: &Palette) {
 
 impl App {
     fn settings_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pal: &Palette) {
+        const PAGES: [(&str, &str, &str); 8] = [
+            ("👤", "Profil", "Name, Info, Profilbild"),
+            ("🔑", "Konto", "Nummer, Abmelden"),
+            ("🔒", "Datenschutz", "Zuletzt online, Lesebestätigungen, Blockiert"),
+            ("💬", "Chats", "Design, Schrift, Enter zum Senden"),
+            ("🔔", "Benachrichtigungen", "Nachrichten, Gruppen, Ton"),
+            ("💾", "Speicher und Daten", "Automatischer Download, Speicherplatz"),
+            ("⚡", "WhatsSnap", "Tray, Autostart, Online-Status, GIFs"),
+            ("❓", "Hilfe", "Fehler melden, Version, Lizenzen"),
+        ];
         let mut changed = false;
         let mut theme_changed = false;
-        let section = |ui: &mut egui::Ui, t: &str| {
-            ui.add_space(18.0);
-            ui.label(RichText::new(t).size(13.0).color(pal.accent).family(theme::bold()));
-            ui.add_space(4.0);
-        };
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(28.0);
-                ui.vertical(|ui| {
-                    ui.set_max_width(520.0);
-                    ui.add_space(22.0);
-                    ui.label(RichText::new("Einstellungen").size(22.0).family(theme::bold()));
-
-                    section(ui, "PROFIL (WHATSAPP)");
-                    ui.label(RichText::new("Name").small().color(pal.dim));
-                    ui.add(egui::TextEdit::singleline(&mut self.settings.profile_name).desired_width(360.0).margin(egui::vec2(10.0, 7.0)));
-                    ui.label(RichText::new("Info").small().color(pal.dim));
-                    ui.add(egui::TextEdit::singleline(&mut self.settings.profile_about).desired_width(360.0).margin(egui::vec2(10.0, 7.0)));
-                    ui.add_space(4.0);
-                    if ui.button("Bei WhatsApp speichern").clicked() {
-                        if !self.settings.profile_name.trim().is_empty() {
-                            let _ = self.cmd.send(Cmd::SetPushName(self.settings.profile_name.trim().to_owned()));
-                        }
-                        if !self.settings.profile_about.trim().is_empty() {
-                            let _ = self.cmd.send(Cmd::SetAbout(self.settings.profile_about.trim().to_owned()));
-                        }
-                        changed = true;
-                    }
-
-                    section(ui, "BENACHRICHTIGUNGEN");
-                    changed |= ui.checkbox(&mut self.settings.notifications, "Bei neuen Nachrichten benachrichtigen").changed();
-                    changed |= ui.checkbox(&mut self.settings.preview, "Nachrichtentext anzeigen").changed();
-                    if ui.button("Test-Benachrichtigung senden").clicked() {
-                        let _ = self.cmd.send(Cmd::TestNotify);
-                    }
-                    ui.label(
-                        RichText::new("Stummgeschaltete Chats werden mit WhatsApp abgeglichen (Rechtsklick auf einen Chat).")
-                            .small()
-                            .color(pal.dim),
-                    );
-
-                    section(ui, "DARSTELLUNG");
-                    ui.horizontal(|ui| {
-                        theme_changed |= ui.radio_value(&mut self.settings.dark, true, "Dunkel").changed();
-                        theme_changed |= ui.radio_value(&mut self.settings.dark, false, "Hell").changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Schriftgröße");
-                        theme_changed |= ui.add(egui::Slider::new(&mut self.settings.font_size, 12.0..=20.0)).changed();
-                    });
-
-                    section(ui, "GIFS");
-                    ui.label(RichText::new("Giphy-API-Schlüssel (kostenlos auf developers.giphy.com)").small().color(pal.dim));
-                    changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.giphy_key).desired_width(360.0).margin(egui::vec2(10.0, 7.0))).changed();
-
-                    section(ui, "SYSTEM");
-                    changed |= ui
-                        .checkbox(&mut self.settings.background, "Beim Schließen im Hintergrund weiterlaufen (Symbol in der Leiste)")
-                        .changed();
-                    if ui.checkbox(&mut self.autostart, "Beim Anmelden automatisch starten").changed() {
-                        if let Err(e) = set_autostart(self.autostart) {
-                            self.info = Some(format!("Autostart: {e}"));
-                            self.autostart = !self.autostart;
-                        }
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("Log-Ordner öffnen").clicked() {
-                            let _ = std::process::Command::new("xdg-open").arg(data_dir()).spawn();
-                        }
-                        ui.label(RichText::new(format!("WhatsSnap {}", env!("CARGO_PKG_VERSION"))).small().color(pal.dim));
-                    });
+        ui.horizontal_top(|ui| {
+            // linke Liste
+            ui.vertical(|ui| {
+                ui.set_width(300.0);
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
                     ui.add_space(24.0);
+                    ui.label(RichText::new("Einstellungen").size(22.0).family(theme::bold()));
+                });
+                ui.add_space(12.0);
+                for (i, (icon, title, sub)) in PAGES.iter().enumerate() {
+                    let on = self.settings_page == i as u8;
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(292.0, 58.0), egui::Sense::click());
+                    let r = rect.shrink2(egui::vec2(8.0, 2.0));
+                    if on {
+                        ui.painter().rect_filled(r, 10.0, pal.selected);
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(r, 10.0, pal.hover);
+                    }
+                    let p = ui.painter();
+                    p.text(r.left_center() + egui::vec2(24.0, 0.0), egui::Align2::CENTER_CENTER, *icon, egui::FontId::proportional(18.0), pal.dim);
+                    p.text(r.left_center() + egui::vec2(52.0, -9.0), egui::Align2::LEFT_CENTER, *title, egui::FontId::proportional(15.5), pal.text);
+                    p.text(r.left_center() + egui::vec2(52.0, 10.0), egui::Align2::LEFT_CENTER, *sub, egui::FontId::proportional(12.0), pal.dim);
+                    if resp.clicked() {
+                        self.settings_page = i as u8;
+                        self.confirm = None;
+                    }
+                }
+            });
+            let sep = ui.available_rect_before_wrap();
+            ui.painter().vline(sep.left(), sep.y_range(), egui::Stroke::new(1.0_f32, pal.border));
+            // rechte Seite
+            ui.vertical(|ui| {
+                egui::ScrollArea::vertical().id_salt("settings_detail").auto_shrink([false; 2]).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(28.0);
+                        ui.vertical(|ui| {
+                            ui.set_max_width(520.0);
+                            ui.add_space(22.0);
+                            let (_, title, _) = PAGES[self.settings_page as usize];
+                            ui.label(RichText::new(title).size(20.0).family(theme::bold()));
+                            ui.add_space(10.0);
+                            match self.settings_page {
+                                0 => self.page_profile(ui, pal, &mut changed),
+                                1 => self.page_account(ui, pal),
+                                2 => self.page_privacy(ui, pal),
+                                3 => self.page_chats(ui, pal, &mut changed, &mut theme_changed),
+                                4 => self.page_notify(ui, pal, &mut changed),
+                                5 => self.page_storage(ui, pal, &mut changed),
+                                6 => self.page_wasnap(ui, pal, &mut changed),
+                                _ => self.page_help(ui, pal),
+                            }
+                            ui.add_space(30.0);
+                        });
+                    });
                 });
             });
         });
@@ -1771,6 +1875,378 @@ impl App {
             theme::apply(ctx, self.settings.dark, self.settings.font_size);
         }
         if changed || theme_changed {
+            self.save_settings();
+        }
+    }
+
+    fn page_profile(&mut self, ui: &mut egui::Ui, pal: &Palette, changed: &mut bool) {
+        let me = self.me.first().cloned().unwrap_or_default();
+        ui.horizontal(|ui| {
+            draw_avatar(ui, self.avatars.get(&me), &self.settings.profile_name, 96.0, self.settings.dark);
+            ui.add_space(12.0);
+            if ui.button("Profilbild ändern …").clicked() {
+                let _ = self.cmd.send(Cmd::SetProfilePicture(None));
+            }
+        });
+        ui.add_space(10.0);
+        ui.label(RichText::new("Name").small().color(pal.dim));
+        ui.add(egui::TextEdit::singleline(&mut self.settings.profile_name).desired_width(360.0).margin(egui::vec2(10.0, 7.0)));
+        ui.label(RichText::new("Diesen Namen sehen deine Kontakte, wenn sie dich nicht gespeichert haben.").small().color(pal.dim));
+        ui.add_space(8.0);
+        ui.label(RichText::new("Info").small().color(pal.dim));
+        ui.add(egui::TextEdit::singleline(&mut self.settings.profile_about).desired_width(360.0).margin(egui::vec2(10.0, 7.0)));
+        ui.add_space(8.0);
+        if ui.button("Bei WhatsApp speichern").clicked() {
+            if !self.settings.profile_name.trim().is_empty() {
+                let _ = self.cmd.send(Cmd::SetPushName(self.settings.profile_name.trim().to_owned()));
+            }
+            if !self.settings.profile_about.trim().is_empty() {
+                let _ = self.cmd.send(Cmd::SetAbout(self.settings.profile_about.trim().to_owned()));
+            }
+            *changed = true;
+        }
+    }
+
+    fn page_account(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        let num = self.me.iter().find(|u| u.len() <= 15).cloned().unwrap_or_default();
+        ui.label(RichText::new("Telefonnummer").small().color(pal.dim));
+        ui.label(RichText::new(if num.is_empty() { "–".to_owned() } else { format!("+{num}") }).size(15.0));
+        ui.add_space(8.0);
+        ui.label(RichText::new("Verbindung").small().color(pal.dim));
+        ui.label(RichText::new(match self.conn {
+            Conn::Online => "Verbunden",
+            Conn::LoggedOut => "Abgemeldet",
+            Conn::NeedsQr => "Nicht verknüpft",
+            Conn::Starting => "Verbinde …",
+        }));
+        ui.add_space(16.0);
+        ui.label(RichText::new("Dieses Gerät erscheint am Handy unter WhatsApp → Verknüpfte Geräte. Nummer ändern, Konto löschen und Sicherheitsbenachrichtigungen gibt es nur in der Handy-App.").small().color(pal.dim));
+        ui.add_space(12.0);
+        if self.confirm == Some(1) {
+            ui.label(RichText::new("Wirklich abmelden? WhatsSnap wird vom Handy getrennt, danach ist ein neuer QR-Scan nötig.").color(pal.danger));
+            ui.horizontal(|ui| {
+                if ui.button("Ja, abmelden").clicked() {
+                    let _ = self.cmd.send(Cmd::Logout);
+                    self.confirm = None;
+                }
+                if ui.button("Abbrechen").clicked() {
+                    self.confirm = None;
+                }
+            });
+        } else if ui.button(RichText::new("Abmelden").color(pal.danger)).clicked() {
+            self.confirm = Some(1);
+        }
+        ui.add_space(8.0);
+        if self.confirm == Some(2) {
+            ui.label(RichText::new("Gespeicherten Verlauf, Medien und Profilbilder auf diesem PC löschen? Die Chats am Handy bleiben.").color(pal.danger));
+            ui.horizontal(|ui| {
+                if ui.button("Ja, löschen").clicked() {
+                    let d = data_dir();
+                    let _ = std::fs::write(d.join("history.jsonl"), b"");
+                    let _ = std::fs::remove_dir_all(d.join("media"));
+                    let _ = std::fs::remove_dir_all(d.join("avatars"));
+                    self.chats.clear();
+                    self.msg_index.clear();
+                    self.selected = None;
+                    self.images.clear();
+                    self.img_requested.clear();
+                    self.info = Some("Lokale Daten gelöscht. Neue Nachrichten kommen weiter an.".into());
+                    self.confirm = None;
+                }
+                if ui.button("Abbrechen").clicked() {
+                    self.confirm = None;
+                }
+            });
+        } else if ui.button("Lokale Daten löschen …").clicked() {
+            self.confirm = Some(2);
+        }
+    }
+
+    fn page_privacy(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        if !self.privacy_loaded && self.conn == Conn::Online {
+            self.privacy_loaded = true;
+            let _ = self.cmd.send(Cmd::FetchPrivacy);
+            let _ = self.cmd.send(Cmd::FetchBlocklist);
+        }
+        if self.conn != Conn::Online {
+            ui.label(RichText::new("Nur verfügbar, wenn WhatsSnap verbunden ist.").color(pal.dim));
+            return;
+        }
+        let opts_std: &[(&str, &str)] = &[("all", "Alle"), ("contacts", "Meine Kontakte"), ("none", "Niemand")];
+        let rows: [(&str, &str, &[(&str, &str)]); 6] = [
+            ("last", "Zuletzt online", opts_std),
+            ("online", "Wer sieht, wenn ich online bin", &[("all", "Alle"), ("matchlastseen", "Wie „Zuletzt online“")]),
+            ("profile", "Profilbild", opts_std),
+            ("status", "Info", opts_std),
+            ("groupadd", "Wer mich zu Gruppen hinzufügen darf", &[("all", "Alle"), ("contacts", "Meine Kontakte")]),
+            ("calladd", "Anrufe von Unbekannten", &[("all", "Zulassen"), ("known", "Stummschalten")]),
+        ];
+        let mut set: Option<(String, String)> = None;
+        for (cat, label, opts) in rows {
+            let cur = self.privacy.get(cat).cloned().unwrap_or_default();
+            ui.add_space(6.0);
+            ui.label(RichText::new(label).size(14.5));
+            ui.horizontal_wrapped(|ui| {
+                for (val, l) in opts {
+                    if ui.radio(cur == *val, *l).clicked() && cur != *val {
+                        set = Some((cat.to_owned(), (*val).to_owned()));
+                    }
+                }
+            });
+        }
+        ui.add_space(8.0);
+        let rr = self.privacy.get("readreceipts").map(|v| v != "none").unwrap_or(true);
+        let mut rr2 = rr;
+        if toggle(ui, &mut rr2, "Lesebestätigungen (blaue Haken)", pal).changed() {
+            set = Some(("readreceipts".into(), if rr2 { "all".into() } else { "none".into() }));
+        }
+        ui.label(RichText::new("Wenn aus, siehst du auch die Lesebestätigungen anderer nicht. In Gruppen werden sie immer gesendet.").small().color(pal.dim));
+        if let Some((c, v)) = set {
+            self.privacy.insert(c.clone(), v.clone());
+            let _ = self.cmd.send(Cmd::SetPrivacy { cat: c, val: v });
+        }
+        ui.add_space(14.0);
+        ui.label(RichText::new("Standarddauer für selbstlöschende Nachrichten (neue Chats)").size(14.5));
+        ui.horizontal_wrapped(|ui| {
+            for (secs, l) in [(0u32, "Aus"), (86_400, "24 Stunden"), (604_800, "7 Tage"), (7_776_000, "90 Tage")] {
+                if ui.button(l).clicked() {
+                    let _ = self.cmd.send(Cmd::SetDefaultDisappearing(secs));
+                    self.info = Some(format!("Standard für selbstlöschende Nachrichten: {l}"));
+                }
+            }
+        });
+        ui.add_space(14.0);
+        ui.label(RichText::new(format!("Blockierte Kontakte ({})", self.blocklist.len())).size(14.5));
+        let mut unblock = None;
+        for j in &self.blocklist {
+            let u = user_of(j);
+            let name = self.names.get(&u).map(|n| n.0.clone()).unwrap_or_else(|| format!("+{u}"));
+            ui.horizontal(|ui| {
+                ui.label(name);
+                if ui.small_button("Freigeben").clicked() {
+                    unblock = Some(j.clone());
+                }
+            });
+        }
+        if let Some(j) = unblock.and_then(|j| j.parse::<Jid>().ok()) {
+            let _ = self.cmd.send(Cmd::Block { jid: j, on: false });
+        }
+        ui.label(RichText::new("Blockieren geht über das ⋮-Menü im Chat.").small().color(pal.dim));
+    }
+
+    fn page_chats(&mut self, ui: &mut egui::Ui, pal: &Palette, changed: &mut bool, theme_changed: &mut bool) {
+        ui.label(RichText::new("Design").size(14.5));
+        ui.horizontal(|ui| {
+            *theme_changed |= ui.radio_value(&mut self.settings.dark, true, "Dunkel").changed();
+            *theme_changed |= ui.radio_value(&mut self.settings.dark, false, "Hell").changed();
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Schriftgröße");
+            *theme_changed |= ui.add(egui::Slider::new(&mut self.settings.font_size, 12.0..=20.0)).changed();
+        });
+        ui.add_space(8.0);
+        *changed |= toggle(ui, &mut self.settings.enter_sends, "Enter sendet die Nachricht (sonst Strg+Enter)", pal).changed();
+        ui.label(RichText::new("Zeilenumbruch: Shift+Enter").small().color(pal.dim));
+    }
+
+    fn page_notify(&mut self, ui: &mut egui::Ui, pal: &Palette, changed: &mut bool) {
+        *changed |= toggle(ui, &mut self.settings.notifications, "Benachrichtigungen für Nachrichten", pal).changed();
+        *changed |= toggle(ui, &mut self.settings.notify_groups, "Benachrichtigungen für Gruppen", pal).changed();
+        *changed |= toggle(ui, &mut self.settings.preview, "Nachrichtentext anzeigen", pal).changed();
+        *changed |= toggle(ui, &mut self.settings.sound, "Ton abspielen", pal).changed();
+        ui.add_space(8.0);
+        if ui.button("Test-Benachrichtigung senden").clicked() {
+            let _ = self.cmd.send(Cmd::TestNotify);
+            if self.settings.sound {
+                backend::play_notify_sound();
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(RichText::new("Einzelne Chats stummschalten: Rechtsklick auf den Chat. Das wird mit WhatsApp abgeglichen.").small().color(pal.dim));
+    }
+
+    fn page_storage(&mut self, ui: &mut egui::Ui, pal: &Palette, changed: &mut bool) {
+        *changed |= toggle(ui, &mut self.settings.autoload, "Fotos und Sticker automatisch herunterladen", pal).changed();
+        ui.label(RichText::new("Videos, Dokumente und Sprachnachrichten werden immer erst beim Anklicken geladen.").small().color(pal.dim));
+        ui.add_space(12.0);
+        let size = dir_size(&data_dir().join("media")) + dir_size(&data_dir().join("avatars"));
+        ui.label(RichText::new(format!("Belegt durch Medien: {}", fmt_size(size))).size(14.5));
+        if ui.button("Heruntergeladene Medien löschen").clicked() {
+            let _ = std::fs::remove_dir_all(data_dir().join("media"));
+            self.images.clear();
+            self.img_requested.clear();
+            self.decoded.clear();
+            self.info = Some("Medien gelöscht. Sie werden bei Bedarf neu geladen.".into());
+        }
+    }
+
+    fn page_wasnap(&mut self, ui: &mut egui::Ui, pal: &Palette, changed: &mut bool) {
+        *changed |= toggle(ui, &mut self.settings.background, "Beim Schließen im Hintergrund weiterlaufen (Symbol in der Leiste)", pal).changed();
+        if toggle(ui, &mut self.autostart, "Beim Anmelden am PC automatisch starten (unsichtbar in der Leiste)", pal).changed() {
+            if let Err(e) = set_autostart(self.autostart) {
+                self.info = Some(format!("Autostart: {e}"));
+                self.autostart = !self.autostart;
+            }
+        }
+        ui.add_space(8.0);
+        *changed |= toggle(ui, &mut self.settings.show_online, "Online anzeigen, solange das Fenster aktiv ist", pal).changed();
+        ui.label(RichText::new("Aus: andere sehen dich über WhatsSnap nie online. Dein Handy bekommt dann weiter alle Benachrichtigungen.").small().color(pal.dim));
+        *changed |= toggle(ui, &mut self.settings.send_typing, "Anderen „schreibt …“ anzeigen", pal).changed();
+        ui.add_space(12.0);
+        ui.label(RichText::new("GIF-Suche: Giphy-API-Schlüssel (kostenlos auf developers.giphy.com)").size(14.0));
+        *changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.giphy_key).desired_width(360.0).margin(egui::vec2(10.0, 7.0))).changed();
+        ui.add_space(12.0);
+        ui.label(RichText::new("Tastenkürzel").size(14.5));
+        for (k, d) in [
+            ("Strg+F", "Chats und Nachrichten durchsuchen"),
+            ("Strg+N", "Neuer Chat (Nummer eingeben)"),
+            ("Alt+↑ / Alt+↓", "Vorheriger / nächster Chat"),
+            ("Esc", "Antwort, Suche oder Chat schließen"),
+            ("Strg+V", "Bild aus der Zwischenablage senden"),
+            ("Shift+Enter", "Neue Zeile"),
+        ] {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(k).code());
+                ui.label(RichText::new(d).color(pal.dim));
+            });
+        }
+    }
+
+    fn page_help(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        ui.label(format!("WhatsSnap {}", env!("CARGO_PKG_VERSION")));
+        ui.label(RichText::new("Inoffizieller WhatsApp-Client für Linux. Nicht von WhatsApp oder Meta.").small().color(pal.dim));
+        ui.add_space(8.0);
+        ui.hyperlink_to("Projekt auf GitHub", "https://github.com/Xinzoooo/wa-snap");
+        ui.hyperlink_to("Fehler melden", "https://github.com/Xinzoooo/wa-snap/issues");
+        ui.add_space(8.0);
+        if ui.button("Log-Ordner öffnen").clicked() {
+            let _ = std::process::Command::new("xdg-open").arg(data_dir()).spawn();
+        }
+        ui.add_space(12.0);
+        ui.label(RichText::new("Lizenzen: WhatsSnap MIT · Schrift Inter (OFL 1.1) · Emojis Fluent Emoji (MIT, Microsoft) und Twemoji (CC-BY 4.0) · libopus, libwebp (BSD)").small().color(pal.dim));
+    }
+
+    /// Emoji-Auswahl wie bei WhatsApp: Suche, Zuletzt, Kategorien, Hauttöne.
+    fn emoji_grid(&mut self, ui: &mut egui::Ui, pal: &Palette) {
+        const PER_ROW: usize = 9;
+        const ROW_H: f32 = 40.0;
+        ui.add(egui::TextEdit::singleline(&mut self.emoji_search).hint_text("🔍 Emoji suchen (z. B. lachen, Herz, Daumen)").desired_width(f32::INFINITY));
+        let cats = emoji::picker();
+        // Zeilen bauen: Überschrift oder bis zu 9 Emojis (mit Hautton-Varianten)
+        let mut rows: Vec<(Option<String>, Vec<(String, Vec<String>)>)> = Vec::new();
+        let mut cat_rows: Vec<usize> = Vec::new();
+        let q = self.emoji_search.trim().to_lowercase();
+        let push_items = |rows: &mut Vec<(Option<String>, Vec<(String, Vec<String>)>)>, items: Vec<(String, Vec<String>)>| {
+            for chunk in items.chunks(PER_ROW) {
+                rows.push((None, chunk.to_vec()));
+            }
+        };
+        if !q.is_empty() {
+            let hits: Vec<(String, Vec<String>)> = cats
+                .iter()
+                .flat_map(|(_, it)| it.iter())
+                .filter(|i| i.name.to_lowercase().contains(&q) || i.tags.contains(&q))
+                .take(200)
+                .map(|i| (i.e.clone(), i.skins.clone()))
+                .collect();
+            rows.push((Some(format!("Suchergebnisse ({})", hits.len())), Vec::new()));
+            push_items(&mut rows, hits);
+        } else {
+            if !self.settings.recent_emojis.is_empty() {
+                cat_rows.push(rows.len());
+                rows.push((Some("Letzte".into()), Vec::new()));
+                push_items(&mut rows, self.settings.recent_emojis.iter().map(|e| (e.clone(), Vec::new())).collect());
+            } else {
+                cat_rows.push(0);
+            }
+            for (name, items) in cats {
+                cat_rows.push(rows.len());
+                rows.push((Some(name.clone()), Vec::new()));
+                push_items(&mut rows, items.iter().map(|i| (i.e.clone(), i.skins.clone())).collect());
+            }
+        }
+        let mut area = egui::ScrollArea::vertical().id_salt("emoji_grid").max_height(300.0).auto_shrink([false, true]);
+        if let Some(r) = self.emoji_jump.take() {
+            area = area.vertical_scroll_offset(r as f32 * (ROW_H + ui.spacing().item_spacing.y));
+        }
+        let tone = self.settings.skin_tone as usize;
+        let mut chosen: Option<String> = None;
+        let mut new_tone: Option<u8> = None;
+        area.show_rows(ui, ROW_H, rows.len(), |ui, range| {
+            for (head, items) in &rows[range] {
+                if let Some(h) = head {
+                    ui.add_sized([ui.available_width(), ROW_H], egui::Label::new(RichText::new(h).size(13.0).color(pal.dim)));
+                    continue;
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (e, skins) in items {
+                        let shown = if tone > 0 && skins.len() >= tone { skins[tone - 1].clone() } else { e.clone() };
+                        let resp = match self.emoji.get(ui.ctx(), &emoji::key(&shown)) {
+                            Some(id) => ui.add_sized([ROW_H, ROW_H], egui::Button::image(egui::Image::new((id, egui::vec2(30.0, 30.0)))).frame(false)),
+                            None => ui.add_sized([ROW_H, ROW_H], egui::Button::new(RichText::new(&shown).size(22.0)).frame(false)),
+                        };
+                        if !skins.is_empty() {
+                            let r = resp.rect;
+                            ui.painter().add(egui::Shape::convex_polygon(
+                                vec![r.right_bottom() + egui::vec2(-3.0, -3.0), r.right_bottom() + egui::vec2(-9.0, -3.0), r.right_bottom() + egui::vec2(-3.0, -9.0)],
+                                pal.dim,
+                                egui::Stroke::NONE,
+                            ));
+                        }
+                        if resp.clicked() {
+                            chosen = Some(shown.clone());
+                        }
+                        if !skins.is_empty() {
+                            resp.context_menu(|ui| {
+                                ui.horizontal(|ui| {
+                                    for (i, v) in std::iter::once(e).chain(skins.iter()).enumerate() {
+                                        let c = match self.emoji.get(ui.ctx(), &emoji::key(v)) {
+                                            Some(id) => ui.add(egui::Button::image(egui::Image::new((id, egui::vec2(28.0, 28.0)))).frame(i == tone)).clicked(),
+                                            None => ui.button(v).clicked(),
+                                        };
+                                        if c {
+                                            chosen = Some(v.clone());
+                                            new_tone = Some(i as u8);
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    }
+                });
+            }
+        });
+        // Kategorie-Leiste unten
+        if q.is_empty() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let icons = ["🕒", "😀", "🐻", "🍔", "⚽", "🚗", "💡", "🔣", "🏁"];
+                for (i, ic) in icons.iter().enumerate() {
+                    if i >= cat_rows.len() {
+                        break;
+                    }
+                    let resp = match (i, self.emoji.get(ui.ctx(), &emoji::key(ic))) {
+                        (0, _) | (_, None) => ui.add(egui::Button::new(RichText::new(*ic).size(17.0).color(pal.dim)).frame(false)),
+                        (_, Some(id)) => ui.add(egui::Button::image(egui::Image::new((id, egui::vec2(22.0, 22.0)))).frame(false)),
+                    };
+                    if resp.clicked() {
+                        self.emoji_jump = Some(cat_rows[i]);
+                    }
+                }
+            });
+        }
+        if let Some(t) = new_tone {
+            self.settings.skin_tone = t;
+        }
+        if let Some(e) = chosen {
+            self.input.push_str(&e);
+            self.settings.recent_emojis.retain(|x| *x != e);
+            self.settings.recent_emojis.insert(0, e);
+            self.settings.recent_emojis.truncate(36);
             self.save_settings();
         }
     }
@@ -1866,10 +2342,21 @@ impl App {
                         let fill = if resp.hovered() { pal.accent.gamma_multiply(0.85) } else { pal.accent };
                         ui.painter().rect_filled(rect.shrink(2.0), 12.0, fill);
                         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::new(24.0, theme::bold()), pal.on_accent);
-                        if resp.on_hover_text("Neuer Chat: Nummer in die Suche tippen").clicked() {
-                            ui.memory_mut(|m| m.request_focus(egui::Id::new("list_search")));
-                            self.info = Some("Telefonnummer mit Ländervorwahl in die Suche tippen, z. B. +49 151 …".into());
+                        let new_id = egui::Id::new("new_menu");
+                        if resp.on_hover_text("Neuer Chat oder neue Gruppe").clicked() {
+                            ui.memory_mut(|m| m.toggle_popup(new_id));
                         }
+                        let anchor = ui.interact(rect, egui::Id::new("new_btn_anchor"), egui::Sense::hover());
+                        egui::popup::popup_below_widget(ui, new_id, &anchor, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                            ui.set_min_width(200.0);
+                            if ui.button("💬  Neuer Chat (Nummer)").clicked() {
+                                ui.memory_mut(|m| m.request_focus(egui::Id::new("list_search")));
+                                self.info = Some("Telefonnummer mit Ländervorwahl in die Suche tippen, z. B. +49 151 …".into());
+                            }
+                            if ui.button("👥  Neue Gruppe").clicked() {
+                                self.new_group = Some((String::new(), HashSet::new(), String::new()));
+                            }
+                        });
                         let st = match self.conn {
                             Conn::Online => None,
                             Conn::LoggedOut => Some(("abgemeldet", pal.danger)),
@@ -2217,12 +2704,11 @@ impl App {
             .frame(egui::Frame::new().fill(pal.chat).inner_margin(egui::Margin { left: 16, right: 16, top: 6, bottom: 12 }))
             .show(ctx, |ui| {
                 let enabled = self.conn == Conn::Online;
-                if enabled
-                    && ctx.memory(|m| m.has_focus(input_id))
-                    && !ctx.input(|i| i.modifiers.shift)
-                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
-                {
-                    do_send = true;
+                if enabled && ctx.memory(|m| m.has_focus(input_id)) {
+                    let send_mods = if self.settings.enter_sends { egui::Modifiers::NONE } else { egui::Modifiers::COMMAND };
+                    if ctx.input_mut(|i| i.consume_key(send_mods, egui::Key::Enter)) {
+                        do_send = true;
+                    }
                 }
                 if enabled && ctx.memory(|m| m.has_focus(input_id)) && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
                     self.try_paste_image(ctx);
@@ -2398,7 +2884,7 @@ impl App {
                                 egui::AboveOrBelow::Above,
                                 egui::PopupCloseBehavior::CloseOnClickOutside,
                                 |ui| {
-                                    ui.set_width(372.0);
+                                    ui.set_width(400.0);
                                     ui.horizontal(|ui| {
                                         for (i, l) in ["Emoji", "GIF", "Sticker"].iter().enumerate() {
                                             if chip(ui, l, self.picker_tab == i as u8, pal) {
@@ -2477,26 +2963,7 @@ impl App {
                                         });
                                         return;
                                     }
-                                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                                        for (cat, list) in theme::EMOJI_CATS {
-                                            ui.label(RichText::new(*cat).small().color(pal.dim));
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
-                                                for e in list.iter() {
-                                                    let key: String = e.chars().filter(|c| *c != '\u{FE0F}').collect();
-                                                    let clicked = match self.emoji.get(ui.ctx(), &key) {
-                                                        Some(id) => ui
-                                                            .add(egui::Button::image(egui::Image::new((id, egui::vec2(28.0, 28.0)))).frame(false))
-                                                            .clicked(),
-                                                        None => ui.add(egui::Button::new(RichText::new(*e).size(22.0)).frame(false)).clicked(),
-                                                    };
-                                                    if clicked {
-                                                        self.input.push_str(e);
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    });
+                                    self.emoji_grid(ui, pal);
                                 },
                             );
                             let has_text = !self.input.trim().is_empty();
@@ -2595,7 +3062,7 @@ impl App {
                 }
                 // Eigenen Tippstatus senden (höchstens alle 8 Sekunden)
                 let key = jid.to_string();
-                if typed && !self.input.trim().is_empty() {
+                if typed && !self.input.trim().is_empty() && self.settings.send_typing {
                     let fresh = matches!(&self.my_typing, Some((k, t)) if *k == key && t.elapsed().as_secs() < 8);
                     if !fresh {
                         let _ = self.cmd.send(Cmd::Typing { chat: jid.clone(), on: true });
@@ -2665,6 +3132,8 @@ impl App {
         let mut jump_req: Option<String> = None;
         let mut older_req = false;
         let mut audio_req: Option<(String, backend::MediaRef, Option<f32>)> = None;
+        let mut chat_cmd: Option<Cmd> = None;
+        let mut toggle_info = false;
         let mut jumped = false;
         let mut scroll_out: Option<(f32, egui::Rect)> = None;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.chat)).show(ctx, |ui| {
@@ -2694,6 +3163,7 @@ impl App {
             let pinned = Self::has(&self.settings.pinned, &key);
             let archived = Self::has(&self.settings.archived, &key);
             let is_group = chat.is_group;
+            let chat_jid = chat.jid.clone();
             let dark = self.settings.dark;
 
             // Kopfzeile
@@ -2703,7 +3173,10 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        draw_avatar(ui, self.avatars.get(&user), &title, 40.0, dark);
+                        let av = ui.scope(|ui| draw_avatar(ui, self.avatars.get(&user), &title, 40.0, dark)).response;
+                        if av.interact(egui::Sense::click()).on_hover_text("Kontakt-/Gruppeninfo").clicked() {
+                            toggle_info = true;
+                        }
                         ui.add_space(6.0);
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
@@ -2766,10 +3239,29 @@ impl App {
                                     act = Some(Act::Archive(key.clone()));
                                     ui.close_menu();
                                 }
+                                ui.separator();
+                                ui.label(RichText::new("Selbstlöschende Nachrichten").small().color(pal.dim));
+                                ui.horizontal(|ui| {
+                                    for (secs, l) in [(0u32, "Aus"), (86_400, "24 Std."), (604_800, "7 Tage"), (7_776_000, "90 Tage")] {
+                                        if ui.small_button(l).clicked() {
+                                            chat_cmd = Some(Cmd::SetChatDisappearing { chat: chat_jid.clone(), secs });
+                                        }
+                                    }
+                                });
+                                if !is_group {
+                                    let blocked = self.blocklist.iter().any(|b| user_of(b) == user);
+                                    if ui.button(if blocked { "Blockierung aufheben" } else { "Blockieren" }).clicked() {
+                                        chat_cmd = Some(Cmd::Block { jid: chat_jid.clone(), on: !blocked });
+                                    }
+                                }
+                                ui.separator();
                                 if ui.button("Chat schließen").clicked() {
                                     self.selected = None;
                                 }
                             });
+                            if icon_button(ui, "ℹ", 17.0, if self.show_info { pal.accent } else { pal.dim }, pal, "Kontakt-/Gruppeninfo").clicked() {
+                                toggle_info = true;
+                            }
                             if icon_button(ui, "🔍", 17.0, pal.dim, pal, "Im Chat suchen").clicked() {
                                 self.chat_search = if self.chat_search.is_some() { None } else { Some(String::new()) };
                             }
@@ -3093,6 +3585,12 @@ impl App {
         });
         self.emoji = ecache;
         self.scroll_bottom = false;
+        if let Some(c) = chat_cmd {
+            let _ = self.cmd.send(c);
+        }
+        if toggle_info {
+            self.show_info = !self.show_info;
+        }
         if let Some((id, media, seek)) = audio_req {
             self.audio_action(id, media, seek);
         }
@@ -3158,6 +3656,13 @@ impl App {
             }
         }
         for (id, media) in media_req {
+            if let Some(real) = id.strip_suffix("#ok") {
+                self.img_requested.insert(id.clone());
+                if self.img_requested.insert(real.to_owned()) {
+                    let _ = self.cmd.send(Cmd::LoadMedia { id: real.to_owned(), media });
+                }
+                continue;
+            }
             if self.img_requested.insert(id.clone()) {
                 let _ = self.cmd.send(Cmd::LoadMedia { id, media });
             }
@@ -3461,8 +3966,19 @@ impl App {
             return;
         }
         let tex = self.images.get(&m.id);
-        if !self.img_requested.contains(&m.id) && tex.map(|t| !t.1).unwrap_or(true) {
+        let auto = self.settings.autoload || m.from_me || self.img_requested.contains(&format!("{}#ok", m.id));
+        if auto && !self.img_requested.contains(&m.id) && tex.map(|t| !t.1).unwrap_or(true) {
             media_req.push((m.id.clone(), md.clone()));
+        }
+        if !auto && tex.is_none() && md.is_picture() {
+            let size = media_size(md, None, max_w);
+            let (r, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            ui.painter().rect_filled(r, 6.0, pal.hover);
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, format!("⬇ {} laden", md.label()), egui::FontId::proportional(13.0), pal.text);
+            if resp.clicked() {
+                media_req.push((format!("{}#ok", m.id), md.clone()));
+            }
+            return;
         }
         if md.is_picture() {
             let size = media_size(md, tex, max_w);
@@ -3535,6 +4051,12 @@ fn fmt_last_seen(ts: i64) -> String {
     }
 }
 
+fn dir_size(p: &std::path::Path) -> u64 {
+    std::fs::read_dir(p)
+        .map(|rd| rd.flatten().map(|e| e.metadata().map(|m| if m.is_dir() { dir_size(&e.path()) } else { m.len() }).unwrap_or(0)).sum())
+        .unwrap_or(0)
+}
+
 fn fmt_size(n: u64) -> String {
     if n >= 1024 * 1024 {
         format!("{:.1} MB", n as f64 / 1048576.0)
@@ -3562,7 +4084,7 @@ impl eframe::App for App {
         self.pump(ctx);
         // Online-Status wie bei WhatsApp Web: online, solange das Fenster aktiv ist.
         if self.focused != was_focused && self.conn == Conn::Online {
-            let _ = self.cmd.send(Cmd::SetOnline(self.focused));
+            let _ = self.cmd.send(Cmd::SetOnline(self.focused && self.settings.show_online));
         }
         self.shortcuts(ctx);
         // Fenster wieder im Vordergrund: offenen Chat als gelesen markieren.
@@ -3625,16 +4147,313 @@ impl eframe::App for App {
         }
 
         self.rail(ctx, &pal);
-        self.chat_list(ctx, &pal);
+        if !self.show_settings {
+            self.chat_list(ctx, &pal);
+        }
+        if self.show_info && self.selected.is_some() && !self.show_settings && !self.show_starred {
+            self.info_panel(ctx, &pal);
+        }
         if self.selected.is_some() && !self.show_settings && !self.show_starred {
             self.input_bar(ctx, &pal);
         }
         self.chat_view(ctx, &pal);
         self.forward_dialog(ctx, &pal);
+        self.new_group_dialog(ctx, &pal);
     }
 }
 
 impl App {
+    /// Bekannter Name zu einer Nummer/LID (Adressbuch, Push-Name oder Einzelchat).
+    fn name_for_user(&self, u: &str) -> Option<String> {
+        if u.is_empty() {
+            return None;
+        }
+        self.names
+            .get(u)
+            .map(|n| n.0.clone())
+            .or_else(|| self.chats.values().find(|c| !c.is_group && c.jid.user.as_str() == u).map(|c| self.display_name(c)).filter(|n| !n.starts_with('+')))
+    }
+
+    /// Seitenleiste mit Kontakt- oder Gruppeninfo, Medien und Verwaltung.
+    fn info_panel(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(key) = self.selected.clone() else { return };
+        let Some(chat) = self.chats.get(&key) else { return };
+        let (jid, is_group, title) = (chat.jid.clone(), chat.is_group, self.display_name(chat));
+        let user = jid.user.to_string();
+        if is_group && self.conn == Conn::Online && self.group_requested.insert(user.clone()) {
+            let _ = self.cmd.send(Cmd::GroupInfo(jid.clone()));
+        }
+        // Medien des Chats (neueste zuerst)
+        let pics: Vec<(String, backend::MediaRef)> = chat
+            .messages
+            .iter()
+            .rev()
+            .filter_map(|m| m.media.as_ref().filter(|md| md.kind == "image").map(|md| (m.id.clone(), md.clone())))
+            .take(30)
+            .collect();
+        let docs = chat.messages.iter().filter(|m| m.media.as_ref().map(|md| md.kind == "document").unwrap_or(false)).count();
+        let links = chat.messages.iter().filter(|m| matches!(m.x.kind, Some(backend::Extra::Link { .. })) || m.text.contains("http")).count();
+        let mut cmds: Vec<Cmd> = Vec::new();
+        let mut jump: Option<String> = None;
+        let mut close = false;
+        let mut want: Vec<(String, backend::MediaRef)> = Vec::new();
+        egui::SidePanel::right("info")
+            .resizable(false)
+            .exact_width(340.0)
+            .frame(egui::Frame::new().fill(pal.side).stroke(egui::Stroke::new(1.0_f32, pal.border)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        if icon_button(ui, "×", 18.0, pal.dim, pal, "Schließen").clicked() {
+                            close = true;
+                        }
+                        ui.label(RichText::new(if is_group { "Gruppeninfo" } else { "Kontaktinfo" }).size(16.0).family(theme::bold()));
+                    });
+                    ui.add_space(10.0);
+                    ui.vertical_centered(|ui| {
+                        draw_avatar(ui, self.avatars.get(&user), &title, 140.0, self.settings.dark);
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(&title).size(20.0).family(theme::bold()));
+                        let gi = self.group_info.get(&user);
+                        let sub = if is_group {
+                            format!("Gruppe · {} Mitglieder", gi.map(|g| g.members.len()).unwrap_or(0))
+                        } else if jid.server == whatsapp_rust::Server::Pn {
+                            format!("+{user}")
+                        } else {
+                            String::new()
+                        };
+                        ui.label(RichText::new(sub).color(pal.dim));
+                    });
+                    ui.add_space(10.0);
+                    let section = |ui: &mut egui::Ui, t: &str| {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ui.label(RichText::new(t).size(13.0).color(pal.dim));
+                        });
+                    };
+                    if let Some(g) = self.group_info.get(&user).cloned() {
+                        if !g.description.is_empty() {
+                            section(ui, "Beschreibung");
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                ui.label(&g.description);
+                            });
+                        }
+                    }
+                    section(ui, &format!("Medien, Links und Doks  ·  {} Fotos · {} Links · {} Doks", pics.len(), links, docs));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(12.0);
+                        for (id, md) in pics.iter().take(9) {
+                            match self.images.get(id) {
+                                Some((t, _)) => {
+                                    if ui.add(egui::Button::image(egui::Image::new((t.id(), egui::vec2(96.0, 96.0))).corner_radius(6.0)).frame(false)).clicked() {
+                                        jump = Some(id.clone());
+                                    }
+                                }
+                                None => {
+                                    ui.add_sized([96.0, 96.0], egui::Spinner::new());
+                                    want.push((id.clone(), md.clone()));
+                                }
+                            }
+                        }
+                    });
+                    if is_group {
+                        let gi = self.group_info.get(&user).cloned();
+                        let admin = gi.as_ref().map(|g| g.i_am_admin).unwrap_or(false);
+                        if admin {
+                            section(ui, "Gruppenname");
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                if self.rename_buf.is_empty() {
+                                    self.rename_buf = title.clone();
+                                }
+                                ui.add(egui::TextEdit::singleline(&mut self.rename_buf).desired_width(200.0));
+                                if ui.button("Ändern").clicked() && !self.rename_buf.trim().is_empty() {
+                                    cmds.push(Cmd::GroupRename { jid: jid.clone(), name: self.rename_buf.trim().to_owned() });
+                                }
+                            });
+                        }
+                        section(ui, &format!("{} Mitglieder", gi.as_ref().map(|g| g.members.len()).unwrap_or(0)));
+                        if admin {
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                ui.add(egui::TextEdit::singleline(&mut self.add_numbers).hint_text("Nummern, z. B. +49151…").desired_width(180.0));
+                                if ui.button("Hinzufügen").clicked() {
+                                    let nums: Vec<String> = self
+                                        .add_numbers
+                                        .split([',', ';', ' '])
+                                        .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
+                                        .filter(|n| n.len() >= 7)
+                                        .collect();
+                                    if !nums.is_empty() {
+                                        cmds.push(Cmd::GroupAdd { jid: jid.clone(), numbers: nums });
+                                        self.add_numbers.clear();
+                                        self.group_requested.remove(&user);
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                if ui.button("🔗 Einladungslink kopieren").clicked() {
+                                    cmds.push(Cmd::GroupInvite(jid.clone()));
+                                }
+                            });
+                        }
+                        if let Some(g) = &gi {
+                            let mut list = g.members.clone();
+                            list.sort_by_key(|(_, _, a, s)| (!s, !a));
+                            for (mj, pn, is_admin, owner) in list {
+                                let mu = user_of(&mj);
+                                let me = self.me.contains(&mu) || self.me.contains(&pn);
+                                let name = if me {
+                                    "Du".to_owned()
+                                } else {
+                                    self.name_for_user(&pn).or_else(|| self.name_for_user(&mu)).unwrap_or_else(|| if pn.is_empty() { mu.clone() } else { format!("+{pn}") })
+                                };
+                                let resp = ui
+                                    .horizontal(|ui| {
+                                        ui.add_space(16.0);
+                                        draw_avatar(ui, self.avatars.get(&pn).or_else(|| self.avatars.get(&mu)), &name, 34.0, self.settings.dark);
+                                        ui.label(RichText::new(&name).size(14.5));
+                                        if owner || is_admin {
+                                            ui.label(RichText::new(if owner { "Ersteller" } else { "Admin" }).size(11.0).color(pal.accent));
+                                        }
+                                    })
+                                    .response
+                                    .interact(egui::Sense::click());
+                                if !me {
+                                    resp.context_menu(|ui| {
+                                        if !pn.is_empty() && ui.button("Nachricht senden").clicked() {
+                                            jump = Some(format!("chat:{pn}"));
+                                            ui.close_menu();
+                                        }
+                                        if admin {
+                                            if ui.button(if is_admin { "Admin-Rechte entziehen" } else { "Zum Admin machen" }).clicked() {
+                                                cmds.push(Cmd::GroupAdmin { jid: jid.clone(), member: mj.clone(), on: !is_admin });
+                                                ui.close_menu();
+                                            }
+                                            if ui.button(RichText::new("Aus der Gruppe entfernen").color(pal.danger)).clicked() {
+                                                cmds.push(Cmd::GroupRemove { jid: jid.clone(), member: mj.clone() });
+                                                ui.close_menu();
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                ui.spinner();
+                            });
+                        }
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            if ui.button(RichText::new("Gruppe verlassen").color(pal.danger)).clicked() {
+                                cmds.push(Cmd::GroupLeave(jid.clone()));
+                            }
+                        });
+                    } else {
+                        // Gemeinsame Gruppen
+                        let common: Vec<String> = self
+                            .members
+                            .iter()
+                            .filter(|(_, ms)| ms.iter().any(|(u, pn)| *u == user || *pn == user))
+                            .filter_map(|(g, _)| self.chats.values().find(|c| c.is_group && c.jid.user.as_str() == g).map(|c| self.display_name(c)))
+                            .collect();
+                        section(ui, &format!("{} gemeinsame Gruppen", common.len()));
+                        for g in common {
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                ui.label(g);
+                            });
+                        }
+                        ui.add_space(8.0);
+                        ui.separator();
+                        let blocked = self.blocklist.iter().any(|b| user_of(b) == user);
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            if ui.button(RichText::new(if blocked { "Blockierung aufheben".to_owned() } else { format!("{title} blockieren") }).color(pal.danger)).clicked() {
+                                cmds.push(Cmd::Block { jid: jid.clone(), on: !blocked });
+                            }
+                        });
+                    }
+                    ui.add_space(20.0);
+                });
+            });
+        for c in cmds {
+            let _ = self.cmd.send(c);
+        }
+        for (id, md) in want {
+            if self.img_requested.insert(id.clone()) {
+                let _ = self.cmd.send(Cmd::LoadMedia { id, media: md });
+            }
+        }
+        if close {
+            self.show_info = false;
+        }
+        if let Some(j) = jump {
+            if let Some(n) = j.strip_prefix("chat:") {
+                self.run_msg_act(MsgAct::OpenNumber(n.to_owned()));
+            } else {
+                self.run_msg_act(MsgAct::Jump(j));
+            }
+        }
+    }
+
+    fn new_group_dialog(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some((mut name, mut sel, mut nums)) = self.new_group.take() else { return };
+        let mut open = true;
+        let mut create = false;
+        egui::Window::new("Neue Gruppe")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.add(egui::TextEdit::singleline(&mut name).hint_text("Gruppenname").desired_width(f32::INFINITY).margin(egui::vec2(10.0, 7.0)));
+                ui.add_space(6.0);
+                ui.label(RichText::new("Mitglieder auswählen").small().color(pal.dim));
+                let mut people: Vec<(String, String)> = self
+                    .chats
+                    .values()
+                    .filter(|c| !c.is_group && c.jid.server == whatsapp_rust::Server::Pn)
+                    .map(|c| (c.jid.user.to_string(), self.display_name(c)))
+                    .collect();
+                people.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (u, n) in people {
+                        let mut on = sel.contains(&u);
+                        if ui.checkbox(&mut on, n).changed() {
+                            if on {
+                                sel.insert(u);
+                            } else {
+                                sel.remove(&u);
+                            }
+                        }
+                    }
+                });
+                ui.add(egui::TextEdit::singleline(&mut nums).hint_text("Weitere Nummern (mit Komma getrennt)").desired_width(f32::INFINITY));
+                ui.add_space(6.0);
+                if ui.add_enabled(!name.trim().is_empty() && self.conn == Conn::Online, egui::Button::new("Gruppe erstellen")).clicked() {
+                    create = true;
+                }
+            });
+        if create {
+            let mut numbers: Vec<String> = sel.iter().cloned().collect();
+            numbers.extend(nums.split([',', ';', ' ']).map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>()).filter(|n| n.len() >= 7));
+            let _ = self.cmd.send(Cmd::CreateGroup { name: name.trim().to_owned(), numbers });
+        } else if open {
+            self.new_group = Some((name, sel, nums));
+        }
+    }
+
     /// Tastenkürzel: Strg+F Suche, Strg+N neuer Chat, Esc schließen, Alt+↑/↓ Chat wechseln.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
@@ -3946,7 +4765,7 @@ fn main() -> eframe::Result<()> {
         if show {
             let opts = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default()
-                    .with_inner_size([1040.0, 700.0])
+                    .with_inner_size([1280.0, 800.0])
                     .with_min_inner_size([640.0, 420.0])
                     .with_app_id("wa-snap")
                     .with_title("WhatsSnap"),

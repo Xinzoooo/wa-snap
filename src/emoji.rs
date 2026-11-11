@@ -41,6 +41,33 @@ fn index() -> &'static Index {
     })
 }
 
+/// Ein Eintrag der Emoji-Auswahl.
+pub struct Item {
+    pub e: String,
+    pub name: String,
+    pub tags: String,
+    pub skins: Vec<String>,
+}
+
+/// Emoji-Auswahl in WhatsApp-Kategorien (aus `assets/emoji_list.json`).
+pub fn picker() -> &'static Vec<(String, Vec<Item>)> {
+    static P: OnceLock<Vec<(String, Vec<Item>)>> = OnceLock::new();
+    P.get_or_init(|| {
+        let raw: Vec<(String, Vec<(String, String, String, Vec<String>)>)> =
+            serde_json::from_str(include_str!("../assets/emoji_list.json")).unwrap_or_default();
+        raw.into_iter()
+            .map(|(cat, items)| {
+                (cat, items.into_iter().map(|(e, name, tags, skins)| Item { tags: tags.to_lowercase(), name, e, skins }).collect())
+            })
+            .collect()
+    })
+}
+
+/// Schlüssel (ohne U+FE0F), wie ihn `Cache::get` erwartet.
+pub fn key(e: &str) -> String {
+    e.chars().filter(|c| *c != '\u{FE0F}').collect()
+}
+
 pub enum Seg<'a> {
     Text(&'a str),
     Emoji(String),

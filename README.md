@@ -5,10 +5,10 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.9)
+## Funktionen (v0.10)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
-- Bunte Emojis (Twemoji) in Nachrichten, Chatliste und Emoji-Auswahl mit Kategorien; reine Emoji-Nachrichten werden groß angezeigt
+- 3D-Emojis im Stil von WhatsApp (Microsoft Fluent Emoji, fehlende aus Twemoji) in Nachrichten, Chatliste und Auswahl; alle 1900+ Emojis mit Kategorien wie bei WhatsApp, „Letzte“, deutscher Suche und Hauttönen (Rechtsklick); reine Emoji-Nachrichten werden groß angezeigt
 - Haken wie bei WhatsApp: gesendet, zugestellt, gelesen (blau)
 - Beim Öffnen eines Chats werden Lesebestätigungen gesendet, der Ungelesen-Zähler am Handy geht mit
 - Stumm, Anheften und Archiv über Rechtsklick auf einen Chat oder das Menü im Chat-Kopf, abgeglichen mit WhatsApp (Nummer und LID werden beide zugeordnet)
@@ -34,7 +34,9 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Verlauf wird lokal gespeichert und ist nach dem Neustart wieder da
 - Namen aus dem Adressbuch, Gruppennamen direkt vom Server, Profilbilder mit Zwischenspeicher
 - Mehrzeilig schreiben (Shift+Enter), senden mit Enter
-- WhatsApp-Profil (Name, Info) in den Einstellungen änderbar; Autostart, Schriftgröße
+- Einstellungen aufgebaut wie bei WhatsApp: Profil (Name, Info, Profilbild), Konto (Abmelden, lokale Daten löschen), Datenschutz (zuletzt online, online, Profilbild, Info, Gruppen, Anrufe von Unbekannten, Lesebestätigungen, Standard für selbstlöschende Nachrichten, Blockierte), Chats (Design, Schrift, Enter sendet), Benachrichtigungen (Gruppen, Ton), Speicher (automatischer Download, Medien löschen), WhatsSnap (Tray, Autostart, Online-Status, „schreibt …“, GIF-Schlüssel, Tastenkürzel), Hilfe
+- Kontakt- und Gruppeninfo (Klick auf den Chat-Kopf): Medien, Beschreibung, Mitglieder, gemeinsame Gruppen, Blockieren
+- Gruppen: neue Gruppe anlegen (+ → Neue Gruppe), umbenennen, Mitglieder hinzufügen/entfernen, Admins ernennen, Einladungslink, verlassen; selbstlöschende Nachrichten je Chat (⋮-Menü)
 - Neuer Chat per Telefonnummer (Nummer in die Suche tippen)
 - Fotos und Sticker werden im Chat angezeigt (Klick öffnet in voller Größe), animierte Sticker bewegen sich; Videos, GIFs und Dokumente laden per Klick und öffnen im Standardprogramm
 - Sprachnachrichten direkt in der App abspielen (Wellenform, Pause, Klick zum Spulen) und aufnehmen (Mikrofon-Knopf, wenn das Eingabefeld leer ist); Opus ist eingebaut, abgespielt und aufgenommen wird über PipeWire (`pw-play`/`pw-record`), ersatzweise PulseAudio oder ALSA
@@ -46,14 +48,14 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Rechtsklick auf eine Nachricht: Reagieren, Antworten, Text kopieren, für alle löschen; Reaktionen, Antworten (Zitate), gelöschte und bearbeitete Nachrichten von anderen werden angezeigt
 - Diagnose-Log: `~/.local/share/wa-snap/wa-snap.log`
 
-**Noch nicht vorhanden:** Videos direkt in der App abspielen, Datenschutz-Einstellungen, Gruppen anlegen, Anrufe. Fehler bitte als Issue melden.
+**Noch nicht vorhanden:** Videos direkt in der App abspielen, Status/Storys, Kanäle, Anrufe. Fehler bitte als Issue melden.
 
 ## Installation auf Fedora (empfohlen)
 
 Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.9.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.10.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
@@ -95,4 +97,4 @@ Die Sitzung liegt in `~/.local/share/wa-snap/whatsapp.db` (Linux), heruntergelad
 
 MIT, siehe [LICENSE](LICENSE).
 
-Eingebaut sind außerdem libopus (BSD) und libwebp (BSD). Mitgeliefert werden die Schrift [Inter](https://github.com/rsms/inter) (SIL Open Font License 1.1, [assets/fonts/OFL.txt](assets/fonts/OFL.txt)) und die Emoji-Grafiken von [Twemoji](https://github.com/jdecked/twemoji) (© Twitter, Inc. und weitere, CC-BY 4.0, [assets/TWEMOJI-LICENSE.txt](assets/TWEMOJI-LICENSE.txt)). `tools/pack_emoji.py` erzeugt daraus `assets/emoji.bin`.
+Eingebaut sind außerdem libopus (BSD) und libwebp (BSD). Mitgeliefert werden die Schrift [Inter](https://github.com/rsms/inter) (SIL Open Font License 1.1, [assets/fonts/OFL.txt](assets/fonts/OFL.txt)) die Emoji-Grafiken von [Fluent Emoji](https://github.com/microsoft/fluentui-emoji) (© Microsoft, MIT, [assets/FLUENT-EMOJI-LICENSE.txt](assets/FLUENT-EMOJI-LICENSE.txt)) und [Twemoji](https://github.com/jdecked/twemoji) (© Twitter, Inc. und weitere, CC-BY 4.0, [assets/TWEMOJI-LICENSE.txt](assets/TWEMOJI-LICENSE.txt)). Reihenfolge, Kategorien und deutsche Suchbegriffe stammen aus [Emojibase](https://github.com/milesj/emojibase) (MIT). `tools/pack_emoji.py` erzeugt daraus `assets/emoji.bin` und `assets/emoji_list.json`.

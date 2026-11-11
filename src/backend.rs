@@ -60,6 +60,12 @@ pub enum UiEvent {
     Revoked { id: String },
     /// Nachricht wurde bearbeitet.
     Edited { id: String, text: String },
+    /// Datenschutz-Einstellungen von WhatsApp: (Kategorie, Wert), z. B. ("last", "contacts").
+    Privacy(Vec<(String, String)>),
+    /// Gruppendetails für die Info-Seite.
+    GroupInfo(GroupDetails),
+    /// Blockierte Kontakte (JIDs).
+    Blocklist(Vec<String>),
     /// Datei eines Mediums liegt lokal bereit (z. B. Sprachnachricht zum Abspielen).
     FileReady { id: String, path: std::path::PathBuf },
     /// Animierter Sticker: Einzelbilder mit Dauer in Millisekunden.
@@ -111,6 +117,28 @@ pub enum Cmd {
     OpenMedia { id: String, media: MediaRef },
     /// Datei senden (Bild als Foto, sonst als Dokument). Ohne Pfad: Dateiauswahl öffnen.
     SendFile { chat: Jid, path: Option<std::path::PathBuf>, caption: String },
+    FetchPrivacy,
+    GroupInfo(Jid),
+    /// Neue Gruppe mit Telefonnummern (nur Ziffern) anlegen.
+    CreateGroup { name: String, numbers: Vec<String> },
+    GroupRename { jid: Jid, name: String },
+    GroupAdd { jid: Jid, numbers: Vec<String> },
+    GroupRemove { jid: Jid, member: String },
+    GroupAdmin { jid: Jid, member: String, on: bool },
+    GroupLeave(Jid),
+    GroupInvite(Jid),
+    /// Datenschutz ändern, Kategorie/Wert wie bei UiEvent::Privacy.
+    SetPrivacy { cat: String, val: String },
+    /// Standarddauer für selbstlöschende Nachrichten (Sekunden, 0 = aus).
+    SetDefaultDisappearing(u32),
+    /// Selbstlöschende Nachrichten für einen Chat (Sekunden, 0 = aus).
+    SetChatDisappearing { chat: Jid, secs: u32 },
+    /// Eigenes Profilbild setzen (ohne Pfad: Dateiauswahl).
+    SetProfilePicture(Option<std::path::PathBuf>),
+    FetchBlocklist,
+    Block { jid: Jid, on: bool },
+    /// Gerät bei WhatsApp abmelden.
+    Logout,
     /// Datei eines Mediums herunterladen (falls nötig) und melden, wo sie liegt.
     FetchFile { id: String, media: MediaRef },
     /// Sprachnachricht senden (fertig kodiertes Ogg/Opus).
@@ -124,6 +152,19 @@ pub enum Cmd {
     /// Bekannten Sticker erneut senden (ohne neuen Upload).
     SendSticker { chat: Jid, media: MediaRef },
     Quit,
+}
+
+/// Details einer Gruppe.
+#[derive(Clone, Default)]
+#[allow(dead_code)]
+pub struct GroupDetails {
+    pub group: String,
+    pub subject: String,
+    pub description: String,
+    /// (JID, Telefonnummer-User, Admin, Ersteller)
+    pub members: Vec<(String, String, bool, bool)>,
+    pub created: i64,
+    pub i_am_admin: bool,
 }
 
 /// Ein Treffer der GIF-Suche.
@@ -518,6 +559,10 @@ pub fn extra_of(msg: &wa::Message) -> MsgExtra {
 #[derive(Default)]
 pub struct NotifyState {
     pub enabled: bool,
+    /// Auch bei Gruppennachrichten benachrichtigen
+    pub groups: bool,
+    /// Ton abspielen
+    pub sound: bool,
     pub preview: bool,
     pub muted: HashSet<String>,
     pub focused: bool,
@@ -590,6 +635,19 @@ pub fn show_notification(title: &str, body: &str) -> Result<(), String> {
     }
 }
 
+/// Kurzer Hinweiston (Freedesktop-Klang über PipeWire/PulseAudio/libcanberra).
+pub fn play_notify_sound() {
+    std::thread::spawn(|| {
+        let f = "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga";
+        let ok = std::path::Path::new(f).exists()
+            && (std::process::Command::new("pw-play").arg(f).status().map(|s| s.success()).unwrap_or(false)
+                || std::process::Command::new("paplay").arg(f).status().map(|s| s.success()).unwrap_or(false));
+        if !ok {
+            let _ = std::process::Command::new("canberra-gtk-play").args(["-i", "message-new-instant"]).status();
+        }
+    });
+}
+
 fn maybe_notify(state: &SharedNotify, m: &ChatMessage) {
     if m.from_me {
         return;
@@ -604,8 +662,11 @@ fn maybe_notify(state: &SharedNotify, m: &ChatMessage) {
             st.enabled,
             st.muted.contains(&chat_user)
         ));
-        if !st.enabled || st.muted.contains(&chat_user) || viewing || age > 300 {
+        if !st.enabled || st.muted.contains(&chat_user) || viewing || age > 300 || (m.is_group && !st.groups) {
             return;
+        }
+        if st.sound {
+            play_notify_sound();
         }
         let chat_name = st.names.get(&chat_user).cloned().unwrap_or_else(|| {
             if m.is_group {
@@ -1845,6 +1906,234 @@ pub fn spawn(
                                             log(format!("Datei senden fehlgeschlagen: {e}"));
                                             send(UiEvent::Info(format!("Datei senden fehlgeschlagen: {e}")));
                                         }
+                                    });
+                                }
+                                Cmd::GroupInfo(jid) => {
+                                    tokio::spawn(async move {
+                                        match client.groups().get_metadata(&jid).await {
+                                            Ok(m) => {
+                                                let me: Vec<String> = [client.pn(), client.lid()].into_iter().flatten().map(|j| j.user.to_string()).collect();
+                                                let members: Vec<(String, String, bool, bool)> = m
+                                                    .participants
+                                                    .iter()
+                                                    .map(|p| {
+                                                        (
+                                                            p.jid.to_string(),
+                                                            p.phone_number.as_ref().map(|n| n.user.to_string()).unwrap_or_default(),
+                                                            p.is_admin(),
+                                                            p.participant_type == whatsapp_rust::features::ParticipantType::SuperAdmin,
+                                                        )
+                                                    })
+                                                    .collect();
+                                                let i_am_admin = m.participants.iter().any(|p| p.is_admin() && (me.contains(&p.jid.user.to_string()) || p.phone_number.as_ref().map(|n| me.contains(&n.user.to_string())).unwrap_or(false)));
+                                                send(UiEvent::GroupInfo(GroupDetails {
+                                                    group: jid.user.to_string(),
+                                                    subject: m.subject.clone(),
+                                                    description: m.description.clone().unwrap_or_default(),
+                                                    members,
+                                                    created: m.creation_time.unwrap_or(0) as i64,
+                                                    i_am_admin,
+                                                }));
+                                            }
+                                            Err(e) => send(UiEvent::Info(format!("Gruppeninfo: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::CreateGroup { name, numbers } => {
+                                    tokio::spawn(async move {
+                                        use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
+                                        let parts = numbers.iter().map(|n| GroupParticipantOptions::new(Jid::pn(n.clone()))).collect();
+                                        let opts = GroupCreateOptions::builder().subject(name.clone()).participants(parts).build();
+                                        match client.groups().create_group(opts).await {
+                                            Ok(r) => {
+                                                send(UiEvent::Groups(vec![(r.metadata.id.clone(), r.metadata.subject.clone())]));
+                                                send(UiEvent::Info(format!("Gruppe „{name}“ erstellt")));
+                                            }
+                                            Err(e) => send(UiEvent::Info(format!("Gruppe erstellen: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::GroupRename { jid, name } => {
+                                    tokio::spawn(async move {
+                                        let r = match whatsapp_rust::features::GroupSubject::new(name.clone()) {
+                                            Ok(subj) => client.groups().set_subject(jid.clone(), subj).await.map_err(|e| e.to_string()),
+                                            Err(e) => Err(e.to_string()),
+                                        };
+                                        match r {
+                                            Ok(()) => send(UiEvent::Groups(vec![(jid, name)])),
+                                            Err(e) => send(UiEvent::Info(format!("Umbenennen: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::GroupAdd { jid, numbers } => {
+                                    tokio::spawn(async move {
+                                        let js: Vec<Jid> = numbers.iter().map(|n| Jid::pn(n.clone())).collect();
+                                        match client.groups().add_participants(jid.clone(), &js).await {
+                                            Ok(_) => send(UiEvent::Info("Mitglieder hinzugefügt".into())),
+                                            Err(e) => send(UiEvent::Info(format!("Hinzufügen: {e}"))),
+                                        }
+                                        let _ = jid;
+                                    });
+                                }
+                                Cmd::GroupRemove { jid, member } => {
+                                    tokio::spawn(async move {
+                                        let Ok(m) = member.parse::<Jid>() else { return };
+                                        match client.groups().remove_participants(jid, &[m]).await {
+                                            Ok(_) => send(UiEvent::Info("Mitglied entfernt".into())),
+                                            Err(e) => send(UiEvent::Info(format!("Entfernen: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::GroupAdmin { jid, member, on } => {
+                                    tokio::spawn(async move {
+                                        let Ok(m) = member.parse::<Jid>() else { return };
+                                        let g = client.groups();
+                                        let r = if on { g.promote_participants(jid, &[m]).await } else { g.demote_participants(jid, &[m]).await };
+                                        if let Err(e) = r {
+                                            send(UiEvent::Info(format!("Admin-Rechte: {e}")));
+                                        }
+                                    });
+                                }
+                                Cmd::GroupLeave(jid) => {
+                                    tokio::spawn(async move {
+                                        match client.groups().leave(jid).await {
+                                            Ok(()) => send(UiEvent::Info("Gruppe verlassen".into())),
+                                            Err(e) => send(UiEvent::Info(format!("Verlassen: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::GroupInvite(jid) => {
+                                    tokio::spawn(async move {
+                                        match client.groups().get_invite_link(jid, false).await {
+                                            Ok(link) => send(UiEvent::Info(format!("Einladungslink (in die Zwischenablage kopiert): {link}"))),
+                                            Err(e) => send(UiEvent::Info(format!("Einladungslink: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::FetchPrivacy => {
+                                    tokio::spawn(async move {
+                                        match client.fetch_privacy_settings().await {
+                                            Ok(r) => {
+                                                let list = r
+                                                    .settings
+                                                    .iter()
+                                                    .map(|s| (format!("{:?}", s.category).to_lowercase(), format!("{:?}", s.value).to_lowercase()))
+                                                    .collect();
+                                                send(UiEvent::Privacy(list));
+                                            }
+                                            Err(e) => send(UiEvent::Info(format!("Datenschutz laden: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::SetPrivacy { cat, val } => {
+                                    tokio::spawn(async move {
+                                        use whatsapp_rust::wacore::iq::privacy::{PrivacyCategory as C, PrivacyValue as V};
+                                        let c = match cat.as_str() {
+                                            "last" => C::Last,
+                                            "online" => C::Online,
+                                            "profile" => C::Profile,
+                                            "status" => C::Status,
+                                            "groupadd" => C::GroupAdd,
+                                            "readreceipts" => C::ReadReceipts,
+                                            "calladd" => C::CallAdd,
+                                            _ => return,
+                                        };
+                                        let v = match val.as_str() {
+                                            "all" => V::All,
+                                            "contacts" => V::Contacts,
+                                            "none" => V::None,
+                                            "matchlastseen" => V::MatchLastSeen,
+                                            "known" => V::Known,
+                                            _ => return,
+                                        };
+                                        match client.set_privacy_setting(c, v).await {
+                                            Ok(_) => log(format!("Datenschutz {cat} = {val}")),
+                                            Err(e) => send(UiEvent::Info(format!("Datenschutz ändern fehlgeschlagen: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::SetDefaultDisappearing(secs) => {
+                                    tokio::spawn(async move {
+                                        if let Err(e) = client.set_default_disappearing_mode(secs).await {
+                                            send(UiEvent::Info(format!("Selbstlöschen: {e}")));
+                                        }
+                                    });
+                                }
+                                Cmd::SetChatDisappearing { chat, secs } => {
+                                    tokio::spawn(async move {
+                                        let r = if chat.is_group() {
+                                            client.groups().set_ephemeral(&chat, secs).await.map_err(|e| e.to_string())
+                                        } else {
+                                            client.set_chat_disappearing_timer(chat, secs).await.map(|_| ()).map_err(|e| e.to_string())
+                                        };
+                                        match r {
+                                            Ok(()) => send(UiEvent::Info(if secs == 0 { "Selbstlöschende Nachrichten aus".into() } else { "Selbstlöschende Nachrichten an".into() })),
+                                            Err(e) => send(UiEvent::Info(format!("Selbstlöschen: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::SetProfilePicture(path) => {
+                                    tokio::spawn(async move {
+                                        let path = match path {
+                                            Some(p) => p,
+                                            None => match rfd::AsyncFileDialog::new()
+                                                .set_title("Profilbild wählen")
+                                                .add_filter("Bilder", &["png", "jpg", "jpeg", "webp"])
+                                                .pick_file()
+                                                .await
+                                            {
+                                                Some(f) => f.path().to_path_buf(),
+                                                None => return,
+                                            },
+                                        };
+                                        let jpeg = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                                            let img = image::open(&path).map_err(|e| e.to_string())?;
+                                            let side = img.width().min(img.height());
+                                            let sq = img.crop_imm((img.width() - side) / 2, (img.height() - side) / 2, side, side).resize_exact(640, 640, image::imageops::FilterType::Lanczos3).to_rgb8();
+                                            let mut out = Vec::new();
+                                            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&sq).map_err(|e| e.to_string())?;
+                                            Ok(out)
+                                        })
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                        .and_then(|r| r);
+                                        match jpeg {
+                                            Ok(j) => match client.profile().set_profile_picture(j).await {
+                                                Ok(_) => send(UiEvent::Info("Profilbild bei WhatsApp geändert".into())),
+                                                Err(e) => send(UiEvent::Info(format!("Profilbild: {e}"))),
+                                            },
+                                            Err(e) => send(UiEvent::Info(format!("Profilbild: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::FetchBlocklist => {
+                                    tokio::spawn(async move {
+                                        match client.blocking().get_blocklist().await {
+                                            Ok(list) => send(UiEvent::Blocklist(list.into_iter().map(|b| b.jid.to_string()).collect())),
+                                            Err(e) => send(UiEvent::Info(format!("Blockierte laden: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::Block { jid, on } => {
+                                    tokio::spawn(async move {
+                                        let b = client.blocking();
+                                        let r = if on { b.block(&jid).await } else { b.unblock(&jid).await };
+                                        match r {
+                                            Ok(()) => {
+                                                if let Ok(list) = b.get_blocklist().await {
+                                                    send(UiEvent::Blocklist(list.into_iter().map(|e| e.jid.to_string()).collect()));
+                                                }
+                                                send(UiEvent::Info(if on { "Kontakt blockiert".into() } else { "Blockierung aufgehoben".into() }));
+                                            }
+                                            Err(e) => send(UiEvent::Info(format!("Blockieren: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::Logout => {
+                                    tokio::spawn(async move {
+                                        client.logout().await;
+                                        log("Abgemeldet (auf Wunsch)");
+                                        send(UiEvent::LoggedOut);
                                     });
                                 }
                                 Cmd::FetchFile { id, media } => {
