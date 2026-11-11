@@ -5,34 +5,32 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.4)
+## Funktionen (v0.5)
 
-- Verknüpfung per QR-Code, die Sitzung bleibt gespeichert
-- Modernes, ruhiges Design, hell und dunkel umschaltbar; Chatliste mit Profilbildern, Suche, Ungelesen-Zähler, Datumstrenner
+- Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
+- Bunte Emojis (Twemoji) in Nachrichten, Chatliste und Emoji-Auswahl mit Kategorien; reine Emoji-Nachrichten werden groß angezeigt
+- Haken wie bei WhatsApp: gesendet, zugestellt, gelesen (blau)
+- Beim Öffnen eines Chats werden Lesebestätigungen gesendet, der Ungelesen-Zähler am Handy geht mit
+- Stumm, Anheften und Archiv über Rechtsklick auf einen Chat oder das Menü im Chat-Kopf, abgeglichen mit WhatsApp (Nummer und LID werden beide zugeordnet)
+- Benachrichtigungen kommen auch, wenn das Fenster minimiert ist; Test-Knopf in den Einstellungen
+- Suche in der Chatliste und im geöffneten Chat
+- Verknüpfung per QR-Code, die Sitzung bleibt gespeichert; beim Verknüpfen wird der Verlauf der letzten 365 Tage angefordert
 - Verlauf wird lokal gespeichert und ist nach dem Neustart wieder da
-- Mehrzeilig schreiben (Shift+Enter) und Emoji-Auswahl
-- Namen aus dem Adressbuch (sobald WhatsApp sie synchronisiert hat), sonst Push-Namen
-- Interne Sync-Nachrichten werden ausgeblendet, Uhrzeit in deiner Zeitzone
-- Nachrichten empfangen und Textnachrichten senden (Enter)
-- Bestehende Chats, Gruppennamen und der letzte Verlauf werden nach der Verknüpfung aus dem Verlauf-Sync übernommen
-- Desktop-Benachrichtigungen (an/aus, mit oder ohne Textvorschau; Fehler landen im Log, Ersatzweg über `notify-send`)
-- Stumm, Anheften und Archiv werden mit WhatsApp abgeglichen (Änderungen vom Handy kommen an, Änderungen hier gehen zurück); Profilname und Info-Text lassen sich bei WhatsApp ändern
-- Gruppenliste und Gruppennamen werden beim Start direkt vom Server geholt
-- Beim Verknüpfen wird der Verlauf der letzten 365 Tage angefordert
-- Diagnose-Log: `~/.local/share/wa-snap/wa-snap.log`
-- Einstellungen: WhatsApp-Profil, Benachrichtigungen, Autostart (Linux), Schriftgröße
+- Namen aus dem Adressbuch, Gruppennamen direkt vom Server, Profilbilder mit Zwischenspeicher
+- Mehrzeilig schreiben (Shift+Enter), senden mit Enter
+- WhatsApp-Profil (Name, Info) in den Einstellungen änderbar; Autostart, Schriftgröße
 - Neuer Chat per Telefonnummer (Nummer in die Suche tippen)
-- Medien erscheinen als Platzhalter, z. B. `[image]`; Profilbilder werden geladen und zwischengespeichert
-- Dunkles Design, läuft unter Linux, Windows und macOS (getestet nur unter Linux)
+- Medien erscheinen als Hinweis, z. B. „📷 Foto“
+- Diagnose-Log: `~/.local/share/wa-snap/wa-snap.log`
 
-**Noch nicht vorhanden:** Bilder/Dokumente/Sprachnachrichten, bunte Emojis, GIFs und Sticker (die Oberfläche zeichnet Emojis einfarbig), Anrufe, Antworten/Reaktionen, Haken für gelesen, Gruppen anlegen. Der Login mit einem echten Konto ist bisher nicht ausführlich getestet. Fehler bitte als Issue melden.
+**Noch nicht vorhanden:** Bilder/Dokumente/Sprachnachrichten anzeigen und senden, GIFs und Sticker, Antworten/Reaktionen, Datenschutz-Einstellungen, Gruppen anlegen, Anrufe. Fehler bitte als Issue melden.
 
 ## Installation auf Fedora (empfohlen)
 
 Ein Befehl, danach findest du wa-snap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.4.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.5.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
@@ -73,3 +71,5 @@ Die Sitzung liegt in `~/.local/share/wa-snap/whatsapp.db` (Linux). Die Datei ent
 ## Lizenz
 
 MIT, siehe [LICENSE](LICENSE).
+
+Mitgeliefert werden die Schrift [Inter](https://github.com/rsms/inter) (SIL Open Font License 1.1, [assets/fonts/OFL.txt](assets/fonts/OFL.txt)) und die Emoji-Grafiken von [Twemoji](https://github.com/jdecked/twemoji) (© Twitter, Inc. und weitere, CC-BY 4.0, [assets/TWEMOJI-LICENSE.txt](assets/TWEMOJI-LICENSE.txt)). `tools/pack_emoji.py` erzeugt daraus `assets/emoji.bin`.

@@ -18,11 +18,18 @@ pub enum Rec {
         text: String,
         ts: i64,
         id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        sjid: String,
+        #[serde(default)]
+        st: u8,
     },
     #[serde(rename = "chat")]
     Chat { jid: String, name: String, is_group: bool, last_ts: i64 },
     #[serde(rename = "name")]
     Name { user: String, name: String, book: bool },
+    /// Zustellstatus einer eigenen Nachricht (2 = zugestellt, 3 = gelesen).
+    #[serde(rename = "st")]
+    Status { id: String, st: u8 },
 }
 
 pub struct Store {
@@ -68,6 +75,8 @@ mod tests {
                 text: "Hallo\nzweite Zeile 👍".into(),
                 ts: 1_700_000_000,
                 id: "A1".into(),
+                sjid: String::new(),
+                st: 2,
             });
             s.append(&Rec::Name { user: "49151".into(), name: "Anna".into(), book: true });
         }

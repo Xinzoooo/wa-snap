@@ -1,6 +1,6 @@
 [package]
 name = "wa-snap"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 description = "Schneller nativer WhatsApp-Desktop-Client in Rust (inoffiziell)"
@@ -25,11 +25,13 @@ codegen-units = 4
 [package.metadata.generate-rpm]
 name = "wa-snap"
 summary = "Schneller nativer WhatsApp-Desktop-Client (inoffiziell)"
-license = "MIT"
+license = "MIT AND OFL-1.1 AND CC-BY-4.0"
 url = "https://github.com/Xinzoooo/wa-snap"
 assets = [
   { source = "target/release/wa-snap", dest = "/usr/bin/wa-snap", mode = "755" },
   { source = "assets/wa-snap-system.desktop", dest = "/usr/share/applications/wa-snap.desktop", mode = "644" },
   { source = "assets/wa-snap.svg", dest = "/usr/share/icons/hicolor/scalable/apps/wa-snap.svg", mode = "644" },
   { source = "LICENSE", dest = "/usr/share/licenses/wa-snap/LICENSE", mode = "644", doc = true },
+  { source = "assets/fonts/OFL.txt", dest = "/usr/share/licenses/wa-snap/Inter-OFL.txt", mode = "644", doc = true },
+  { source = "assets/TWEMOJI-LICENSE.txt", dest = "/usr/share/licenses/wa-snap/Twemoji-CC-BY-4.0.txt", mode = "644", doc = true },
 ]
