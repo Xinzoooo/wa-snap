@@ -49,6 +49,10 @@ struct Settings {
     recent_emojis: Vec<String>,
     /// Hautton 0 = Standard, 1–5 = hell bis dunkel
     skin_tone: u8,
+    /// Von anderen gelöschte Nachrichten weiter anzeigen
+    keep_deleted: bool,
+    /// Nur lokal angeheftete Chats (über die 3 von WhatsApp hinaus)
+    local_pins: Vec<String>,
 }
 
 impl Default for Settings {
@@ -74,6 +78,8 @@ impl Default for Settings {
             send_typing: true,
             recent_emojis: Vec::new(),
             skin_tone: 0,
+            keep_deleted: false,
+            local_pins: Vec::new(),
         }
     }
 }
@@ -936,6 +942,11 @@ impl App {
         v.insert(String::new(), vec!["Sonntag".into()]);
         self.starred.insert("demo-link".into());
         self.set_reaction("demo-img".into(), String::new(), "😍".into(), false);
+        if std::env::var_os("WA_SNAP_DEMO_MOD").is_some() {
+            self.settings.keep_deleted = true;
+            self.revoke_local("demo-0-2", false);
+            self.edit_local("demo-0-0", "Hey, bist du *heute* noch online?".into(), false);
+        }
         self.set_reaction("demo-1-2".into(), "4915100000001".into(), "❤️".into(), false);
         self.settings.pinned = vec!["4915100000001".into(), "120363000000001".into()];
         self.settings.muted = vec!["120363000000002".into()];
@@ -1332,20 +1343,30 @@ impl App {
     }
 
     fn revoke_local(&mut self, id: &str, persist: bool) {
+        let keep = self.settings.keep_deleted;
+        if persist {
+            self.store.append(&Rec::Del { id: id.to_owned() });
+        }
         if let Some(m) = self.find_msg_mut(id) {
+            // Eigene Löschungen immer ausführen; fremde auf Wunsch nur markieren.
+            if keep && !m.from_me {
+                m.x.deleted = true;
+                return;
+            }
             m.text = "🚫 Diese Nachricht wurde gelöscht.".into();
             m.media = None;
             m.quote = None;
-            if persist {
-                self.store.append(&Rec::Del { id: id.to_owned() });
-            }
+            m.x = backend::MsgExtra::default();
         }
         self.reactions.remove(id);
     }
 
     fn edit_local(&mut self, id: &str, text: String, persist: bool) {
         if let Some(m) = self.find_msg_mut(id) {
-            m.text = text.clone();
+            if m.text != text {
+                let old = std::mem::replace(&mut m.text, text.clone());
+                m.x.prev.push(old);
+            }
             m.x.edited = true;
             if persist {
                 self.store.append(&Rec::Edit { id: id.to_owned(), text });
@@ -1410,12 +1431,21 @@ impl App {
             }
             Act::Pin(_) => {
                 let on = !Self::has(&self.settings.pinned, &key);
-                if on && self.settings.pinned.len() >= 3 {
-                    self.info = Some("WhatsApp erlaubt höchstens 3 angeheftete Chats.".into());
-                    return;
+                // WhatsApp erlaubt 3 angeheftete Chats; weitere heftet WhatsSnap nur lokal an.
+                let local_only = on && self.settings.pinned.len() >= 3;
+                set_flag(&mut self.settings.pinned, user.clone(), on);
+                if local_only {
+                    if !self.settings.local_pins.contains(&user) {
+                        self.settings.local_pins.push(user);
+                    }
+                    self.info = Some("Nur in WhatsSnap angeheftet (am Handy sind höchstens 3 möglich).".into());
+                } else {
+                    let was_local = self.settings.local_pins.contains(&user);
+                    self.settings.local_pins.retain(|u| *u != user);
+                    if !was_local {
+                        let _ = self.cmd.send(Cmd::SetPin { jid, on });
+                    }
                 }
-                set_flag(&mut self.settings.pinned, user, on);
-                let _ = self.cmd.send(Cmd::SetPin { jid, on });
             }
             Act::Archive(_) => {
                 let on = !Self::has(&self.settings.archived, &key);
@@ -1449,6 +1479,14 @@ impl App {
                 }
                 UiEvent::LoggedOut => self.conn = Conn::LoggedOut,
                 UiEvent::Message(m) => {
+                    // Bei „Gelöschte behalten“ Fotos sofort laden, damit sie nach einer Löschung noch da sind.
+                    if self.settings.keep_deleted && !m.from_me {
+                        if let Some(md) = m.media.as_ref().filter(|md| md.is_picture()) {
+                            if self.img_requested.insert(m.id.clone()) {
+                                let _ = self.cmd.send(Cmd::LoadMedia { id: m.id.clone(), media: md.clone() });
+                            }
+                        }
+                    }
                     self.add_message(m, Source::Live);
                 }
                 UiEvent::History(c) => {
@@ -1628,7 +1666,11 @@ impl App {
                     }
                     self.apply_flag(0, users, on)
                 }
-                UiEvent::Pinned { users, on } => self.apply_flag(1, users, on),
+                UiEvent::Pinned { users, on } => {
+                    // lokale Zusatz-Pins nicht vom Handy-Abgleich entfernen lassen
+                    let users: Vec<String> = users.into_iter().filter(|u| on || !self.settings.local_pins.contains(u)).collect();
+                    self.apply_flag(1, users, on)
+                }
                 UiEvent::Archived { users, on } => self.apply_flag(2, users, on),
                 UiEvent::ChatRead { users, read } => {
                     for c in self.chats.values_mut() {
@@ -2093,6 +2135,11 @@ impl App {
         *changed |= toggle(ui, &mut self.settings.show_online, "Online anzeigen, solange das Fenster aktiv ist", pal).changed();
         ui.label(RichText::new("Aus: andere sehen dich über WhatsSnap nie online. Dein Handy bekommt dann weiter alle Benachrichtigungen.").small().color(pal.dim));
         *changed |= toggle(ui, &mut self.settings.send_typing, "Anderen „schreibt …“ anzeigen", pal).changed();
+        ui.add_space(8.0);
+        ui.label(RichText::new("Zusatzfunktionen").size(14.5));
+        *changed |= toggle(ui, &mut self.settings.keep_deleted, "Gelöschte Nachrichten anderer weiter anzeigen", pal).changed();
+        ui.label(RichText::new("Bleiben mit „🚫 gelöscht“ markiert sichtbar. Wirkt auch für ältere, schon gespeicherte Löschungen (nach Neustart). Fotos nur, wenn sie vorher geladen waren.").small().color(pal.dim));
+        ui.label(RichText::new("Frühere Fassungen bearbeiteter Nachrichten: Maus über „Bearbeitet ⓘ“ halten. Mehr als 3 Chats anheften geht immer; ab dem 4. nur in WhatsSnap.").small().color(pal.dim));
         ui.add_space(12.0);
         ui.label(RichText::new("GIF-Suche: Giphy-API-Schlüssel (kostenlos auf developers.giphy.com)").size(14.0));
         *changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.giphy_key).desired_width(360.0).margin(egui::vec2(10.0, 7.0))).changed();
@@ -3351,6 +3398,9 @@ impl App {
                             (pal.bubble_them, egui::Align::Min)
                         };
                         let sticker = m.media.as_ref().map(|x| x.kind == "sticker").unwrap_or(false);
+                        if m.x.deleted {
+                            bg = bg.gamma_multiply(0.75);
+                        }
                         if sticker {
                             bg = Color32::TRANSPARENT;
                         }
@@ -3449,8 +3499,16 @@ impl App {
                                             if m.x.expiration > 0 {
                                                 ui.label(RichText::new("⏱").size(10.0).color(pal.dim)).on_hover_text("Selbstlöschende Nachricht");
                                             }
+                                            if m.x.deleted {
+                                                ui.label(RichText::new("🚫 gelöscht").size(11.0).color(pal.danger))
+                                                    .on_hover_text("Der Absender hat diese Nachricht für alle gelöscht. WhatsSnap zeigt sie weiter an.");
+                                            }
                                             if m.x.edited {
-                                                ui.label(RichText::new("Bearbeitet").size(11.0).italics().color(pal.dim));
+                                                let l = ui.label(RichText::new(if m.x.prev.is_empty() { "Bearbeitet" } else { "Bearbeitet ⓘ" }).size(11.0).italics().color(pal.dim));
+                                                if !m.x.prev.is_empty() {
+                                                    let hist: Vec<String> = m.x.prev.iter().enumerate().map(|(i, t)| format!("Fassung {}: {t}", i + 1)).collect();
+                                                    l.on_hover_text(format!("Frühere Fassungen:\n{}", hist.join("\n")));
+                                                }
                                             }
                                             ui.label(RichText::new(fmt_time(m.ts)).size(11.0).color(pal.dim));
                                             if m.from_me {

@@ -5,7 +5,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.10)
+## Funktionen (v0.11)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - 3D-Emojis im Stil von WhatsApp (Microsoft Fluent Emoji, fehlende aus Twemoji) in Nachrichten, Chatliste und Auswahl; alle 1900+ Emojis mit Kategorien wie bei WhatsApp, „Letzte“, deutscher Suche und Hauttönen (Rechtsklick); reine Emoji-Nachrichten werden groß angezeigt
@@ -22,6 +22,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Knopf „Nach unten“ mit Zähler neuer Nachrichten; Klick auf ein Zitat springt zur Originalnachricht
 - Weiterleiten (auch Fotos, Sticker, Dokumente ohne neuen Upload)
 - Stummschalten für 8 Stunden, 1 Woche oder immer
+- Zusatzfunktionen: von anderen gelöschte Nachrichten weiter anzeigen (Schalter unter Einstellungen → WhatsSnap, standardmäßig aus), frühere Fassungen bearbeiteter Nachrichten ansehen (Maus über „Bearbeitet ⓘ“), mehr als 3 Chats anheften (ab dem 4. nur in WhatsSnap)
 - Eigene Nachrichten bearbeiten (bis 15 Minuten), „Bearbeitet“-Hinweis
 - @Erwähnungen in Gruppen mit Vorschlagsliste; Erwähnungen werden mit Namen hervorgehoben
 - Nachrichten mit Stern markieren (abgeglichen mit WhatsApp), Übersicht über ☆ in der linken Leiste
@@ -55,7 +56,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.10.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.11.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.

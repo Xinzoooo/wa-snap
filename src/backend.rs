@@ -453,6 +453,12 @@ pub struct MsgExtra {
     /// Erwähnte Nummern/LIDs (ohne @server).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<String>,
+    /// Vom Absender gelöscht, Inhalt aber behalten (Einstellung „Gelöschte Nachrichten behalten“).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+    /// Frühere Fassungen bearbeiteter Nachrichten (älteste zuerst).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prev: Vec<String>,
 }
 
 fn is_zero(v: &u32) -> bool {
