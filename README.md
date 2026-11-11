@@ -61,7 +61,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.13.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.13.1-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
@@ -114,7 +114,7 @@ WhatsSnap is a fast, native WhatsApp client for Linux written in Rust (egui). It
 Install on Fedora 40+:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.13.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.13.1-1.x86_64.rpm
 ```
 
 Then start “WhatsSnap” from the app menu and scan the QR code with WhatsApp → Settings → Linked devices.

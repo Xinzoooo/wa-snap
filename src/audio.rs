@@ -5,11 +5,15 @@
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub const RATE: u32 = 48_000;
 
 /// Ogg/Opus-Datei zu 16-Bit-PCM (48 kHz). Gibt (Samples, Kanäle) zurück.
+/// Längste Sprachnachricht, die dekodiert wird (WhatsApp selbst erlaubt deutlich weniger).
+pub const MAX_VOICE_SECS: usize = 30 * 60;
+
 pub fn decode_ogg_opus(bytes: &[u8]) -> Result<(Vec<i16>, usize), String> {
     let mut reader = ogg::PacketReader::new(Cursor::new(bytes));
     let head = reader.read_packet().map_err(|e| e.to_string())?.ok_or("leere Datei")?;
@@ -22,6 +26,7 @@ pub fn decode_ogg_opus(bytes: &[u8]) -> Result<(Vec<i16>, usize), String> {
     let mut dec = opus::Decoder::new(RATE, ch).map_err(|e| e.to_string())?;
     let mut pcm: Vec<i16> = Vec::new();
     let mut buf = vec![0i16; 5760 * channels];
+    let limit = MAX_VOICE_SECS * RATE as usize * channels;
     while let Some(p) = reader.read_packet().map_err(|e| e.to_string())? {
         if p.data.starts_with(b"OpusTags") {
             continue;
@@ -29,6 +34,10 @@ pub fn decode_ogg_opus(bytes: &[u8]) -> Result<(Vec<i16>, usize), String> {
         match dec.decode(&p.data, &mut buf, false) {
             Ok(n) => pcm.extend_from_slice(&buf[..n * channels]),
             Err(_) => continue,
+        }
+        // Winzige Pakete können sich auf das Tausendfache aufblähen: harte Obergrenze.
+        if pcm.len() > limit {
+            return Err(format!("länger als {} Minuten", MAX_VOICE_SECS / 60));
         }
     }
     let skip = (pre_skip * channels).min(pcm.len());
@@ -180,10 +189,18 @@ fn spawn_first(cands: &[(&str, Vec<String>)]) -> Result<Child, String> {
     Err(last)
 }
 
+enum PlayState {
+    Pending,
+    Running(Child),
+    Failed(String),
+    Stopped,
+}
+
 /// Läuft gerade eine Wiedergabe?
 pub struct Playback {
     pub id: String,
-    child: Child,
+    state: Arc<Mutex<PlayState>>,
+    wav: PathBuf,
     started: Instant,
     pub offset: f32,
     pub duration: f32,
@@ -195,29 +212,67 @@ impl Playback {
     }
 
     pub fn finished(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_))) || self.position() >= self.duration + 0.5
+        let done = match self.state.lock().as_deref_mut() {
+            Ok(PlayState::Running(c)) => matches!(c.try_wait(), Ok(Some(_))),
+            Ok(PlayState::Failed(_)) | Ok(PlayState::Stopped) | Err(_) => true,
+            Ok(PlayState::Pending) => false,
+        };
+        done || self.position() >= self.duration + 0.5
     }
 
-    pub fn stop(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    /// Fehlermeldung, falls der Player nicht starten konnte.
+    pub fn error(&self) -> Option<String> {
+        match self.state.lock().as_deref() {
+            Ok(PlayState::Failed(e)) => Some(e.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn stop(self) {
+        if let Ok(mut g) = self.state.lock() {
+            if let PlayState::Running(c) = &mut *g {
+                let _ = c.kill();
+                let _ = c.wait();
+                let _ = std::fs::remove_file(&self.wav);
+            }
+            *g = PlayState::Stopped;
+        }
     }
 }
 
 /// Dekodierte Sprachnachricht ab `offset` Sekunden abspielen.
-pub fn play(id: &str, pcm: &[i16], channels: usize, offset: f32, tmp: &Path) -> Result<Playback, String> {
+/// WAV-Datei schreiben und Player starten passiert in einem eigenen Thread,
+/// damit lange Nachrichten das Fenster nicht einfrieren.
+pub fn play(id: &str, pcm: &std::sync::Arc<Vec<i16>>, channels: usize, offset: f32, tmp: &Path) -> Result<Playback, String> {
     let duration = pcm.len() as f32 / channels as f32 / RATE as f32;
     let start = ((offset.max(0.0) * RATE as f32) as usize * channels).min(pcm.len());
-    let _ = std::fs::create_dir_all(tmp);
-    let wav = tmp.join("wiedergabe.wav");
-    std::fs::write(&wav, wav_bytes(&pcm[start..], channels)).map_err(|e| e.to_string())?;
-    let w = wav.to_string_lossy().to_string();
-    let child = spawn_first(&[
-        ("pw-play", vec![w.clone()]),
-        ("paplay", vec![w.clone()]),
-        ("aplay", vec!["-q".into(), w]),
-    ])?;
-    Ok(Playback { id: id.to_owned(), child, started: Instant::now(), offset, duration })
+    std::fs::create_dir_all(tmp).map_err(|e| e.to_string())?;
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let wav = tmp.join(format!("wiedergabe-{}-{n}.wav", std::process::id()));
+    let state: Arc<Mutex<PlayState>> = Arc::new(Mutex::new(PlayState::Pending));
+    let (st, pcm, path) = (state.clone(), pcm.clone(), wav.clone());
+    std::thread::spawn(move || {
+        let r = std::fs::write(&path, wav_bytes(&pcm[start..], channels)).map_err(|e| e.to_string()).and_then(|_| {
+            let w = path.to_string_lossy().to_string();
+            spawn_first(&[("pw-play", vec![w.clone()]), ("paplay", vec![w.clone()]), ("aplay", vec!["-q".into(), w])])
+        });
+        let Ok(mut g) = st.lock() else { return };
+        match (r, &*g) {
+            // Schon gestoppt, bevor der Player lief: sofort wieder beenden.
+            (Ok(mut c), PlayState::Stopped) => {
+                let _ = c.kill();
+                let _ = c.wait();
+                let _ = std::fs::remove_file(&path);
+            }
+            (Ok(c), _) => *g = PlayState::Running(c),
+            (Err(e), _) => {
+                let _ = std::fs::remove_file(&path);
+                *g = PlayState::Failed(e)
+            }
+        }
+    });
+    Ok(Playback { id: id.to_owned(), state, wav, started: Instant::now(), offset, duration })
 }
 
 /// Laufende Aufnahme.
@@ -283,6 +338,31 @@ mod tests {
         assert!(diff < 2000, "Länge {} statt {}", back.len(), pcm.len());
         let energy: f64 = back.iter().map(|x| (*x as f64).abs()).sum::<f64>() / back.len() as f64;
         assert!(energy > 1000.0, "zu leise: {energy}");
+    }
+
+    /// Viele winzige Pakete dürfen nicht zu unbegrenztem Speicher führen.
+    #[test]
+    fn opus_bomb_is_rejected() {
+        let mut enc = opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let mut buf = vec![0u8; 4000];
+        let n = enc.encode(&[0i16; 960], &mut buf).unwrap();
+        let pkt = buf[..n].to_vec();
+        let mut out = Vec::new();
+        {
+            let mut w = ogg::PacketWriter::new(&mut out);
+            let mut head = b"OpusHead".to_vec();
+            head.extend_from_slice(&[1, 1, 0, 0]);
+            head.extend_from_slice(&RATE.to_le_bytes());
+            head.extend_from_slice(&[0, 0, 0]);
+            w.write_packet(head, 1, ogg::PacketWriteEndInfo::EndPage, 0).unwrap();
+            let frames = MAX_VOICE_SECS * 50 + 500; // 20-ms-Pakete, etwas über dem Limit
+            for i in 0..frames {
+                let info = if i % 200 == 199 { ogg::PacketWriteEndInfo::EndPage } else { ogg::PacketWriteEndInfo::NormalPacket };
+                w.write_packet(pkt.clone(), 1, info, (i as u64 + 1) * 960).unwrap();
+            }
+        }
+        assert!(out.len() < 8_000_000, "Testdatei sollte klein sein: {}", out.len());
+        assert!(decode_ogg_opus(&out).is_err());
     }
 
     #[test]

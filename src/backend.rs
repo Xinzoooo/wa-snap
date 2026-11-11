@@ -79,7 +79,8 @@ pub enum UiEvent {
     /// Blockierte Kontakte (JIDs).
     Blocklist(Vec<String>),
     /// Datei eines Mediums liegt lokal bereit (z. B. Sprachnachricht zum Abspielen).
-    FileReady { id: String, path: std::path::PathBuf },
+    /// Bei Ogg/Opus schon im Hintergrund dekodiert: (PCM, Kanäle, Wellenform) oder Fehler.
+    FileReady { id: String, path: std::path::PathBuf, voice: Option<Result<(Arc<Vec<i16>>, usize, Vec<u8>), String>> },
     /// Animierter Sticker: Einzelbilder mit Dauer in Millisekunden.
     Anim { id: String, frames: Vec<([usize; 2], Vec<u8>, u32)> },
     /// Ergebnisse der GIF-Suche.
@@ -443,9 +444,32 @@ fn mime_of(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// Obergrenzen für Bilder aus fremder Quelle (Schutz vor Dekompressionsbomben).
+const IMG_MAX_DIM: u32 = 12_000;
+const IMG_MAX_ALLOC: u64 = 200 * 1024 * 1024;
+
+/// Bild aus fremder Quelle dekodieren – mit Größen- und Speicherlimit.
+pub fn load_image_limited(bytes: &[u8]) -> Option<image::DynamicImage> {
+    let mut r = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut l = image::Limits::default();
+    l.max_image_width = Some(IMG_MAX_DIM);
+    l.max_image_height = Some(IMG_MAX_DIM);
+    l.max_alloc = Some(IMG_MAX_ALLOC);
+    r.limits(l);
+    match r.decode() {
+        Ok(img) => Some(img),
+        Err(e) => {
+            if matches!(e, image::ImageError::Limits(_)) {
+                log(format!("Bild abgelehnt (zu groß): {e}"));
+            }
+            None
+        }
+    }
+}
+
 /// Bilddatei dekodieren und auf höchstens `max` Pixel verkleinern.
 fn decode_rgba(bytes: &[u8], max: u32) -> Option<([usize; 2], Vec<u8>)> {
-    let img = image::load_from_memory(bytes).ok()?;
+    let img = load_image_limited(bytes)?;
     let img = if img.width() > max || img.height() > max { img.thumbnail(max, max) } else { img };
     let rgba = img.to_rgba8();
     Some(([rgba.width() as usize, rgba.height() as usize], rgba.into_raw()))
@@ -454,6 +478,8 @@ fn decode_rgba(bytes: &[u8], max: u32) -> Option<([usize; 2], Vec<u8>)> {
 /// Datei des Mediums im Datenordner; lädt sie herunter, falls sie noch fehlt.
 async fn ensure_file(client: &Client, dir: &std::path::Path, id: &str, m: &MediaRef) -> Result<std::path::PathBuf, String> {
     let path = dir.join(format!("{}.{}", safe_name(id), m.ext()));
+    // Vollständig ist eine Datei erst nach dem Umbenennen von `.part` – halbe Downloads
+    // bleiben als `.part` liegen und werden beim nächsten Start entfernt.
     if path.exists() {
         return Ok(path);
     }
@@ -461,8 +487,21 @@ async fn ensure_file(client: &Client, dir: &std::path::Path, id: &str, m: &Media
         return Err(t!("Medium ist nicht mehr verfügbar", "Media is no longer available").into());
     }
     let bytes = client.download_from_params(&m.params()).await.map_err(|e| e.to_string())?;
-    let _ = std::fs::create_dir_all(dir);
-    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let part = dir.join(format!("{}.{}.part", safe_name(id), m.ext()));
+    let p2 = part.clone();
+    let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&p2)?;
+        f.write_all(&bytes)?;
+        f.sync_all()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Err(e) = res.and_then(|_| std::fs::rename(&part, &path)) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e.to_string());
+    }
     Ok(path)
 }
 
@@ -934,7 +973,7 @@ async fn load_avatar(client: Arc<Client>, dir: std::path::PathBuf, jid: Jid) -> 
         return None;
     }
     tokio::task::spawn_blocking(move || {
-        let img = image::load_from_memory(&bytes).ok()?.thumbnail(96, 96).to_rgba8();
+        let img = load_image_limited(&bytes)?.thumbnail(96, 96).to_rgba8();
         let size = [img.width() as usize, img.height() as usize];
         Some(UiEvent::Avatar { user, size, rgba: img.into_raw() })
     })
@@ -1085,8 +1124,15 @@ fn to_sticker_webp(img: &image::DynamicImage) -> Result<Vec<u8>, String> {
 /// Animierten WebP-Sticker in Einzelbilder zerlegen (höchstens 60, verkleinert).
 fn decode_anim(bytes: &[u8]) -> Option<Vec<([usize; 2], Vec<u8>, u32)>> {
     use image::AnimationDecoder;
+    use image::ImageDecoder;
     let dec = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes)).ok()?;
     if !dec.has_animation() {
+        return None;
+    }
+    // Sticker sind 512×512; riesige Leinwände nicht Frame für Frame dekodieren.
+    let (w, h) = dec.dimensions();
+    if w > 2048 || h > 2048 {
+        log(format!("Animation abgelehnt ({w}×{h})"));
         return None;
     }
     let mut out = Vec::new();
@@ -1101,12 +1147,18 @@ fn decode_anim(bytes: &[u8]) -> Option<Vec<([usize; 2], Vec<u8>, u32)>> {
 
 /// Bei Giphy suchen. Gibt bis zu 24 Treffer mit Vorschaubild zurück.
 fn giphy_search(query: &str, key: &str) -> Result<Vec<GifItem>, String> {
-    let url = format!(
-        "https://api.giphy.com/v1/gifs/search?api_key={}&q={}&limit=24&rating=pg-13&lang=de",
-        key,
-        query.replace(' ', "+")
-    );
-    let body = ureq::get(&url).call().map_err(|e| e.to_string())?.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    let lang = if crate::i18n::en() { "en" } else { "de" };
+    let body = ureq::get("https://api.giphy.com/v1/gifs/search")
+        .query("api_key", key)
+        .query("q", query)
+        .query("limit", "24")
+        .query("rating", "pg-13")
+        .query("lang", lang)
+        .call()
+        .map_err(|e| e.to_string())?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for g in v["data"].as_array().cloned().unwrap_or_default() {
@@ -1129,7 +1181,7 @@ fn giphy_search(query: &str, key: &str) -> Result<Vec<GifItem>, String> {
         if !still.is_empty() {
             if let Ok(mut r) = ureq::get(still).call() {
                 if let Ok(b) = r.body_mut().read_to_vec() {
-                    if let Ok(img) = image::load_from_memory(&b) {
+                    if let Some(img) = load_image_limited(&b) {
                         item.thumb = jpeg_thumb(&img);
                         let t = img.thumbnail(160, 160).to_rgba8();
                         item.preview = Some(([t.width() as usize, t.height() as usize], t.into_raw()));
@@ -1376,10 +1428,10 @@ pub fn spawn(
     ui_tx: Sender<UiEvent>,
     notify_state: SharedNotify,
     repaint: impl Fn() + Send + Sync + Clone + 'static,
-) -> tokio::sync::mpsc::UnboundedSender<Cmd> {
+) -> (tokio::sync::mpsc::UnboundedSender<Cmd>, std::thread::JoinHandle<()>) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
 
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("wa-backend".into())
         .spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2578,7 +2630,23 @@ pub fn spawn(
                                     let dir = media_dir.clone();
                                     tokio::spawn(async move {
                                         match ensure_file(&client, &dir, &id, &media).await {
-                                            Ok(path) => send(UiEvent::FileReady { id, path }),
+                                            Ok(path) => {
+                                                // Dekodieren kostet bei langen Nachrichten spürbar Zeit – nicht im UI-Thread.
+                                                let voice = if media.ext() == "ogg" {
+                                                    let p = path.clone();
+                                                    tokio::task::spawn_blocking(move || {
+                                                        let b = std::fs::read(&p).map_err(|e| e.to_string())?;
+                                                        let (pcm, ch) = crate::audio::decode_ogg_opus(&b)?;
+                                                        let wf = crate::audio::waveform(&pcm, ch);
+                                                        Ok((Arc::new(pcm), ch, wf))
+                                                    })
+                                                    .await
+                                                    .ok()
+                                                } else {
+                                                    None
+                                                };
+                                                send(UiEvent::FileReady { id, path, voice })
+                                            }
                                             Err(e) => send(UiEvent::Info(tf!("Herunterladen fehlgeschlagen: {e}", "Download failed: {e}"))),
                                         }
                                     });
@@ -2774,5 +2842,30 @@ pub fn spawn(
         })
         .expect("backend thread");
 
-    cmd_tx
+    (cmd_tx, handle)
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::load_image_limited;
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let img = image::GrayImage::new(w, h);
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn normal_image_decodes() {
+        assert!(load_image_limited(&png(640, 480)).is_some());
+    }
+
+    #[test]
+    fn oversized_image_is_rejected() {
+        // klein als Datei, riesig als Bild
+        let b = png(20_000, 2);
+        assert!(b.len() < 10_000);
+        assert!(load_image_limited(&b).is_none());
+    }
 }

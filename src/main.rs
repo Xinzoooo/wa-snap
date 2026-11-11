@@ -99,8 +99,54 @@ fn data_dir() -> std::path::PathBuf {
         .or_else(|| std::env::var_os("APPDATA").map(std::path::PathBuf::from))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let dir = base.join("wa-snap");
-    let _ = std::fs::create_dir_all(&dir);
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
     dir
+}
+
+/// Datenordner nur für den eigenen Nutzer lesbar machen (Ordner 0700, Dateien 0600),
+/// halbe Downloads (`.part`) und alte Temp-Dateien entfernen. Läuft einmal beim Start.
+fn harden_data_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    fn walk(p: &std::path::Path, depth: usize) {
+        let Ok(rd) = std::fs::read_dir(p) else { return };
+        for e in rd.flatten() {
+            let path = e.path();
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+                if depth < 3 {
+                    walk(&path, depth + 1);
+                }
+            } else if path.extension().map(|x| x == "part").unwrap_or(false) {
+                let _ = std::fs::remove_file(&path);
+            } else if meta.permissions().mode() & 0o077 != 0 {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    let dir = data_dir();
+    if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!("{}: {e}", dir.display());
+    }
+    let _ = std::fs::remove_dir_all(dir.join("tmp"));
+    walk(&dir, 0);
+}
+
+/// Datei atomar ersetzen: erst `<name>.tmp` schreiben und syncen, dann umbenennen.
+pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
 }
 
 fn settings_path() -> std::path::PathBuf {
@@ -108,10 +154,18 @@ fn settings_path() -> std::path::PathBuf {
 }
 
 fn load_settings() -> Settings {
-    std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    let path = settings_path();
+    let Ok(t) = std::fs::read_to_string(&path) else { return Settings::default() };
+    match serde_json::from_str(&t) {
+        Ok(s) => s,
+        Err(e) => {
+            // Kaputte Datei nicht still überschreiben, sondern beiseitelegen.
+            let bak = data_dir().join(format!("settings.json.bak-{}", now_ts()));
+            let _ = std::fs::rename(&path, &bak);
+            backend::log(format!("settings.json unlesbar ({e}), gesichert als {}", bak.display()));
+            Settings::default()
+        }
+    }
 }
 
 fn autostart_file() -> Option<std::path::PathBuf> {
@@ -241,7 +295,22 @@ fn mute_opts() -> [(&'static str, Option<i64>); 3] {
 }
 
 /// Aktion auf eine einzelne Nachricht.
+/// Noch nicht bestätigte Textnachricht (überlebt einen Neustart, siehe `Rec::Out`).
+#[derive(Clone)]
+struct Outgoing {
+    chat: String,
+    is_group: bool,
+    text: String,
+    ts: i64,
+    quote: Option<backend::Quote>,
+    mentions: Vec<String>,
+    exp: u32,
+}
+
 enum MsgAct {
+    /// Fehlgeschlagene Nachricht erneut senden / verwerfen
+    Resend(String),
+    Discard(String),
     React(String, String),
     Reply(String),
     Revoke(String),
@@ -319,6 +388,7 @@ struct App {
     forward: Option<(String, String)>,
     /// Bild aus der Zwischenablage, wartet auf Bestätigung
     pending_paste: Option<(std::path::PathBuf, egui::TextureHandle)>,
+    outbox: HashMap<String, Outgoing>,
     starred: HashSet<String>,
     /// Umfrage-ID → Abstimmender (leer = ich) → gewählte Optionen
     votes: HashMap<String, HashMap<String, Vec<String>>>,
@@ -763,6 +833,7 @@ impl App {
             highlight: None,
             forward: None,
             pending_paste: None,
+            outbox: HashMap::new(),
             starred: HashSet::new(),
             votes: HashMap::new(),
             members: HashMap::new(),
@@ -814,6 +885,29 @@ impl App {
         };
         for r in recs {
             app.apply_rec(r);
+        }
+        // Beim letzten Mal nicht bestätigte Nachrichten wieder anzeigen – als „nicht gesendet“.
+        let mut pending: Vec<(String, Outgoing)> = app.outbox.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pending.sort_by_key(|(_, o)| o.ts);
+        for (temp, o) in pending {
+            let Ok(jid) = o.chat.parse::<Jid>() else { continue };
+            app.add_message(
+                ChatMessage {
+                    chat: jid,
+                    is_group: o.is_group,
+                    from_me: true,
+                    sender_name: String::new(),
+                    sender: String::new(),
+                    text: o.text,
+                    ts: o.ts,
+                    id: temp,
+                    status: 9,
+                    media: None,
+                    quote: o.quote,
+                    x: backend::MsgExtra { expiration: o.exp, ..Default::default() },
+                },
+                Source::Disk,
+            );
         }
         // Gespeicherte Umfragen dem Backend melden, damit neue Stimmen lesbar sind.
         let polls: Vec<(String, Vec<u8>, String, Vec<String>)> = app
@@ -1069,6 +1163,12 @@ impl App {
             Rec::Name { user, name, book } => {
                 self.names.insert(user, (name, book));
             }
+            Rec::Out { temp, chat, is_group, text, ts, quote, mentions, exp } => {
+                self.outbox.insert(temp, Outgoing { chat, is_group, text, ts, quote, mentions, exp });
+            }
+            Rec::OutDone { temp } => {
+                self.outbox.remove(&temp);
+            }
             Rec::Status { id, st } => self.set_status(&id, st, false),
             Rec::React { target, from, emoji } => self.set_reaction(target, from, emoji, false),
             Rec::Del { id } => self.revoke_local(&id, false),
@@ -1115,7 +1215,9 @@ impl App {
 
     fn save_settings(&self) {
         if let Ok(t) = serde_json::to_string_pretty(&self.settings) {
-            let _ = std::fs::write(settings_path(), t);
+            if let Err(e) = write_atomic(&settings_path(), t.as_bytes()) {
+                backend::log(format!("Einstellungen speichern: {e}"));
+            }
         }
     }
 
@@ -1320,8 +1422,38 @@ impl App {
         self.mark_read(&key);
     }
 
+    /// Fehlgeschlagene Textnachricht mit derselben vorläufigen ID noch einmal senden.
+    fn resend(&mut self, temp: &str) {
+        let Some(o) = self.outbox.get(temp).cloned() else { return };
+        if self.conn != Conn::Online {
+            self.info = Some(t!("Nicht verbunden – bitte später erneut versuchen.", "Not connected – please try again later.").into());
+            return;
+        }
+        let Ok(jid) = o.chat.parse::<Jid>() else { return };
+        if let Some(m) = self.chats.get_mut(&o.chat).and_then(|c| c.messages.iter_mut().find(|m| m.id == temp)) {
+            m.status = 0;
+        }
+        let _ = self.cmd.send(Cmd::Send { chat: jid, text: o.text, temp: temp.to_owned(), quote: o.quote, mentions: o.mentions, expiration: o.exp });
+    }
+
+    /// Nicht gesendete Nachricht endgültig verwerfen.
+    fn discard_outgoing(&mut self, temp: &str) {
+        let Some(o) = self.outbox.remove(temp) else { return };
+        if let Some(c) = self.chats.get_mut(&o.chat) {
+            c.messages.retain(|m| m.id != temp);
+        }
+        self.msg_index.remove(temp);
+        self.store.append(&Rec::OutDone { temp: temp.to_owned() });
+    }
+
     fn run_msg_act(&mut self, a: MsgAct) {
+        match &a {
+            MsgAct::Resend(temp) => return self.resend(temp),
+            MsgAct::Discard(temp) => return self.discard_outgoing(temp),
+            _ => {}
+        }
         let id = match &a {
+            MsgAct::Resend(_) | MsgAct::Discard(_) => return,
             MsgAct::React(id, _) | MsgAct::Reply(id) | MsgAct::Revoke(id) | MsgAct::Forward(id) | MsgAct::Star(id, _) | MsgAct::Edit(id) | MsgAct::Vote(id, _) | MsgAct::Jump(id) => id.clone(),
             MsgAct::OpenNumber(n) => {
                 let jid = Jid::pn(n.clone());
@@ -1400,7 +1532,7 @@ impl App {
                     let _ = self.cmd.send(Cmd::Vote { chat: jid, poll: id, creator, secret: secret.clone(), options });
                 }
             }
-            MsgAct::Jump(_) | MsgAct::OpenNumber(_) => {}
+            MsgAct::Jump(_) | MsgAct::OpenNumber(_) | MsgAct::Resend(_) | MsgAct::Discard(_) => {}
         }
     }
 
@@ -1540,6 +1672,10 @@ impl App {
     }
 
     fn pump(&mut self, ctx: &egui::Context) {
+        if let Some(e) = self.store.take_error() {
+            backend::log(format!("Verlauf speichern: {e}"));
+            self.info = Some(tf!("Verlauf konnte nicht gespeichert werden: {e}", "Could not save history: {e}"));
+        }
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 UiEvent::Status(s) => self.status = s,
@@ -1601,6 +1737,9 @@ impl App {
                         }
                         self.msg_index.insert(id, chat.clone());
                         self.persist_msg(&chat, &m);
+                    }
+                    if self.outbox.remove(&temp).is_some() {
+                        self.store.append(&Rec::OutDone { temp });
                     }
                 }
                 UiEvent::SendFailed { chat, temp, err } => {
@@ -1680,13 +1819,12 @@ impl App {
                     self.members.insert(d.group.clone(), members);
                     self.group_info.insert(d.group.clone(), d);
                 }
-                UiEvent::FileReady { id, path } => {
+                UiEvent::FileReady { id, path, voice } => {
                     if self.want_play.as_ref().map(|w| w.0 == id).unwrap_or(false) {
                         let (_, from) = self.want_play.take().unwrap_or_default();
-                        match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| audio::decode_ogg_opus(&b)) {
-                            Ok((pcm, ch)) => {
-                                let wf = audio::waveform(&pcm, ch);
-                                self.decoded.insert(id.clone(), (std::sync::Arc::new(pcm), ch, wf));
+                        match voice.unwrap_or_else(|| Err("kein Opus".into())) {
+                            Ok(v) => {
+                                self.decoded.insert(id.clone(), v);
                                 self.start_play(&id, from);
                             }
                             Err(e) => {
@@ -1873,6 +2011,7 @@ impl App {
         let expiration = self.chats.get(&key).and_then(|c| c.messages.iter().rev().find(|m| !m.id.starts_with("local-"))).map(|m| m.x.expiration).unwrap_or(0);
         if let Some(chat) = self.chats.get(&key) {
             let jid = chat.jid.clone();
+            let chat_is_group = chat.is_group;
             self.temp_counter += 1;
             let temp = format!("local-{}-{}", now_ts(), self.temp_counter);
             let m = ChatMessage {
@@ -1890,6 +2029,18 @@ impl App {
                 x: backend::MsgExtra { expiration, mentions: mentions.iter().map(|m| user_of(m)).collect(), ..Default::default() },
             };
             self.add_message(m, Source::Live);
+            let out = Outgoing { chat: key.clone(), is_group: chat_is_group, text: text.clone(), ts: now_ts(), quote: quote.clone(), mentions: mentions.clone(), exp: expiration };
+            self.store.append(&Rec::Out {
+                temp: temp.clone(),
+                chat: out.chat.clone(),
+                is_group: out.is_group,
+                text: out.text.clone(),
+                ts: out.ts,
+                quote: out.quote.clone(),
+                mentions: out.mentions.clone(),
+                exp: out.exp,
+            });
+            self.outbox.insert(temp.clone(), out);
             let _ = self.cmd.send(Cmd::Send { chat: jid, text, temp, quote, mentions, expiration });
         }
         self.input.clear();
@@ -2924,7 +3075,7 @@ impl App {
                                             paste_send = Some(path.clone());
                                         }
                                         if ui.button(t!("Abbrechen", "Cancel")).clicked() {
-                                            self.pending_paste = None;
+                                            self.discard_paste();
                                         }
                                     });
                                 });
@@ -3759,6 +3910,16 @@ impl App {
                                     msg_act = Some(MsgAct::Edit(m.id.clone()));
                                     ui.close_menu();
                                 }
+                                if m.from_me && m.status == 9 && self.outbox.contains_key(&m.id) {
+                                    if ui.button(t!("Erneut senden", "Send again")).clicked() {
+                                        msg_act = Some(MsgAct::Resend(m.id.clone()));
+                                        ui.close_menu();
+                                    }
+                                    if ui.button(t!("Nicht senden (verwerfen)", "Don't send (discard)")).clicked() {
+                                        msg_act = Some(MsgAct::Discard(m.id.clone()));
+                                        ui.close_menu();
+                                    }
+                                }
                                 if !m.text.is_empty() && ui.button(t!("Text kopieren", "Copy text")).clicked() {
                                     ui.ctx().copy_text(m.text.clone());
                                     ui.close_menu();
@@ -4331,6 +4492,9 @@ impl eframe::App for App {
         self.sync_notify_state();
         if self.player.as_mut().map(|p| p.finished()).unwrap_or(false) {
             if let Some(p) = self.player.take() {
+                if let Some(e) = p.error() {
+                    self.info = Some(tf!("Abspielen nicht möglich: {e}", "Playback not possible: {e}"));
+                }
                 self.paused_at.remove(&p.id);
                 p.stop();
             }
@@ -5274,7 +5438,7 @@ impl App {
             if self.forward.is_some() {
                 self.forward = None;
             } else if self.pending_paste.is_some() {
-                self.pending_paste = None;
+                self.discard_paste();
             } else if self.reply_to.is_some() {
                 self.reply_to = None;
             } else if self.chat_search.is_some() {
@@ -5364,6 +5528,13 @@ impl App {
     }
 
     /// Strg+V mit Bild in der Zwischenablage: Bild übernehmen und Vorschau zeigen.
+    /// Eingefügtes Bild verwerfen und die Temp-Datei gleich mit löschen.
+    fn discard_paste(&mut self) {
+        if let Some((path, _)) = self.pending_paste.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn try_paste_image(&mut self, ctx: &egui::Context) {
         let img = match arboard::Clipboard::new().and_then(|mut c| c.get_image()) {
             Ok(i) => i,
@@ -5528,9 +5699,10 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    harden_data_dir();
     let (tx, rx) = channel();
     let notify: backend::SharedNotify = Default::default();
-    let cmd = backend::spawn(data_dir(), tx, notify.clone(), || with_ctx(|c| c.request_repaint()));
+    let (cmd, backend_thread) = backend::spawn(data_dir(), tx, notify.clone(), || with_ctx(|c| c.request_repaint()));
     let has_tray = tray::start(ev_tx.clone());
     let mut core = Some(Core { rx, cmd: cmd.clone(), notify });
 
@@ -5580,8 +5752,16 @@ fn main() -> eframe::Result<()> {
             _ => break,
         }
     }
+    // Backend sauber herunterfahren lassen (Verbindung schließen, Datenbank schreiben),
+    // aber höchstens ein paar Sekunden warten.
     let _ = cmd.send(Cmd::Quit);
-    std::thread::sleep(std::time::Duration::from_millis(400));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    while !backend_thread.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    if !backend_thread.is_finished() {
+        backend::log("Beenden: Backend hat nicht rechtzeitig aufgehört");
+    }
     Ok(())
 }
 
