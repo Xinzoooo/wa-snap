@@ -62,6 +62,16 @@ pub enum UiEvent {
     Edited { id: String, text: String },
     /// Datenschutz-Einstellungen von WhatsApp: (Kategorie, Wert), z. B. ("last", "contacts").
     Privacy(Vec<(String, String)>),
+    /// Abonnierte Kanäle: (JID, Name, Abonnenten)
+    Channels(Vec<(String, String, u64)>),
+    /// Beiträge eines Kanals: (Zeit, Text, Medienhinweis)
+    ChannelPosts { jid: String, posts: Vec<(i64, String, String)> },
+    /// Eingehender Sprachanruf klingelt.
+    CallIncoming { id: String, from: String, name: String, video: bool },
+    /// Zustand des laufenden Anrufs (Text für die Anzeige).
+    CallState { peer: String, text: String },
+    /// Anruf vorbei (Grund).
+    CallEnded(String),
     /// Gruppendetails für die Info-Seite.
     GroupInfo(GroupDetails),
     /// Blockierte Kontakte (JIDs).
@@ -118,6 +128,18 @@ pub enum Cmd {
     /// Datei senden (Bild als Foto, sonst als Dokument). Ohne Pfad: Dateiauswahl öffnen.
     SendFile { chat: Jid, path: Option<std::path::PathBuf>, caption: String },
     FetchPrivacy,
+    FetchChannels,
+    FetchChannelPosts(Jid),
+    /// Text-Status posten (Hintergrundfarbe ARGB) an diese Empfänger.
+    PostTextStatus { text: String, argb: u32, recipients: Vec<Jid> },
+    /// Foto-Status posten (ohne Pfad: Dateiauswahl).
+    PostPhotoStatus { caption: String, recipients: Vec<Jid> },
+    /// Sprachanruf starten.
+    Call(Jid),
+    AcceptCall(String),
+    RejectCall(String),
+    Hangup,
+    MuteCall(bool),
     GroupInfo(Jid),
     /// Neue Gruppe mit Telefonnummern (nur Ziffern) anlegen.
     CreateGroup { name: String, numbers: Vec<String> },
@@ -459,6 +481,9 @@ pub struct MsgExtra {
     /// Frühere Fassungen bearbeiteter Nachrichten (älteste zuerst).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prev: Vec<String>,
+    /// Hintergrundfarbe eines Text-Status (ARGB, 0 = keine).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bg: u32,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -541,6 +566,7 @@ pub fn extra_of(msg: &wa::Message) -> MsgExtra {
     } else if let Some(c) = b.contact_message.as_option() {
         x.kind = Some(Extra::Contact { name: c.display_name.clone().unwrap_or_default(), vcard: c.vcard.clone().unwrap_or_default() });
     } else if let Some(e) = b.extended_text_message.as_option() {
+        x.bg = e.background_argb.unwrap_or(0);
         let url = e.matched_text.clone().unwrap_or_default();
         let title = e.title.clone().unwrap_or_default();
         if !url.is_empty() && !title.is_empty() {
@@ -655,7 +681,7 @@ pub fn play_notify_sound() {
 }
 
 fn maybe_notify(state: &SharedNotify, m: &ChatMessage) {
-    if m.from_me {
+    if m.from_me || m.chat.server == whatsapp_rust::Server::Broadcast {
         return;
     }
     let age = chrono::Utc::now().timestamp() - m.ts;
@@ -1115,6 +1141,45 @@ async fn upload_and_send(
     Ok(())
 }
 
+/// Laufenden Anruf begleiten, bis er endet.
+async fn run_call(
+    h: whatsapp_rust::voip::CallHandle,
+    active: Arc<Mutex<Option<Arc<whatsapp_rust::voip::CallHandle>>>>,
+    procs: crate::call::Procs,
+    _client: Arc<Client>,
+    send: impl Fn(UiEvent) + Clone + Send + 'static,
+    peer: String,
+) {
+    let h = Arc::new(h);
+    if let Ok(mut a) = active.lock() {
+        *a = Some(h.clone());
+    }
+    let events = h.events();
+    let (s2, p2) = (send.clone(), peer.clone());
+    let ev_task = tokio::spawn(async move {
+        while let Ok(ev) = events.recv().await {
+            use whatsapp_rust::voip::CallEvent as E;
+            let text = match ev {
+                E::RelayAllocated => "Verbunden",
+                E::RelayAllocateFailed(_) | E::RelayAllocateTimedOut => "Verbindung fehlgeschlagen",
+                E::RelayReconnectTimedOut => "Verbindung verloren",
+                _ => continue,
+            };
+            s2(UiEvent::CallState { peer: p2.clone(), text: text.into() });
+        }
+    });
+    h.wait_ended().await;
+    ev_task.abort();
+    procs.stop();
+    if let Ok(mut a) = active.lock() {
+        if a.as_ref().map(|x| Arc::ptr_eq(x, &h)).unwrap_or(false) {
+            *a = None;
+        }
+    }
+    log(format!("Anruf mit {peer} beendet"));
+    send(UiEvent::CallEnded("Anruf beendet".into()));
+}
+
 /// Datei hochladen und als Foto (Bilder) oder Dokument senden.
 async fn send_file(
     client: &Client,
@@ -1305,6 +1370,10 @@ pub fn spawn(
                     }
                 };
 
+                let ringing: Arc<Mutex<HashMap<String, whatsapp_rust::types::call::IncomingCall>>> = Default::default();
+                let active: Arc<Mutex<Option<Arc<whatsapp_rust::voip::CallHandle>>>> = Default::default();
+                let procs = crate::call::Procs::default();
+                let ring_ev = ringing.clone();
                 let (s_qr, s_conn, s_out, s_msg, s_ev) =
                     (send.clone(), send.clone(), send.clone(), send.clone(), send.clone());
                 let n_msg = notify_state.clone();
@@ -1474,11 +1543,48 @@ pub fn spawn(
                             EventKind::ChatPresence,
                             EventKind::Presence,
                             EventKind::StarUpdate,
+                            EventKind::IncomingCall,
+                            EventKind::MissedCall,
                         ],
                         move |event, client| {
                             let s = s_ev.clone();
+                            let ringing = ring_ev.clone();
                             async move {
                                 match &*event {
+                                    Event::IncomingCall(inc) => {
+                                        use whatsapp_rust::types::call::CallAction;
+                                        let id = inc.action.call_id().to_owned();
+                                        match &inc.action {
+                                            CallAction::Offer { is_video, .. } if !inc.offline => {
+                                                let video = *is_video;
+                                                let from = inc.from.user.to_string();
+                                                let name = inc.notify.clone().unwrap_or_default();
+                                                log(format!("Eingehender Anruf {id} von {from} (Video: {video})"));
+                                                if let Ok(mut r) = ringing.lock() {
+                                                    r.insert(id.clone(), inc.clone());
+                                                }
+                                                let title = if name.is_empty() { format!("+{from}") } else { name.clone() };
+                                                std::thread::spawn(move || {
+                                                    let _ = show_notification(&format!("📞 Anruf von {title}"), "In WhatsSnap annehmen oder ablehnen");
+                                                });
+                                                play_notify_sound();
+                                                s(UiEvent::CallIncoming { id, from, name, video });
+                                            }
+                                            CallAction::Terminate { .. } | CallAction::Reject { .. } => {
+                                                let was_ringing = ringing.lock().ok().map(|mut r| r.remove(&id).is_some()).unwrap_or(false);
+                                                if was_ringing {
+                                                    s(UiEvent::CallEnded("Anruf beendet".into()));
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    Event::MissedCall(m) => {
+                                        if let Ok(mut r) = ringing.lock() {
+                                            r.remove(&m.call_id);
+                                        }
+                                        s(UiEvent::CallEnded("Verpasster Anruf".into()));
+                                    }
                                     Event::StarUpdate(st) => {
                                         s(UiEvent::Starred { id: st.message_id.clone(), on: st.action.starred.unwrap_or(false) });
                                     }
@@ -1809,11 +1915,14 @@ pub fn spawn(
                                             by_sender.entry(sender).or_default().push(id);
                                         }
                                         for (sender, ids) in by_sender {
-                                            let sj = if jid.is_group() { sender.parse::<Jid>().ok() } else { None };
+                                            let sj = if jid.is_group() || jid.server == whatsapp_rust::Server::Broadcast { sender.parse::<Jid>().ok() } else { None };
                                             let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
                                             if let Err(e) = client.mark_as_read(&jid, sj.as_ref(), &refs).await {
                                                 log(format!("Lesebestätigung fehlgeschlagen: {e}"));
                                             }
+                                        }
+                                        if jid.server == whatsapp_rust::Server::Broadcast {
+                                            return;
                                         }
                                         let range = range_of(&jid, last);
                                         let r = client.chat_actions().mark_chat_as_read(&jid, true, range).await;
@@ -1913,6 +2022,156 @@ pub fn spawn(
                                             send(UiEvent::Info(format!("Datei senden fehlgeschlagen: {e}")));
                                         }
                                     });
+                                }
+                                Cmd::FetchChannels => {
+                                    tokio::spawn(async move {
+                                        match client.newsletter().list_subscribed().await {
+                                            Ok(list) => send(UiEvent::Channels(list.into_iter().map(|n| (n.jid.to_string(), n.name, n.subscriber_count)).collect())),
+                                            Err(e) => log(format!("Kanäle: {e}")),
+                                        }
+                                    });
+                                }
+                                Cmd::FetchChannelPosts(jid) => {
+                                    tokio::spawn(async move {
+                                        match client.newsletter().get_messages(jid.clone(), 30, None).await {
+                                            Ok(list) => {
+                                                let posts = list
+                                                    .into_iter()
+                                                    .map(|m| {
+                                                        let (text, media) = match &m.message {
+                                                            Some(msg) => {
+                                                                let md = media_of(msg);
+                                                                let t = msg.text_content().map(|t| t.to_owned()).or_else(|| md.as_ref().and_then(|x| x.2.clone())).unwrap_or_default();
+                                                                (t, md.map(|x| x.0.label()).unwrap_or_default())
+                                                            }
+                                                            None => (String::new(), String::new()),
+                                                        };
+                                                        (m.timestamp as i64, text, media)
+                                                    })
+                                                    .collect();
+                                                send(UiEvent::ChannelPosts { jid: jid.to_string(), posts });
+                                            }
+                                            Err(e) => send(UiEvent::Info(format!("Kanal laden: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::PostTextStatus { text, argb, recipients } => {
+                                    tokio::spawn(async move {
+                                        let font = wa::message::extended_text_message::FontType::SYSTEM;
+                                        match client.status().send_text(&text, argb, font, &recipients, Default::default()).await {
+                                            Ok(_) => send(UiEvent::Info(format!("Status gepostet ({} Empfänger)", recipients.len()))),
+                                            Err(e) => send(UiEvent::Info(format!("Status posten: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::PostPhotoStatus { caption, recipients } => {
+                                    tokio::spawn(async move {
+                                        use whatsapp_rust::wacore::download::MediaType as M;
+                                        let Some(f) = rfd::AsyncFileDialog::new().set_title("Foto für Status").add_filter("Bilder", &["jpg", "jpeg", "png", "webp"]).pick_file().await else { return };
+                                        let path = f.path().to_path_buf();
+                                        let prepared = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>), String> {
+                                            let img = image::open(&path).map_err(|e| e.to_string())?;
+                                            let img = if img.width() > 1600 || img.height() > 1600 { img.thumbnail(1600, 1600) } else { img };
+                                            let mut out = Vec::new();
+                                            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&img.to_rgb8()).map_err(|e| e.to_string())?;
+                                            Ok((out, jpeg_thumb(&img)))
+                                        })
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                        .and_then(|r| r);
+                                        let (data, thumb) = match prepared {
+                                            Ok(x) => x,
+                                            Err(e) => {
+                                                send(UiEvent::Info(format!("Foto-Status: {e}")));
+                                                return;
+                                            }
+                                        };
+                                        let up = match client.upload(data, M::Image, Default::default()).await {
+                                            Ok(u) => u,
+                                            Err(e) => {
+                                                send(UiEvent::Info(format!("Foto-Status hochladen: {e}")));
+                                                return;
+                                            }
+                                        };
+                                        let cap = if caption.is_empty() { None } else { Some(caption.as_str()) };
+                                        match client.status().send_image(up, thumb, cap, &recipients, Default::default()).await {
+                                            Ok(_) => send(UiEvent::Info("Foto-Status gepostet".into())),
+                                            Err(e) => send(UiEvent::Info(format!("Foto-Status: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::Call(jid) => {
+                                    let (active, procs) = (active.clone(), procs.clone());
+                                    tokio::spawn(async move {
+                                        let peer = jid.user.to_string();
+                                        let (mic, spk) = match crate::call::open(&procs) {
+                                            Ok(x) => x,
+                                            Err(e) => {
+                                                send(UiEvent::CallEnded(format!("Audio nicht verfügbar: {e}")));
+                                                return;
+                                            }
+                                        };
+                                        send(UiEvent::CallState { peer: peer.clone(), text: "Rufe an …".into() });
+                                        match client.voip().call(&jid).audio(mic, spk).start().await {
+                                            Ok(h) => run_call(h, active, procs, client.clone(), send.clone(), peer).await,
+                                            Err(e) => {
+                                                procs.stop();
+                                                log(format!("Anruf fehlgeschlagen: {e}"));
+                                                send(UiEvent::CallEnded(format!("Anruf fehlgeschlagen: {e}")));
+                                            }
+                                        }
+                                    });
+                                }
+                                Cmd::AcceptCall(id) => {
+                                    let (active, procs, ringing) = (active.clone(), procs.clone(), ringing.clone());
+                                    tokio::spawn(async move {
+                                        let Some(inc) = ringing.lock().ok().and_then(|mut r| r.remove(&id)) else {
+                                            send(UiEvent::CallEnded("Anruf nicht mehr verfügbar".into()));
+                                            return;
+                                        };
+                                        let peer = inc.from.user.to_string();
+                                        let (mic, spk) = match crate::call::open(&procs) {
+                                            Ok(x) => x,
+                                            Err(e) => {
+                                                let _ = client.voip().reject(&inc).await;
+                                                send(UiEvent::CallEnded(format!("Audio nicht verfügbar: {e}")));
+                                                return;
+                                            }
+                                        };
+                                        send(UiEvent::CallState { peer: peer.clone(), text: "Verbinde …".into() });
+                                        match client.voip().accept(&inc).audio(mic, spk).start().await {
+                                            Ok(h) => run_call(h, active, procs, client.clone(), send.clone(), peer).await,
+                                            Err(e) => {
+                                                procs.stop();
+                                                log(format!("Annehmen fehlgeschlagen: {e}"));
+                                                send(UiEvent::CallEnded(format!("Annehmen fehlgeschlagen: {e}")));
+                                            }
+                                        }
+                                    });
+                                }
+                                Cmd::RejectCall(id) => {
+                                    let ringing = ringing.clone();
+                                    tokio::spawn(async move {
+                                        if let Some(inc) = ringing.lock().ok().and_then(|mut r| r.remove(&id)) {
+                                            let _ = client.voip().reject(&inc).await;
+                                        }
+                                        send(UiEvent::CallEnded("Abgelehnt".into()));
+                                    });
+                                }
+                                Cmd::Hangup => {
+                                    let (active, procs) = (active.clone(), procs.clone());
+                                    tokio::spawn(async move {
+                                        let h = active.lock().ok().and_then(|mut a| a.take());
+                                        if let Some(h) = h {
+                                            let _ = client.voip().terminate(h.call_id(), &h.peer_jid(), h.call_creator()).await;
+                                            h.hangup().await;
+                                        }
+                                        procs.stop();
+                                        send(UiEvent::CallEnded("Aufgelegt".into()));
+                                    });
+                                }
+                                Cmd::MuteCall(on) => {
+                                    crate::call::MUTED.store(on, std::sync::atomic::Ordering::Relaxed);
                                 }
                                 Cmd::GroupInfo(jid) => {
                                     tokio::spawn(async move {

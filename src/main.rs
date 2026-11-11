@@ -1,5 +1,6 @@
 mod audio;
 mod backend;
+mod call;
 mod emoji;
 mod store;
 mod theme;
@@ -353,6 +354,21 @@ struct App {
     rename_buf: String,
     /// Neue Gruppe: (Name, ausgewählte Chats, zusätzliche Nummern)
     new_group: Option<(String, HashSet<String>, String)>,
+    /// Klingelnder Anruf: (ID, Nummer, Name, Video)
+    call_in: Option<(String, String, String, bool)>,
+    /// Laufender Anruf: (Nummer, Zustand, Beginn, stumm)
+    call: Option<(String, String, std::time::Instant, bool)>,
+    show_status: bool,
+    /// Ausgewählte Person im Status-Bereich ("" = ich) und Position
+    status_sel: Option<(String, usize)>,
+    status_seen: HashSet<String>,
+    status_text: String,
+    status_color: usize,
+    channels: Vec<(String, String, u64)>,
+    channels_loaded: bool,
+    /// Ausgewählter Kanal und seine Beiträge
+    channel_sel: Option<String>,
+    channel_posts: HashMap<String, Vec<(i64, String, String)>>,
 }
 
 fn user_of(key: &str) -> String {
@@ -760,6 +776,17 @@ impl App {
             add_numbers: String::new(),
             rename_buf: String::new(),
             new_group: None,
+            call_in: None,
+            call: None,
+            show_status: false,
+            status_sel: None,
+            status_seen: HashSet::new(),
+            status_text: String::new(),
+            status_color: 0,
+            channels: Vec::new(),
+            channels_loaded: false,
+            channel_sel: None,
+            channel_posts: HashMap::new(),
         };
         for r in recs {
             app.apply_rec(r);
@@ -942,6 +969,33 @@ impl App {
         v.insert(String::new(), vec!["Sonntag".into()]);
         self.starred.insert("demo-link".into());
         self.set_reaction("demo-img".into(), String::new(), "😍".into(), false);
+        let st = Jid::new("status", whatsapp_rust::Server::Broadcast);
+        for (i, (who, text, bg)) in [("4915100000001", "Sonnenuntergang am Rhein 🌅", 0xFFFF7A6Bu32), ("4915100000001", "Wer kommt mit zum Grillen? 🔥", 0xFF00A884), ("4915100000002", "Neuer Job ab Montag 💼", 0xFF5696FF)].into_iter().enumerate() {
+            self.add_message(
+                ChatMessage {
+                    chat: st.clone(),
+                    is_group: false,
+                    from_me: false,
+                    sender_name: String::new(),
+                    sender: format!("{who}@s.whatsapp.net"),
+                    text: text.into(),
+                    ts: now - 3600 * (3 - i as i64),
+                    id: format!("demo-st-{i}"),
+                    status: 0,
+                    media: None,
+                    quote: None,
+                    x: backend::MsgExtra { bg, ..Default::default() },
+                },
+                Source::Disk,
+            );
+        }
+        if std::env::var_os("WA_SNAP_DEMO_STATUS").is_some() {
+            self.show_status = true;
+            self.status_sel = Some(("4915100000001".into(), 1));
+        }
+        if std::env::var_os("WA_SNAP_DEMO_CALL").is_some() {
+            self.call_in = Some(("demo".into(), "4915100000001".into(), "Anna".into(), false));
+        }
         if std::env::var_os("WA_SNAP_DEMO_MOD").is_some() {
             self.settings.keep_deleted = true;
             self.revoke_local("demo-0-2", false);
@@ -1561,6 +1615,33 @@ impl App {
                     self.privacy = list.into_iter().collect();
                 }
                 UiEvent::Blocklist(list) => self.blocklist = list,
+                UiEvent::Channels(list) => self.channels = list,
+                UiEvent::ChannelPosts { jid, posts } => {
+                    self.channel_posts.insert(jid, posts);
+                }
+                UiEvent::CallIncoming { id, from, name, video } => {
+                    self.call_in = Some((id, from, name, video));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Critical));
+                }
+                UiEvent::CallState { peer, text } => {
+                    self.call_in = None;
+                    let muted = self.call.as_ref().map(|c| c.3).unwrap_or(false);
+                    let started = self.call.as_ref().map(|c| c.2).unwrap_or_else(std::time::Instant::now);
+                    let started = if text == "Verbunden" && self.call.as_ref().map(|c| c.1 != "Verbunden").unwrap_or(true) { std::time::Instant::now() } else { started };
+                    self.call = Some((peer, text, started, muted));
+                }
+                UiEvent::CallEnded(reason) => {
+                    self.call_in = None;
+                    if let Some((peer, text, start, _)) = self.call.take() {
+                        let secs = if text == "Verbunden" { start.elapsed().as_secs() } else { 0 };
+                        let name = self.name_for_user(&peer).unwrap_or_else(|| format!("+{peer}"));
+                        self.info = Some(if secs > 0 { format!("{reason} – {name}, {}:{:02}", secs / 60, secs % 60) } else { format!("{reason} – {name}") });
+                    } else {
+                        self.info = Some(reason);
+                    }
+                }
                 UiEvent::GroupInfo(d) => {
                     let members: Vec<(String, String)> = d.members.iter().map(|(j, pn, _, _)| (user_of(j), pn.clone())).collect();
                     self.members.insert(d.group.clone(), members);
@@ -2327,6 +2408,23 @@ impl App {
                     if r.clicked() {
                         self.show_settings = false;
                         self.show_starred = false;
+                        self.show_status = false;
+                    }
+                    ui.add_space(4.0);
+                    let new_status = self.status_groups().iter().any(|(u, items)| !u.is_empty() && items.iter().any(|m| !self.status_seen.contains(&m.id)));
+                    let col = if self.show_status { pal.text } else { pal.dim };
+                    let r = icon_button(ui, "◎", 20.0, col, pal, "Status");
+                    if self.show_status {
+                        ui.painter().circle_filled(r.rect.center(), r.rect.width() / 2.0, pal.selected);
+                        ui.painter().text(r.rect.center(), egui::Align2::CENTER_CENTER, "◎", egui::FontId::proportional(20.0), pal.text);
+                    }
+                    if new_status {
+                        ui.painter().circle_filled(r.rect.right_top() + egui::vec2(-8.0, 8.0), 4.5, pal.accent);
+                    }
+                    if r.clicked() {
+                        self.show_status = !self.show_status;
+                        self.show_starred = false;
+                        self.show_settings = false;
                     }
                     ui.add_space(4.0);
                     let col = if self.show_starred { pal.text } else { pal.dim };
@@ -2338,6 +2436,7 @@ impl App {
                     if r.clicked() {
                         self.show_starred = !self.show_starred;
                         self.show_settings = false;
+                        self.show_status = false;
                     }
                 });
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
@@ -2350,6 +2449,7 @@ impl App {
                     }
                     if r.clicked() {
                         self.show_settings = !self.show_settings;
+                        self.show_status = false;
                     }
                     let icon = if self.settings.dark { "☀" } else { "🌙" };
                     if icon_button(ui, icon, 18.0, pal.dim, pal, "Hell/Dunkel").clicked() {
@@ -2546,6 +2646,7 @@ impl App {
                 let mut rows: Vec<(String, String, i64, bool)> = self
                     .chats
                     .iter()
+                    .filter(|(_, c)| c.jid.server != whatsapp_rust::Server::Broadcast && c.jid.server != whatsapp_rust::Server::Newsletter)
                     .filter(|(k, _)| !needle.is_empty() || Self::has(arch, k) == show_archive)
                     .filter(|(_, c)| match filter {
                         _ if show_archive => true,
@@ -3181,6 +3282,7 @@ impl App {
         let mut audio_req: Option<(String, backend::MediaRef, Option<f32>)> = None;
         let mut chat_cmd: Option<Cmd> = None;
         let mut toggle_info = false;
+        let mut export_chat = false;
         let mut jumped = false;
         let mut scroll_out: Option<(f32, egui::Rect)> = None;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.chat)).show(ctx, |ui| {
@@ -3302,10 +3404,17 @@ impl App {
                                     }
                                 }
                                 ui.separator();
+                                if ui.button("Chat exportieren (.txt)").clicked() {
+                                    export_chat = true;
+                                }
                                 if ui.button("Chat schließen").clicked() {
                                     self.selected = None;
                                 }
                             });
+                            if !is_group && self.conn == Conn::Online && self.call.is_none() && icon_button(ui, "📞", 17.0, pal.dim, pal, "Sprachanruf").clicked() {
+                                chat_cmd = Some(Cmd::Call(chat_jid.clone()));
+                                self.call = Some((user.clone(), "Rufe an …".into(), std::time::Instant::now(), false));
+                            }
                             if icon_button(ui, "ℹ", 17.0, if self.show_info { pal.accent } else { pal.dim }, pal, "Kontakt-/Gruppeninfo").clicked() {
                                 toggle_info = true;
                             }
@@ -3648,6 +3757,9 @@ impl App {
         }
         if toggle_info {
             self.show_info = !self.show_info;
+        }
+        if export_chat {
+            self.export_current();
         }
         if let Some((id, media, seek)) = audio_req {
             self.audio_action(id, media, seek);
@@ -4163,7 +4275,7 @@ impl eframe::App for App {
         let unread: u32 = self
             .chats
             .iter()
-            .filter(|(k, c)| c.unread > 0 && !Self::has(&self.settings.archived, k) && !Self::has(&self.settings.muted, k))
+            .filter(|(k, c)| c.unread > 0 && c.jid.server != whatsapp_rust::Server::Broadcast && !Self::has(&self.settings.archived, k) && !Self::has(&self.settings.muted, k))
             .map(|(_, c)| c.unread)
             .sum();
         tray::BADGE.store(unread, std::sync::atomic::Ordering::Relaxed);
@@ -4205,6 +4317,12 @@ impl eframe::App for App {
         }
 
         self.rail(ctx, &pal);
+        if self.show_status {
+            self.status_view(ctx, &pal);
+            self.forward_dialog(ctx, &pal);
+            self.call_overlay(ctx, &pal);
+            return;
+        }
         if !self.show_settings {
             self.chat_list(ctx, &pal);
         }
@@ -4217,6 +4335,7 @@ impl eframe::App for App {
         self.chat_view(ctx, &pal);
         self.forward_dialog(ctx, &pal);
         self.new_group_dialog(ctx, &pal);
+        self.call_overlay(ctx, &pal);
     }
 }
 
@@ -4461,6 +4580,409 @@ impl App {
             } else {
                 self.run_msg_act(MsgAct::Jump(j));
             }
+        }
+    }
+
+    /// Offenen Chat als Textdatei in ~/Downloads (oder ~) speichern, wie der WhatsApp-Export.
+    fn export_current(&mut self) {
+        let Some(key) = self.selected.clone() else { return };
+        let Some(c) = self.chats.get(&key) else { return };
+        let title = self.display_name(c);
+        let mut out = String::new();
+        for m in &c.messages {
+            let dt = chrono::DateTime::from_timestamp(m.ts, 0).map(|d| d.with_timezone(&chrono::Local).format("%d.%m.%y, %H:%M").to_string()).unwrap_or_default();
+            let who = if m.from_me { "Ich".to_owned() } else if c.is_group { m.sender_name.clone() } else { title.clone() };
+            let body = match (&m.media, &m.x.kind) {
+                (Some(md), _) if m.text.is_empty() => md.label(),
+                (Some(md), _) => format!("{} {}", md.label(), m.text),
+                (None, Some(k)) if m.text.is_empty() => k.label(),
+                _ => m.text.clone(),
+            };
+            out.push_str(&format!("{dt} - {who}: {body}\n"));
+        }
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
+        let dir = ["Downloads", "Download"].iter().map(|d| home.join(d)).find(|p| p.is_dir()).unwrap_or(home);
+        let safe: String = title.chars().map(|ch| if ch.is_alphanumeric() || ch == ' ' || ch == '-' { ch } else { '_' }).collect();
+        let path = dir.join(format!("WhatsSnap-Chat mit {}.txt", safe.trim()));
+        match std::fs::write(&path, out) {
+            Ok(()) => self.info = Some(format!("Exportiert: {}", path.display())),
+            Err(e) => self.info = Some(format!("Export fehlgeschlagen: {e}")),
+        }
+    }
+
+    /// Status der letzten 24 Stunden, gruppiert nach Person ("" = ich), neueste Person zuerst.
+    fn status_groups(&self) -> Vec<(String, Vec<ChatMessage>)> {
+        let Some(c) = self.chats.values().find(|c| c.jid.server == whatsapp_rust::Server::Broadcast && c.jid.user.as_str() == "status") else {
+            return Vec::new();
+        };
+        let since = now_ts() - 86_400;
+        let mut map: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+        for m in c.messages.iter().filter(|m| m.ts >= since) {
+            let who = if m.from_me { String::new() } else { user_of(&m.sender) };
+            map.entry(who).or_default().push(m.clone());
+        }
+        let mut v: Vec<(String, Vec<ChatMessage>)> = map.into_iter().collect();
+        v.sort_by_key(|(_, items)| std::cmp::Reverse(items.last().map(|m| m.ts).unwrap_or(0)));
+        v
+    }
+
+    /// Status-Bereich: links Personen, rechts Anzeige; eigenen Status posten.
+    fn status_view(&mut self, ctx: &egui::Context, pal: &Palette) {
+        const COLORS: [(u32, Color32); 6] = [
+            (0xFF00A884, Color32::from_rgb(0x00, 0xa8, 0x84)),
+            (0xFF5696FF, Color32::from_rgb(0x56, 0x96, 0xff)),
+            (0xFFFF7A6B, Color32::from_rgb(0xff, 0x7a, 0x6b)),
+            (0xFF8294CA, Color32::from_rgb(0x82, 0x94, 0xca)),
+            (0xFFC69FCC, Color32::from_rgb(0xc6, 0x9f, 0xcc)),
+            (0xFF243640, Color32::from_rgb(0x24, 0x36, 0x40)),
+        ];
+        let groups = self.status_groups();
+        let mut select: Option<(String, usize)> = None;
+        let mut post: Option<Cmd> = None;
+        egui::SidePanel::left("status_list")
+            .resizable(false)
+            .exact_width(360.0)
+            .frame(egui::Frame::new().fill(pal.side).stroke(egui::Stroke::new(1.0_f32, pal.border)))
+            .show(ctx, |ui| {
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    ui.label(RichText::new("Status").size(22.0).family(theme::bold()));
+                });
+                ui.add_space(10.0);
+                // eigener Status
+                egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 6)).show(ui, |ui| {
+                    ui.label(RichText::new("Mein Status").size(13.0).color(pal.dim));
+                    ui.add(egui::TextEdit::multiline(&mut self.status_text).hint_text("Text-Status schreiben …").desired_rows(2).desired_width(f32::INFINITY));
+                    ui.horizontal(|ui| {
+                        for (i, (_, c)) in COLORS.iter().enumerate() {
+                            let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                            ui.painter().circle_filled(r.center(), 10.0, *c);
+                            if self.status_color == i {
+                                ui.painter().circle_stroke(r.center(), 11.0, egui::Stroke::new(2.0_f32, pal.text));
+                            }
+                            if resp.clicked() {
+                                self.status_color = i;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let recipients = self.status_recipients();
+                        let ok = self.conn == Conn::Online;
+                        if ui.add_enabled(ok && !self.status_text.trim().is_empty(), egui::Button::new("Text posten")).clicked() {
+                            post = Some(Cmd::PostTextStatus { text: self.status_text.trim().to_owned(), argb: COLORS[self.status_color].0, recipients: recipients.clone() });
+                            self.status_text.clear();
+                        }
+                        if ui.add_enabled(ok, egui::Button::new("📷 Foto posten …")).clicked() {
+                            post = Some(Cmd::PostPhotoStatus { caption: std::mem::take(&mut self.status_text).trim().to_owned(), recipients });
+                        }
+                    });
+                    ui.label(RichText::new(format!("Geht an {} Kontakte mit Einzelchat.", self.status_recipients().len())).size(11.0).color(pal.dim));
+                });
+                ui.separator();
+                if groups.is_empty() {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| ui.label(RichText::new("Keine Status-Updates in den letzten 24 Stunden.").color(pal.dim)));
+                }
+                if !self.channels_loaded && self.conn == Conn::Online {
+                    self.channels_loaded = true;
+                    let _ = self.cmd.send(Cmd::FetchChannels);
+                }
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                    if !self.channels.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(20.0);
+                            ui.label(RichText::new("Kanäle").size(13.0).color(pal.dim));
+                        });
+                        for (jid, name, subs) in self.channels.clone() {
+                            let sel = self.channel_sel.as_deref() == Some(jid.as_str());
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
+                            let inner = rect.shrink2(egui::vec2(8.0, 2.0));
+                            if sel || resp.hovered() {
+                                ui.painter().rect_filled(inner, 10.0, if sel { pal.selected } else { pal.hover });
+                            }
+                            ui.painter().text(inner.left_center() + egui::vec2(16.0, -8.0), egui::Align2::LEFT_CENTER, format!("📢 {name}"), egui::FontId::proportional(15.0), pal.text);
+                            ui.painter().text(inner.left_center() + egui::vec2(16.0, 11.0), egui::Align2::LEFT_CENTER, format!("{subs} Abonnenten"), egui::FontId::proportional(12.0), pal.dim);
+                            if resp.clicked() {
+                                self.channel_sel = Some(jid.clone());
+                                self.status_sel = None;
+                                if let Ok(j) = jid.parse::<Jid>() {
+                                    let _ = self.cmd.send(Cmd::FetchChannelPosts(j));
+                                }
+                            }
+                        }
+                        ui.separator();
+                    }
+                    for (who, items) in &groups {
+                        let name = if who.is_empty() { "Mein Status".to_owned() } else { self.name_for_user(who).unwrap_or_else(|| format!("+{who}")) };
+                        let unseen = items.iter().any(|m| !self.status_seen.contains(&m.id));
+                        let sel = self.status_sel.as_ref().map(|s| &s.0 == who).unwrap_or(false);
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 66.0), egui::Sense::click());
+                        let inner = rect.shrink2(egui::vec2(8.0, 2.0));
+                        if sel || resp.hovered() {
+                            ui.painter().rect_filled(inner, 10.0, if sel { pal.selected } else { pal.hover });
+                        }
+                        let c = inner.left_center() + egui::vec2(34.0, 0.0);
+                        ui.painter().circle_stroke(c, 25.0, egui::Stroke::new(2.5_f32, if unseen && !who.is_empty() { pal.accent } else { pal.dim.gamma_multiply(0.5) }));
+                        let mut av = ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_center_size(c, egui::vec2(44.0, 44.0))));
+                        draw_avatar(&mut av, self.avatars.get(who), &name, 44.0, self.settings.dark);
+                        let p = ui.painter();
+                        p.text(inner.left_center() + egui::vec2(72.0, -9.0), egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(15.5), pal.text);
+                        let last = items.last().map(|m| fmt_list_time(m.ts)).unwrap_or_default();
+                        p.text(inner.left_center() + egui::vec2(72.0, 11.0), egui::Align2::LEFT_CENTER, format!("{last} · {}", items.len()), egui::FontId::proportional(12.5), pal.dim);
+                        if resp.clicked() {
+                            let first_unseen = items.iter().position(|m| !self.status_seen.contains(&m.id)).unwrap_or(0);
+                            select = Some((who.clone(), first_unseen));
+                            self.channel_sel = None;
+                        }
+                    }
+                });
+            });
+        if let Some(c) = post {
+            let _ = self.cmd.send(c);
+        }
+        if let Some(s) = select {
+            self.status_sel = Some(s);
+        }
+        let mut go: i32 = 0;
+        let mut open_chat: Option<String> = None;
+        let mut want: Option<(String, backend::MediaRef)> = None;
+        let mut mark: Option<(String, String)> = None;
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(0x10, 0x10, 0x10))).show(ctx, |ui| {
+            if let Some(ch) = self.channel_sel.clone() {
+                let name = self.channels.iter().find(|c| c.0 == ch).map(|c| c.1.clone()).unwrap_or_default();
+                ui.add_space(14.0);
+                ui.vertical_centered(|ui| ui.label(RichText::new(format!("📢 {name}")).size(18.0).color(Color32::WHITE).family(theme::bold())));
+                ui.add_space(8.0);
+                match self.channel_posts.get(&ch) {
+                    None => {
+                        ui.vertical_centered(|ui| ui.spinner());
+                    }
+                    Some(posts) => {
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).stick_to_bottom(true).show(ui, |ui| {
+                            for (ts, text, media) in posts {
+                                egui::Frame::new()
+                                    .fill(Color32::from_rgb(0x24, 0x26, 0x26))
+                                    .corner_radius(8.0)
+                                    .inner_margin(egui::Margin::symmetric(12, 8))
+                                    .outer_margin(egui::Margin::symmetric(60, 4))
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width().min(620.0));
+                                        if !media.is_empty() {
+                                            ui.label(RichText::new(media).color(Color32::from_gray(170)));
+                                        }
+                                        if !text.is_empty() {
+                                            ui.label(RichText::new(text).color(Color32::WHITE).size(14.5));
+                                        }
+                                        ui.label(RichText::new(format!("{} {}", day_label(*ts), fmt_time(*ts))).size(11.0).color(Color32::from_gray(150)));
+                                    });
+                            }
+                        });
+                    }
+                }
+                return;
+            }
+            let Some((who, idx)) = self.status_sel.clone() else {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.4);
+                    ui.label(RichText::new("Klicke auf einen Kontakt, um seinen Status anzusehen.").color(Color32::from_gray(170)));
+                });
+                return;
+            };
+            let Some((_, items)) = groups.iter().find(|(w, _)| *w == who) else { return };
+            let idx = idx.min(items.len().saturating_sub(1));
+            let m = &items[idx];
+            if !self.status_seen.contains(&m.id) && !who.is_empty() {
+                mark = Some((m.id.clone(), m.sender.clone()));
+            }
+            let name = if who.is_empty() { "Mein Status".to_owned() } else { self.name_for_user(&who).unwrap_or_else(|| format!("+{who}")) };
+            // Fortschrittsbalken
+            let full = ui.available_rect_before_wrap();
+            let bar_y = full.top() + 12.0;
+            let n = items.len().max(1) as f32;
+            let w = (full.width() * 0.6) / n;
+            let x0 = full.center().x - full.width() * 0.3;
+            for i in 0..items.len() {
+                let r = egui::Rect::from_min_size(egui::pos2(x0 + i as f32 * w + 2.0, bar_y), egui::vec2(w - 4.0, 3.0));
+                ui.painter().rect_filled(r, 2.0, if i <= idx { Color32::WHITE } else { Color32::from_gray(90) });
+            }
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(format!("{name} · {} {}", day_label(m.ts), fmt_time(m.ts))).color(Color32::WHITE).size(14.0));
+            });
+            ui.add_space(10.0);
+            let area = ui.available_rect_before_wrap().shrink2(egui::vec2(80.0, 60.0));
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::Center)));
+            if let Some(md) = &m.media {
+                if md.is_picture() {
+                    match self.images.get(&m.id) {
+                        Some((t, _)) => {
+                            let sz = t.size_vec2();
+                            let k = (area.width() / sz.x).min((area.height() - 60.0) / sz.y).min(3.0);
+                            child.add(egui::Image::new((t.id(), sz * k)).corner_radius(8.0));
+                        }
+                        None => {
+                            child.spinner();
+                            if !self.img_requested.contains(&m.id) {
+                                want = Some((m.id.clone(), md.clone()));
+                            }
+                        }
+                    }
+                } else {
+                    child.label(RichText::new(md.label()).size(20.0).color(Color32::WHITE));
+                    if child.button("Öffnen").clicked() {
+                        let _ = self.cmd.send(Cmd::OpenMedia { id: m.id.clone(), media: md.clone() });
+                    }
+                }
+                if !m.text.is_empty() {
+                    child.add_space(8.0);
+                    child.label(RichText::new(&m.text).size(16.0).color(Color32::WHITE));
+                }
+            } else {
+                let bg = if m.x.bg != 0 {
+                    let c = m.x.bg;
+                    Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+                } else {
+                    Color32::from_rgb(0x24, 0x36, 0x40)
+                };
+                child.painter().rect_filled(area, 12.0, bg);
+                child.add_space(area.height() * 0.35);
+                child.style_mut().visuals.override_text_color = Some(Color32::WHITE);
+                child.horizontal_wrapped(|ui| rich_label(ui, &m.text, 28.0, &mut self.emoji));
+            }
+            // Bedienung unten
+            let bottom = egui::Rect::from_min_size(egui::pos2(full.left(), full.bottom() - 50.0), egui::vec2(full.width(), 40.0));
+            let mut b = ui.new_child(egui::UiBuilder::new().max_rect(bottom).layout(egui::Layout::left_to_right(egui::Align::Center)));
+            b.add_space(full.width() / 2.0 - 170.0);
+            if b.add_enabled(idx > 0, egui::Button::new("◀ Zurück")).clicked() {
+                go = -1;
+            }
+            if !who.is_empty() && b.button("Antworten im Chat").clicked() {
+                open_chat = Some(who.clone());
+            }
+            if b.button("Weiter ▶").clicked() {
+                go = 1;
+            }
+            let keys = ui.input(|i| (i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::ArrowLeft)));
+            if keys.0 {
+                go = 1;
+            }
+            if keys.1 && idx > 0 {
+                go = -1;
+            }
+        });
+        if let Some((id, sender)) = mark {
+            self.status_seen.insert(id.clone());
+            if self.conn == Conn::Online {
+                let _ = self.cmd.send(Cmd::MarkRead { jid: Jid::new("status", whatsapp_rust::Server::Broadcast), msgs: vec![(id, sender)], last: None });
+            }
+        }
+        if let Some((id, md)) = want {
+            self.img_requested.insert(id.clone());
+            let _ = self.cmd.send(Cmd::LoadMedia { id, media: md });
+        }
+        if go != 0 {
+            if let Some((who, idx)) = self.status_sel.clone() {
+                let len = groups.iter().find(|(w, _)| *w == who).map(|g| g.1.len()).unwrap_or(0);
+                let ni = idx as i32 + go;
+                if ni >= 0 && (ni as usize) < len {
+                    self.status_sel = Some((who, ni as usize));
+                } else if ni as usize >= len {
+                    // nächste Person mit ungesehenem Status
+                    let next = groups.iter().find(|(w, items)| *w != who && !w.is_empty() && items.iter().any(|m| !self.status_seen.contains(&m.id)));
+                    self.status_sel = next.map(|(w, _)| (w.clone(), 0));
+                }
+            }
+        }
+        if let Some(u) = open_chat {
+            self.show_status = false;
+            self.run_msg_act(MsgAct::OpenNumber(u));
+        }
+    }
+
+    /// Empfänger für eigenen Status: alle Kontakte mit Einzelchat (Telefonnummer).
+    fn status_recipients(&self) -> Vec<Jid> {
+        self.chats.values().filter(|c| !c.is_group && c.jid.server == whatsapp_rust::Server::Pn).map(|c| c.jid.clone()).collect()
+    }
+
+    /// Anruf-Anzeige oben in der Mitte: klingelnd oder laufend.
+    fn call_overlay(&mut self, ctx: &egui::Context, pal: &Palette) {
+        if self.call_in.is_none() && self.call.is_none() {
+            return;
+        }
+        let mut cmd: Option<Cmd> = None;
+        let mut clear_in = false;
+        egui::Area::new(egui::Id::new("call_overlay"))
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 16.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(pal.bubble_them)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                    .corner_radius(16.0)
+                    .inner_margin(egui::Margin::symmetric(18, 12))
+                    .shadow(egui::epaint::Shadow { offset: [0, 4], blur: 18, spread: 0, color: Color32::from_black_alpha(90) })
+                    .show(ui, |ui| {
+                        ui.set_min_width(320.0);
+                        if let Some((id, from, name, video)) = self.call_in.clone() {
+                            let title = self.name_for_user(&from).or_else(|| (!name.is_empty()).then(|| name.clone())).unwrap_or_else(|| format!("+{from}"));
+                            ui.horizontal(|ui| {
+                                draw_avatar(ui, self.avatars.get(&from), &title, 48.0, self.settings.dark);
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&title).size(17.0).family(theme::bold()));
+                                    ui.label(RichText::new(if video { "Videoanruf (wird als Sprachanruf angenommen)" } else { "WhatsApp-Sprachanruf" }).color(pal.dim));
+                                });
+                            });
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui.add(egui::Button::new(RichText::new("✆  Annehmen").color(Color32::WHITE)).fill(pal.accent).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0))).clicked() {
+                                    cmd = Some(Cmd::AcceptCall(id.clone()));
+                                    self.call = Some((from.clone(), "Verbinde …".into(), std::time::Instant::now(), false));
+                                    clear_in = true;
+                                }
+                                if ui.add(egui::Button::new(RichText::new("Ablehnen").color(Color32::WHITE)).fill(pal.danger).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0))).clicked() {
+                                    cmd = Some(Cmd::RejectCall(id.clone()));
+                                    clear_in = true;
+                                }
+                            });
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                        } else if let Some((peer, text, start, muted)) = self.call.clone() {
+                            let title = self.name_for_user(&peer).unwrap_or_else(|| format!("+{peer}"));
+                            ui.horizontal(|ui| {
+                                draw_avatar(ui, self.avatars.get(&peer), &title, 48.0, self.settings.dark);
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&title).size(17.0).family(theme::bold()));
+                                    let t = if text == "Verbunden" {
+                                        let s = start.elapsed().as_secs();
+                                        format!("{}:{:02}", s / 60, s % 60)
+                                    } else {
+                                        text.clone()
+                                    };
+                                    ui.label(RichText::new(t).color(pal.dim));
+                                });
+                            });
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let ml = if muted { "🎤 Stumm aus" } else { "🎤 Stumm" };
+                                if ui.add(egui::Button::new(ml).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0)).selected(muted)).clicked() {
+                                    cmd = Some(Cmd::MuteCall(!muted));
+                                    if let Some(c) = self.call.as_mut() {
+                                        c.3 = !muted;
+                                    }
+                                }
+                                if ui.add(egui::Button::new(RichText::new("Auflegen").color(Color32::WHITE)).fill(pal.danger).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0))).clicked() {
+                                    cmd = Some(Cmd::Hangup);
+                                }
+                            });
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                        }
+                    });
+            });
+        if clear_in {
+            self.call_in = None;
+        }
+        if let Some(c) = cmd {
+            let _ = self.cmd.send(c);
         }
     }
 

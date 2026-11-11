@@ -1,12 +1,12 @@
 [package]
 name = "wa-snap"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license = "MIT"
 description = "Schneller nativer WhatsApp-Desktop-Client in Rust (inoffiziell)"
 
 [dependencies]
-whatsapp-rust = { version = "0.7", default-features = false, features = ["tokio-runtime", "tokio-native", "tokio-transport", "ureq-client", "sqlite-storage"] }
+whatsapp-rust = { version = "0.7", default-features = false, features = ["tokio-runtime", "tokio-native", "tokio-transport", "ureq-client", "sqlite-storage", "voip"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 eframe = "0.31"
 qrcode = { version = "0.14", default-features = false }
@@ -22,6 +22,7 @@ arboard = { version = "3", default-features = false, features = ["image-data", "
 opus = "0.3"
 ogg = "0.9"
 webp = { version = "0.3", default-features = false }
+async-channel = "2"
 
 [profile.release]
 lto = "thin"
