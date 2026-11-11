@@ -1,6 +1,6 @@
 [package]
 name = "wa-snap"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
 description = "Schneller nativer WhatsApp-Desktop-Client in Rust (inoffiziell)"
@@ -19,6 +19,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 ksni = { version = "0.3", features = ["blocking"] }
 arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
+opus = "0.3"
+ogg = "0.9"
+webp = { version = "0.3", default-features = false }
 
 [profile.release]
 lto = "thin"
@@ -42,3 +45,8 @@ assets = [
 [patch.crates-io]
 # Strg+V mit Bild in der Zwischenablage durchreichen (siehe vendor/egui-winit/src/lib.rs, "wa-snap:")
 egui-winit = { path = "vendor/egui-winit" }
+
+[profile.dev]
+# Entwicklungs-Builds klein halten
+debug = 0
+incremental = false

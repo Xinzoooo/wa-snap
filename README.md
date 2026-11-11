@@ -5,7 +5,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.8)
+## Funktionen (v0.9)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - Bunte Emojis (Twemoji) in Nachrichten, Chatliste und Emoji-Auswahl mit Kategorien; reine Emoji-Nachrichten werden groß angezeigt
@@ -36,20 +36,24 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Mehrzeilig schreiben (Shift+Enter), senden mit Enter
 - WhatsApp-Profil (Name, Info) in den Einstellungen änderbar; Autostart, Schriftgröße
 - Neuer Chat per Telefonnummer (Nummer in die Suche tippen)
-- Fotos und Sticker werden im Chat angezeigt (Klick öffnet in voller Größe); Videos, GIFs, Sprachnachrichten und Dokumente laden per Klick und öffnen im Standardprogramm
+- Fotos und Sticker werden im Chat angezeigt (Klick öffnet in voller Größe), animierte Sticker bewegen sich; Videos, GIFs und Dokumente laden per Klick und öffnen im Standardprogramm
+- Sprachnachrichten direkt in der App abspielen (Wellenform, Pause, Klick zum Spulen) und aufnehmen (Mikrofon-Knopf, wenn das Eingabefeld leer ist); Opus ist eingebaut, abgespielt und aufgenommen wird über PipeWire (`pw-play`/`pw-record`), ersatzweise PulseAudio oder ALSA
+- Videos senden; GIF-Dateien werden mit ffmpeg (falls installiert) zu WhatsApp-GIFs umgewandelt, sonst als Dokument gesendet
+- GIF-Suche über Giphy (eigener kostenloser API-Schlüssel nötig, Eintrag in den Einstellungen oder direkt im GIF-Reiter)
+- Eigene Sticker aus beliebigen Bildern (📎 → Sticker aus Bild, oder im Sticker-Reiter)
 - Fotos und Dateien senden: 📎 oder Datei ins Fenster ziehen; Text im Eingabefeld wird zur Bildunterschrift
 - Sticker: empfangene Sticker erscheinen in der Emoji-Auswahl unter „Sticker“ und lassen sich weiterschicken
 - Rechtsklick auf eine Nachricht: Reagieren, Antworten, Text kopieren, für alle löschen; Reaktionen, Antworten (Zitate), gelöschte und bearbeitete Nachrichten von anderen werden angezeigt
 - Diagnose-Log: `~/.local/share/wa-snap/wa-snap.log`
 
-**Noch nicht vorhanden:** GIF-Suche (bräuchte einen API-Schlüssel von Tenor/Giphy), Videos und Sprachnachrichten direkt in der App abspielen, Sprachnachrichten aufnehmen, eigene Sticker erstellen, Datenschutz-Einstellungen, Gruppen anlegen, Anrufe. Fehler bitte als Issue melden.
+**Noch nicht vorhanden:** Videos direkt in der App abspielen, Datenschutz-Einstellungen, Gruppen anlegen, Anrufe. Fehler bitte als Issue melden.
 
 ## Installation auf Fedora (empfohlen)
 
 Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.8.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.9.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
@@ -91,4 +95,4 @@ Die Sitzung liegt in `~/.local/share/wa-snap/whatsapp.db` (Linux), heruntergelad
 
 MIT, siehe [LICENSE](LICENSE).
 
-Mitgeliefert werden die Schrift [Inter](https://github.com/rsms/inter) (SIL Open Font License 1.1, [assets/fonts/OFL.txt](assets/fonts/OFL.txt)) und die Emoji-Grafiken von [Twemoji](https://github.com/jdecked/twemoji) (© Twitter, Inc. und weitere, CC-BY 4.0, [assets/TWEMOJI-LICENSE.txt](assets/TWEMOJI-LICENSE.txt)). `tools/pack_emoji.py` erzeugt daraus `assets/emoji.bin`.
+Eingebaut sind außerdem libopus (BSD) und libwebp (BSD). Mitgeliefert werden die Schrift [Inter](https://github.com/rsms/inter) (SIL Open Font License 1.1, [assets/fonts/OFL.txt](assets/fonts/OFL.txt)) und die Emoji-Grafiken von [Twemoji](https://github.com/jdecked/twemoji) (© Twitter, Inc. und weitere, CC-BY 4.0, [assets/TWEMOJI-LICENSE.txt](assets/TWEMOJI-LICENSE.txt)). `tools/pack_emoji.py` erzeugt daraus `assets/emoji.bin`.

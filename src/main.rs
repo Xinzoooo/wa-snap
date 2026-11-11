@@ -1,3 +1,4 @@
+mod audio;
 mod backend;
 mod emoji;
 mod store;
@@ -30,6 +31,8 @@ struct Settings {
     background: bool,
     /// Ende einer befristeten Stummschaltung (Unix-Sekunden) je Nummer/LID.
     muted_until: HashMap<String, i64>,
+    /// Eigener Giphy-API-Schlüssel für die GIF-Suche.
+    giphy_key: String,
 }
 
 impl Default for Settings {
@@ -46,6 +49,7 @@ impl Default for Settings {
             profile_about: String::new(),
             background: true,
             muted_until: HashMap::new(),
+            giphy_key: String::new(),
         }
     }
 }
@@ -254,7 +258,6 @@ struct App {
     /// Bilder/Sticker je Nachrichten-ID (Textur, volle Größe?).
     images: HashMap<String, (egui::TextureHandle, bool)>,
     img_requested: HashSet<String>,
-    show_stickers: bool,
     /// Reaktionen je Nachrichten-ID: (Absender, Emoji); Absender leer = ich.
     reactions: HashMap<String, Vec<(String, String)>>,
     /// Antwort in Vorbereitung: (Chat, Zitat, zitierte Nachricht ist von mir).
@@ -290,6 +293,21 @@ struct App {
     show_limit: HashMap<String, usize>,
     /// Gefundene Nachrichten bei der Suche einblenden
     show_msg_results: bool,
+    /// 0 = Emoji, 1 = GIF, 2 = Sticker
+    picker_tab: u8,
+    player: Option<audio::Playback>,
+    /// Pausierte Position je Sprachnachricht
+    paused_at: HashMap<String, f32>,
+    /// Dekodierte Sprachnachrichten: PCM, Kanäle, Wellenform
+    decoded: HashMap<String, (std::sync::Arc<Vec<i16>>, usize, Vec<u8>)>,
+    /// Abspielen, sobald die Datei da ist: (ID, Startposition)
+    want_play: Option<(String, f32)>,
+    recording: Option<audio::Recording>,
+    /// Animierte Sticker: Einzelbilder, Dauer je Bild (ms)
+    anims: HashMap<String, (Vec<egui::TextureHandle>, Vec<u32>)>,
+    gif_query: String,
+    gif_results: Vec<(backend::GifItem, Option<egui::TextureHandle>)>,
+    gif_loading: bool,
 }
 
 fn user_of(key: &str) -> String {
@@ -632,7 +650,6 @@ impl App {
             emoji: emoji::Cache::default(),
             images: HashMap::new(),
             img_requested: HashSet::new(),
-            show_stickers: false,
             reactions: HashMap::new(),
             reply_to: None,
             me: Vec::new(),
@@ -655,6 +672,16 @@ impl App {
             show_starred: false,
             show_limit: HashMap::new(),
             show_msg_results: true,
+            picker_tab: 0,
+            player: None,
+            paused_at: HashMap::new(),
+            decoded: HashMap::new(),
+            want_play: None,
+            recording: None,
+            anims: HashMap::new(),
+            gif_query: String::new(),
+            gif_results: Vec::new(),
+            gif_loading: false,
         };
         for r in recs {
             app.apply_rec(r);
@@ -741,6 +768,29 @@ impl App {
                 id: "demo-img".into(),
                 status: 0,
                 media: Some(backend::MediaRef { kind: "image".into(), mime: "image/png".into(), w: 480, h: 320, ..Default::default() }),
+                quote: None,
+                x: Default::default(),
+            },
+            Source::Disk,
+        );
+        let tone: Vec<i16> = (0..audio::RATE as usize * 3)
+            .map(|i| ((i as f32 * 330.0 * std::f32::consts::TAU / audio::RATE as f32).sin() * 6000.0 * (1.0 + (i as f32 / 9000.0).sin()) / 2.0) as i16)
+            .collect();
+        if let Ok(ogg) = audio::encode_ogg_opus(&tone) {
+            let _ = std::fs::write(media_dir.join("demo-voice.ogg"), ogg);
+        }
+        self.add_message(
+            ChatMessage {
+                chat: anna.clone(),
+                is_group: false,
+                from_me: false,
+                sender_name: "Anna Berger".into(),
+                sender: String::new(),
+                text: String::new(),
+                ts: now - 20,
+                id: "demo-voice".into(),
+                status: 0,
+                media: Some(backend::MediaRef { kind: "ptt".into(), mime: "audio/ogg; codecs=opus".into(), seconds: 3, ..Default::default() }),
                 quote: None,
                 x: Default::default(),
             },
@@ -1011,6 +1061,46 @@ impl App {
         });
         if self.conn == Conn::Online && (had_unread || !msgs.is_empty()) {
             let _ = self.cmd.send(Cmd::MarkRead { jid: c.jid.clone(), msgs, last });
+        }
+    }
+
+    /// Sprachnachricht ab `from` Sekunden abspielen (vorher laufende stoppen).
+    fn start_play(&mut self, id: &str, from: f32) {
+        if let Some(p) = self.player.take() {
+            let pos = p.position();
+            self.paused_at.insert(p.id.clone(), pos);
+            p.stop();
+        }
+        let Some((pcm, ch, _)) = self.decoded.get(id).cloned() else { return };
+        match audio::play(id, &pcm, ch, from, &data_dir().join("tmp")) {
+            Ok(p) => self.player = Some(p),
+            Err(e) => self.info = Some(format!("Abspielen nicht möglich: {e}")),
+        }
+    }
+
+    /// Klick auf Play/Pause oder in die Wellenform (`seek` = Anteil 0..1).
+    fn audio_action(&mut self, id: String, media: backend::MediaRef, seek: Option<f32>) {
+        let playing_this = self.player.as_ref().map(|p| p.id == id).unwrap_or(false);
+        if playing_this && seek.is_none() {
+            if let Some(p) = self.player.take() {
+                self.paused_at.insert(id, p.position());
+                p.stop();
+            }
+            return;
+        }
+        let dur = self.decoded.get(&id).map(|(pcm, ch, _)| pcm.len() as f32 / *ch as f32 / audio::RATE as f32).unwrap_or(media.seconds as f32);
+        let mut from = match seek {
+            Some(f) => f * dur,
+            None => *self.paused_at.get(&id).unwrap_or(&0.0),
+        };
+        if from >= dur - 0.2 {
+            from = 0.0;
+        }
+        if self.decoded.contains_key(&id) {
+            self.start_play(&id, from);
+        } else {
+            self.want_play = Some((id.clone(), from));
+            let _ = self.cmd.send(Cmd::FetchFile { id, media });
         }
     }
 
@@ -1329,6 +1419,48 @@ impl App {
                     self.store.append(&Rec::Vote { poll: poll.clone(), voter: voter.clone(), options: options.clone() });
                     self.votes.entry(poll).or_default().insert(voter, options);
                 }
+                UiEvent::FileReady { id, path } => {
+                    if self.want_play.as_ref().map(|w| w.0 == id).unwrap_or(false) {
+                        let (_, from) = self.want_play.take().unwrap_or_default();
+                        match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| audio::decode_ogg_opus(&b)) {
+                            Ok((pcm, ch)) => {
+                                let wf = audio::waveform(&pcm, ch);
+                                self.decoded.insert(id.clone(), (std::sync::Arc::new(pcm), ch, wf));
+                                self.start_play(&id, from);
+                            }
+                            Err(e) => {
+                                // Nicht dekodierbar (z. B. MP3/M4A): mit dem Standardprogramm öffnen
+                                backend::log(format!("Audio {id}: {e}"));
+                                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                            }
+                        }
+                    }
+                }
+                UiEvent::Anim { id, frames } => {
+                    let mut texs = Vec::new();
+                    let mut delays = Vec::new();
+                    for (i, (size, rgba, ms)) in frames.into_iter().enumerate() {
+                        let img = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                        texs.push(ctx.load_texture(format!("anim-{id}-{i}"), img, egui::TextureOptions::LINEAR));
+                        delays.push(ms);
+                    }
+                    self.anims.insert(id, (texs, delays));
+                }
+                UiEvent::GifResults(list) => {
+                    self.gif_loading = false;
+                    self.gif_results = list
+                        .into_iter()
+                        .map(|g| {
+                            let tex = g.preview.as_ref().map(|(size, rgba)| {
+                                ctx.load_texture(format!("gif-{}", g.id), egui::ColorImage::from_rgba_unmultiplied(*size, rgba), egui::TextureOptions::LINEAR)
+                            });
+                            (g, tex)
+                        })
+                        .collect();
+                    if self.gif_results.is_empty() {
+                        self.info = Some("Keine GIFs gefunden.".into());
+                    }
+                }
                 UiEvent::Members { group, members } => {
                     self.members.insert(group, members);
                 }
@@ -1610,6 +1742,10 @@ impl App {
                         ui.label("Schriftgröße");
                         theme_changed |= ui.add(egui::Slider::new(&mut self.settings.font_size, 12.0..=20.0)).changed();
                     });
+
+                    section(ui, "GIFS");
+                    ui.label(RichText::new("Giphy-API-Schlüssel (kostenlos auf developers.giphy.com)").small().color(pal.dim));
+                    changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.giphy_key).desired_width(360.0).margin(egui::vec2(10.0, 7.0))).changed();
 
                     section(ui, "SYSTEM");
                     changed |= ui
@@ -2070,6 +2206,10 @@ impl App {
         let input_id = egui::Id::new("wa_input");
         let mut do_send = false;
         let mut attach = false;
+        let mut make_sticker = false;
+        let mut paste_now = false;
+        let mut gif_send: Option<backend::GifItem> = None;
+        let mut rec_action: u8 = 0; // 1 starten, 2 senden, 3 abbrechen
         let mut paste_send: Option<std::path::PathBuf> = None;
         let mut typed = false;
         let mut sticker_send: Option<backend::MediaRef> = None;
@@ -2124,7 +2264,7 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("✏ Nachricht bearbeiten").size(13.0).family(theme::bold()).color(pal.accent));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("✕").on_hover_text("Bearbeiten abbrechen").clicked() {
+                                    if ui.small_button("×").on_hover_text("Bearbeiten abbrechen").clicked() {
                                         self.editing = None;
                                         self.input.clear();
                                     }
@@ -2198,7 +2338,7 @@ impl App {
                                     ui.add(egui::Label::new(RichText::new(t).size(13.0).color(pal.dim)).truncate());
                                 });
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("✕").on_hover_text("Antwort abbrechen").clicked() {
+                                    if ui.small_button("×").on_hover_text("Antwort abbrechen").clicked() {
                                         self.reply_to = None;
                                     }
                                 });
@@ -2213,9 +2353,23 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            if icon_button(ui, "📎", 19.0, pal.dim, pal, "Foto oder Datei senden (Text im Eingabefeld wird Bildunterschrift)").clicked() && enabled {
-                                attach = true;
+                            let clip = icon_button(ui, "📎", 19.0, pal.dim, pal, "Anhängen");
+                            let attach_id = egui::Id::new("attach_menu");
+                            if clip.clicked() && enabled {
+                                ui.memory_mut(|m| m.toggle_popup(attach_id));
                             }
+                            egui::popup::popup_above_or_below_widget(ui, attach_id, &clip, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                                ui.set_min_width(230.0);
+                                if ui.button("📄  Foto, Video oder Datei").clicked() {
+                                    attach = true;
+                                }
+                                if ui.button("🖼  Sticker aus Bild").clicked() {
+                                    make_sticker = true;
+                                }
+                                if ui.button("📋  Bild aus Zwischenablage").clicked() {
+                                    paste_now = true;
+                                }
+                            });
                             let emoji_btn = icon_button(ui, "", 19.0, pal.dim, pal, "Emoji");
                             {
                                 // Smiley als Umriss, wie das Symbol bei WhatsApp
@@ -2246,15 +2400,56 @@ impl App {
                                 |ui| {
                                     ui.set_width(372.0);
                                     ui.horizontal(|ui| {
-                                        if chip(ui, "Emoji", !self.show_stickers, pal) {
-                                            self.show_stickers = false;
-                                        }
-                                        if chip(ui, "Sticker", self.show_stickers, pal) {
-                                            self.show_stickers = true;
+                                        for (i, l) in ["Emoji", "GIF", "Sticker"].iter().enumerate() {
+                                            if chip(ui, l, self.picker_tab == i as u8, pal) {
+                                                self.picker_tab = i as u8;
+                                            }
                                         }
                                     });
                                     ui.add_space(4.0);
-                                    if self.show_stickers {
+                                    if self.picker_tab == 1 {
+                                        if self.settings.giphy_key.trim().is_empty() {
+                                            ui.label(RichText::new("Für die GIF-Suche brauchst du einen kostenlosen API-Schlüssel von Giphy (developers.giphy.com → Create an API Key). Hier eintragen:").small().color(pal.dim));
+                                            if ui.add(egui::TextEdit::singleline(&mut self.settings.giphy_key).hint_text("Giphy-API-Schlüssel").desired_width(340.0)).lost_focus() {
+                                                self.save_settings();
+                                            }
+                                            return;
+                                        }
+                                        let r = ui.add(egui::TextEdit::singleline(&mut self.gif_query).hint_text("GIFs suchen (Enter) …").desired_width(340.0));
+                                        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.gif_query.trim().is_empty() {
+                                            self.gif_loading = true;
+                                            let _ = self.cmd.send(Cmd::GifSearch { query: self.gif_query.trim().to_owned(), key: self.settings.giphy_key.trim().to_owned() });
+                                        }
+                                        if self.gif_loading {
+                                            ui.spinner();
+                                        }
+                                        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                for (g, tex) in &self.gif_results {
+                                                    let clicked = match tex {
+                                                        Some(t) => {
+                                                            let sz = t.size_vec2();
+                                                            let k = 108.0 / sz.x.max(1.0);
+                                                            ui.add(egui::Button::image(egui::Image::new((t.id(), sz * k)).corner_radius(4.0)).frame(false)).on_hover_text(&g.title).clicked()
+                                                        }
+                                                        None => ui.button(&g.title).clicked(),
+                                                    };
+                                                    if clicked {
+                                                        gif_send = Some(g.clone());
+                                                        ui.memory_mut(|m| m.close_popup());
+                                                    }
+                                                }
+                                            });
+                                            ui.label(RichText::new("Powered by GIPHY").size(10.0).color(pal.dim));
+                                        });
+                                        return;
+                                    }
+                                    if self.picker_tab == 2 {
+                                        if ui.button("➕ Eigenen Sticker aus Bild erstellen").clicked() {
+                                            make_sticker = true;
+                                            ui.memory_mut(|m| m.close_popup());
+                                        }
+                                        ui.add_space(4.0);
                                         let list = self.known_stickers();
                                         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                                             if list.is_empty() {
@@ -2306,6 +2501,33 @@ impl App {
                             );
                             let has_text = !self.input.trim().is_empty();
                             let send_w = 44.0;
+                            if let Some(rec) = &self.recording {
+                                // Aufnahme läuft: Zeit, Abbrechen, Senden
+                                let secs = rec.seconds() as u32;
+                                ui.add_space(6.0);
+                                let blink = (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0;
+                                ui.label(RichText::new(if blink { "●" } else { " " }).color(pal.danger).size(16.0));
+                                ui.label(RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).size(15.0));
+                                ui.label(RichText::new("Sprachnachricht wird aufgenommen").size(13.0).color(pal.dim));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::click());
+                                    let c = rect.center();
+                                    ui.painter().circle_filled(c, 20.0, pal.accent);
+                                    let pts = vec![c + egui::vec2(-6.0, -7.0), c + egui::vec2(8.0, 0.0), c + egui::vec2(-6.0, 7.0), c + egui::vec2(-3.0, 0.0)];
+                                    ui.painter().add(egui::Shape::convex_polygon(pts, pal.on_accent, egui::Stroke::NONE));
+                                    if resp.on_hover_text("Senden").clicked() {
+                                        rec_action = 2;
+                                    }
+                                    if icon_button(ui, "🗑", 18.0, pal.danger, pal, "Verwerfen").clicked() {
+                                        rec_action = 3;
+                                    }
+                                });
+                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                                if secs >= 15 * 60 {
+                                    rec_action = 2;
+                                }
+                                return;
+                            }
                             typed = ui.add_enabled(
                                 enabled,
                                 egui::TextEdit::multiline(&mut self.input)
@@ -2318,12 +2540,32 @@ impl App {
                             ).changed();
                             let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::click());
                             let c = rect.center();
-                            let (bg, fg) = if has_text { (pal.accent, pal.on_accent) } else { (Color32::TRANSPARENT, pal.dim) };
-                            ui.painter().circle_filled(c, 20.0, bg);
-                            let pts = vec![c + egui::vec2(-6.0, -7.0), c + egui::vec2(8.0, 0.0), c + egui::vec2(-6.0, 7.0), c + egui::vec2(-3.0, 0.0)];
-                            ui.painter().add(egui::Shape::convex_polygon(pts, fg, egui::Stroke::NONE));
-                            if has_text && resp.on_hover_text("Senden (Enter)").clicked() {
-                                do_send = true;
+                            if has_text || self.editing.is_some() {
+                                ui.painter().circle_filled(c, 20.0, pal.accent);
+                                let pts = vec![c + egui::vec2(-6.0, -7.0), c + egui::vec2(8.0, 0.0), c + egui::vec2(-6.0, 7.0), c + egui::vec2(-3.0, 0.0)];
+                                ui.painter().add(egui::Shape::convex_polygon(pts, pal.on_accent, egui::Stroke::NONE));
+                                if resp.on_hover_text("Senden (Enter)").clicked() {
+                                    do_send = true;
+                                }
+                            } else {
+                                // Mikrofon zeichnen
+                                if resp.hovered() {
+                                    ui.painter().circle_filled(c, 20.0, pal.hover);
+                                }
+                                let st = egui::Stroke::new(1.8_f32, pal.dim);
+                                let p = ui.painter();
+                                p.rect_stroke(egui::Rect::from_center_size(c + egui::vec2(0.0, -3.0), egui::vec2(8.0, 13.0)), 4.0, st, egui::StrokeKind::Middle);
+                                let arc: Vec<egui::Pos2> = (0..=10)
+                                    .map(|i| {
+                                        let a = std::f32::consts::PI * i as f32 / 10.0;
+                                        c + egui::vec2(-a.cos() * 7.0, a.sin() * 6.0 + 1.0)
+                                    })
+                                    .collect();
+                                p.add(egui::Shape::line(arc, st));
+                                p.line_segment([c + egui::vec2(0.0, 7.0), c + egui::vec2(0.0, 10.0)], st);
+                                if resp.on_hover_text("Sprachnachricht aufnehmen").clicked() && enabled {
+                                    rec_action = 1;
+                                }
                             }
                         });
                     });
@@ -2331,6 +2573,12 @@ impl App {
         if do_send {
             self.send_current();
             ctx.memory_mut(|m| m.request_focus(input_id));
+        }
+        if paste_now {
+            self.try_paste_image(ctx);
+            if self.pending_paste.is_none() && self.info.is_none() {
+                self.info = Some("In der Zwischenablage ist kein Bild.".into());
+            }
         }
         // Dateien per Ziehen-und-Ablegen oder über 📎 senden
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
@@ -2357,6 +2605,46 @@ impl App {
                     let _ = self.cmd.send(Cmd::Typing { chat: jid.clone(), on: false });
                     self.my_typing = None;
                 }
+                if make_sticker {
+                    let _ = self.cmd.send(Cmd::MakeSticker { chat: jid.clone(), path: None });
+                }
+                if let Some(gif) = gif_send.take() {
+                    let _ = self.cmd.send(Cmd::SendGif { chat: jid.clone(), gif });
+                }
+                match rec_action {
+                    1 => match audio::start_recording(&data_dir().join("tmp")) {
+                        Ok(r) => {
+                            if let Some(p) = self.player.take() {
+                                p.stop();
+                            }
+                            self.recording = Some(r);
+                        }
+                        Err(e) => self.info = Some(format!("Aufnahme nicht möglich: {e}")),
+                    },
+                    2 => {
+                        if let Some(r) = self.recording.take() {
+                            let secs = r.seconds().round().max(1.0) as u32;
+                            match r.finish().and_then(|pcm| {
+                                if pcm.len() < (audio::RATE / 2) as usize {
+                                    return Err("Aufnahme zu kurz oder kein Mikrofon-Signal".into());
+                                }
+                                let wf = audio::waveform(&pcm, 1);
+                                audio::encode_ogg_opus(&pcm).map(|ogg| (ogg, wf))
+                            }) {
+                                Ok((ogg, waveform)) => {
+                                    let _ = self.cmd.send(Cmd::SendVoice { chat: jid.clone(), ogg, seconds: secs, waveform });
+                                }
+                                Err(e) => self.info = Some(format!("Sprachnachricht: {e}")),
+                            }
+                        }
+                    }
+                    3 => {
+                        if let Some(r) = self.recording.take() {
+                            r.cancel();
+                        }
+                    }
+                    _ => {}
+                }
                 if attach {
                     let caption = std::mem::take(&mut self.input).trim().to_owned();
                     let _ = self.cmd.send(Cmd::SendFile { chat: jid.clone(), path: None, caption });
@@ -2376,6 +2664,7 @@ impl App {
         let mut msg_act: Option<MsgAct> = None;
         let mut jump_req: Option<String> = None;
         let mut older_req = false;
+        let mut audio_req: Option<(String, backend::MediaRef, Option<f32>)> = None;
         let mut jumped = false;
         let mut scroll_out: Option<(f32, egui::Rect)> = None;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.chat)).show(ctx, |ui| {
@@ -2508,7 +2797,7 @@ impl App {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(msg).size(13.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("✕").clicked() {
+                                if ui.small_button("×").clicked() {
                                     self.info = None;
                                 }
                             });
@@ -2575,6 +2864,9 @@ impl App {
                         }
                         let margin_side = (full_w * 0.06).clamp(16.0, 63.0) as i8;
                         ui.with_layout(egui::Layout::top_down(align), |ui| {
+                            // Fläche fürs Rechtsklick-Menü VOR dem Inhalt anmelden, damit Knöpfe in der Blase Vorrang haben
+                            let bid = egui::Id::new(("bubble", &m.id));
+                            let bubble_hit = ui.ctx().data(|d| d.get_temp::<egui::Rect>(bid)).map(|r| ui.interact(r, bid, egui::Sense::click()));
                             let resp = egui::Frame::new()
                                 .fill(bg)
                                 .corner_radius(8.0)
@@ -2645,7 +2937,7 @@ impl App {
                                     if m.x.view_once {
                                         ui.label(RichText::new("⏱ Einmal-Ansicht – nur auf dem Handy sichtbar").size(14.0).italics().color(pal.dim));
                                     } else if let Some(md) = &m.media {
-                                        self.media_block(ui, m, md, max_w, pal, &mut media_req, &mut open_req);
+                                        self.media_block(ui, m, md, max_w, pal, &mut media_req, &mut open_req, &mut audio_req);
                                     }
                                     if let Some(k) = &m.x.kind {
                                         self.extra_block(ui, m, k, w, pal, &mut msg_act);
@@ -2729,7 +3021,9 @@ impl App {
                             }
                             // Rechtsklick-Menü der Nachricht
                             let mine = self.reactions.get(&m.id).and_then(|l| l.iter().find(|(f, _)| f.is_empty()).map(|x| x.1.clone()));
-                            resp.response.interact(egui::Sense::click()).context_menu(|ui| {
+                            ui.ctx().data_mut(|d| d.insert_temp(bid, resp.response.rect));
+                            let hit = bubble_hit.unwrap_or_else(|| resp.response.clone());
+                            hit.context_menu(|ui| {
                                 ui.horizontal(|ui| {
                                     for e in ["👍", "❤️", "😂", "😮", "😢", "🙏"] {
                                         let k: String = e.chars().filter(|c| *c != '\u{FE0F}').collect();
@@ -2799,6 +3093,9 @@ impl App {
         });
         self.emoji = ecache;
         self.scroll_bottom = false;
+        if let Some((id, media, seek)) = audio_req {
+            self.audio_action(id, media, seek);
+        }
         if older_req {
             if let Some(key) = self.selected.clone() {
                 if let Some(c) = self.chats.get(&key) {
@@ -3067,6 +3364,64 @@ impl App {
         }
     }
 
+    /// Sprachnachricht: Play/Pause, Wellenform zum Spulen, Zeit.
+    fn audio_block(&self, ui: &mut egui::Ui, m: &ChatMessage, md: &backend::MediaRef, max_w: f32, pal: &Palette, audio_req: &mut Option<(String, backend::MediaRef, Option<f32>)>) {
+        let playing = self.player.as_ref().filter(|p| p.id == m.id);
+        let dec = self.decoded.get(&m.id);
+        let dur = dec.map(|(pcm, ch, _)| pcm.len() as f32 / *ch as f32 / audio::RATE as f32).unwrap_or(md.seconds as f32).max(0.1);
+        let pos = playing.map(|p| p.position()).or_else(|| self.paused_at.get(&m.id).copied()).unwrap_or(0.0);
+        let loading = self.want_play.as_ref().map(|w| w.0 == m.id).unwrap_or(false);
+        let w = 260.0_f32.min(max_w - 20.0);
+        ui.horizontal(|ui| {
+            let (r, resp) = ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::click());
+            let c = r.center();
+            let p = ui.painter();
+            p.circle_filled(c, 18.0, if m.from_me { Color32::from_black_alpha(40) } else { pal.hover });
+            if loading {
+                p.text(c, egui::Align2::CENTER_CENTER, "…", egui::FontId::proportional(16.0), pal.text);
+            } else if playing.is_some() {
+                p.rect_filled(egui::Rect::from_center_size(c + egui::vec2(-4.0, 0.0), egui::vec2(4.0, 14.0)), 1.0, pal.text);
+                p.rect_filled(egui::Rect::from_center_size(c + egui::vec2(4.0, 0.0), egui::vec2(4.0, 14.0)), 1.0, pal.text);
+            } else {
+                let pts = vec![c + egui::vec2(-5.0, -8.0), c + egui::vec2(9.0, 0.0), c + egui::vec2(-5.0, 8.0)];
+                p.add(egui::Shape::convex_polygon(pts, pal.text, egui::Stroke::NONE));
+            }
+            if resp.on_hover_text(if playing.is_some() { "Pause" } else { "Abspielen" }).clicked() {
+                *audio_req = Some((m.id.clone(), md.clone(), None));
+            }
+            ui.vertical(|ui| {
+                let (wr, wresp) = ui.allocate_exact_size(egui::vec2(w - 50.0, 26.0), egui::Sense::click());
+                let bars: Vec<u8> = dec.map(|d| d.2.clone()).unwrap_or_else(|| {
+                    // Platzhalter, bis die Datei geladen ist
+                    (0..40).map(|i| (30 + ((i * 37 + m.id.len() * 11) % 50)) as u8).collect()
+                });
+                let n = bars.len().max(1);
+                let bw = wr.width() / n as f32;
+                let frac = (pos / dur).clamp(0.0, 1.0);
+                for (i, b) in bars.iter().enumerate() {
+                    let h = (*b as f32 / 100.0 * wr.height()).max(3.0);
+                    let x = wr.left() + i as f32 * bw + bw / 2.0;
+                    let played = (i as f32 + 0.5) / n as f32 <= frac;
+                    let col = if played { pal.tick_read } else { pal.dim.gamma_multiply(0.7) };
+                    ui.painter().line_segment([egui::pos2(x, wr.center().y - h / 2.0), egui::pos2(x, wr.center().y + h / 2.0)], egui::Stroke::new((bw * 0.6).clamp(1.5, 3.0), col));
+                }
+                if wresp.clicked() {
+                    if let Some(pt) = wresp.interact_pointer_pos() {
+                        let f = ((pt.x - wr.left()) / wr.width()).clamp(0.0, 1.0);
+                        *audio_req = Some((m.id.clone(), md.clone(), Some(f)));
+                    }
+                }
+                let shown = if playing.is_some() || pos > 0.0 { pos } else { dur };
+                let label = if md.kind == "ptt" { "" } else { "  🎵 Audio" };
+                let shown = shown.round() as u32;
+                ui.label(RichText::new(format!("{}:{:02}{label}", shown / 60, shown % 60)).size(11.0).color(pal.dim));
+            });
+        });
+        if playing.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// Bild, Sticker oder Anhang in einer Blase.
     fn media_block(
         &self,
@@ -3077,7 +3432,34 @@ impl App {
         pal: &Palette,
         media_req: &mut Vec<(String, backend::MediaRef)>,
         open_req: &mut Vec<(String, backend::MediaRef)>,
+        audio_req: &mut Option<(String, backend::MediaRef, Option<f32>)>,
     ) {
+        if md.kind == "ptt" || md.kind == "audio" {
+            self.audio_block(ui, m, md, max_w, pal, audio_req);
+            return;
+        }
+        if let Some((frames, delays)) = self.anims.get(&m.id) {
+            // animierter Sticker: Bild nach Zeit auswählen
+            let total: u32 = delays.iter().sum::<u32>().max(1);
+            let t = (ui.input(|i| i.time) * 1000.0) as u64 % total as u64;
+            let mut acc = 0u64;
+            let mut idx = 0;
+            for (i, d) in delays.iter().enumerate() {
+                acc += *d as u64;
+                if t < acc {
+                    idx = i;
+                    break;
+                }
+            }
+            let tex = &frames[idx];
+            let size = media_size(md, Some(&(tex.clone(), true)), max_w);
+            let resp = ui.add(egui::Image::new((tex.id(), size)).sense(egui::Sense::click()));
+            if resp.on_hover_text("Öffnen").clicked() {
+                open_req.push((m.id.clone(), md.clone()));
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(delays[idx].max(30) as u64));
+            return;
+        }
         let tex = self.images.get(&m.id);
         if !self.img_requested.contains(&m.id) && tex.map(|t| !t.1).unwrap_or(true) {
             media_req.push((m.id.clone(), md.clone()));
@@ -3192,6 +3574,12 @@ impl eframe::App for App {
             }
         }
         self.sync_notify_state();
+        if self.player.as_mut().map(|p| p.finished()).unwrap_or(false) {
+            if let Some(p) = self.player.take() {
+                self.paused_at.remove(&p.id);
+                p.stop();
+            }
+        }
         let unread: u32 = self
             .chats
             .iter()

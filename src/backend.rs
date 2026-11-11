@@ -60,6 +60,12 @@ pub enum UiEvent {
     Revoked { id: String },
     /// Nachricht wurde bearbeitet.
     Edited { id: String, text: String },
+    /// Datei eines Mediums liegt lokal bereit (z. B. Sprachnachricht zum Abspielen).
+    FileReady { id: String, path: std::path::PathBuf },
+    /// Animierter Sticker: Einzelbilder mit Dauer in Millisekunden.
+    Anim { id: String, frames: Vec<([usize; 2], Vec<u8>, u32)> },
+    /// Ergebnisse der GIF-Suche.
+    GifResults(Vec<GifItem>),
     /// Bild/Sticker einer Nachricht dekodiert (Vorschau oder volle Größe).
     Image { id: String, size: [usize; 2], rgba: Vec<u8>, full: bool },
 }
@@ -105,9 +111,33 @@ pub enum Cmd {
     OpenMedia { id: String, media: MediaRef },
     /// Datei senden (Bild als Foto, sonst als Dokument). Ohne Pfad: Dateiauswahl öffnen.
     SendFile { chat: Jid, path: Option<std::path::PathBuf>, caption: String },
+    /// Datei eines Mediums herunterladen (falls nötig) und melden, wo sie liegt.
+    FetchFile { id: String, media: MediaRef },
+    /// Sprachnachricht senden (fertig kodiertes Ogg/Opus).
+    SendVoice { chat: Jid, ogg: Vec<u8>, seconds: u32, waveform: Vec<u8> },
+    /// Bild als eigenen Sticker senden (wird auf 512×512 WebP umgerechnet).
+    MakeSticker { chat: Jid, path: Option<std::path::PathBuf> },
+    /// GIFs bei Giphy suchen (eigener API-Schlüssel nötig).
+    GifSearch { query: String, key: String },
+    /// GIF aus der Suche senden.
+    SendGif { chat: Jid, gif: GifItem },
     /// Bekannten Sticker erneut senden (ohne neuen Upload).
     SendSticker { chat: Jid, media: MediaRef },
     Quit,
+}
+
+/// Ein Treffer der GIF-Suche.
+#[derive(Clone)]
+pub struct GifItem {
+    pub id: String,
+    pub title: String,
+    pub mp4: String,
+    pub w: u32,
+    pub h: u32,
+    /// Vorschaubild (RGBA) und dessen Größe
+    pub preview: Option<([usize; 2], Vec<u8>)>,
+    /// Vorschau als JPEG für die Nachricht
+    pub thumb: Vec<u8>,
 }
 
 /// Zitierte Nachricht (Antwort).
@@ -865,6 +895,159 @@ fn forward_message(m: &ChatMessage) -> wa::Message {
     }
 }
 
+fn has_cmd(cmd: &str) -> bool {
+    std::process::Command::new(cmd).arg("-version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().is_ok()
+}
+
+/// GIF-Datei mit ffmpeg in ein stummes MP4 umwandeln (so verschickt WhatsApp GIFs).
+fn gif_to_mp4(path: &std::path::Path, out: &std::path::Path) -> bool {
+    has_cmd("ffmpeg")
+        && std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-i"])
+            .arg(path)
+            .args(["-movflags", "faststart", "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-an"])
+            .arg(out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+}
+
+/// Vorschaubild (JPEG) und Größe eines Videos über ffmpeg, falls vorhanden.
+fn video_thumb(path: &std::path::Path) -> Option<(Vec<u8>, u32, u32)> {
+    if !has_cmd("ffmpeg") {
+        return None;
+    }
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
+        .output()
+        .ok()?;
+    let img = image::load_from_memory(&out.stdout).ok()?;
+    Some((jpeg_thumb(&img), img.width(), img.height()))
+}
+
+/// Bild auf 512×512 (transparent aufgefüllt) bringen und als WebP unter 100 KB kodieren.
+fn to_sticker_webp(img: &image::DynamicImage) -> Result<Vec<u8>, String> {
+    let fitted = img.resize(512, 512, image::imageops::FilterType::Lanczos3).to_rgba8();
+    let mut canvas = image::RgbaImage::from_pixel(512, 512, image::Rgba([0, 0, 0, 0]));
+    let x = (512 - fitted.width()) / 2;
+    let y = (512 - fitted.height()) / 2;
+    image::imageops::overlay(&mut canvas, &fitted, x as i64, y as i64);
+    let enc = webp::Encoder::from_rgba(canvas.as_raw(), 512, 512);
+    for q in [80.0, 65.0, 50.0, 35.0] {
+        let data = enc.encode(q).to_vec();
+        if data.len() <= 100 * 1024 {
+            return Ok(data);
+        }
+    }
+    Ok(enc.encode(25.0).to_vec())
+}
+
+/// Animierten WebP-Sticker in Einzelbilder zerlegen (höchstens 60, verkleinert).
+fn decode_anim(bytes: &[u8]) -> Option<Vec<([usize; 2], Vec<u8>, u32)>> {
+    use image::AnimationDecoder;
+    let dec = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    if !dec.has_animation() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for f in dec.into_frames().take(60).flatten() {
+        let (n, d) = f.delay().numer_denom_ms();
+        let ms = if d == 0 { 100 } else { (n / d).max(20) };
+        let img = image::DynamicImage::ImageRgba8(f.into_buffer()).thumbnail(256, 256).to_rgba8();
+        out.push(([img.width() as usize, img.height() as usize], img.into_raw(), ms));
+    }
+    (out.len() > 1).then_some(out)
+}
+
+/// Bei Giphy suchen. Gibt bis zu 24 Treffer mit Vorschaubild zurück.
+fn giphy_search(query: &str, key: &str) -> Result<Vec<GifItem>, String> {
+    let url = format!(
+        "https://api.giphy.com/v1/gifs/search?api_key={}&q={}&limit=24&rating=pg-13&lang=de",
+        key,
+        query.replace(' ', "+")
+    );
+    let body = ureq::get(&url).call().map_err(|e| e.to_string())?.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for g in v["data"].as_array().cloned().unwrap_or_default() {
+        let im = &g["images"];
+        let mp4 = im["original"]["mp4"].as_str().or_else(|| im["fixed_width"]["mp4"].as_str()).unwrap_or("").to_owned();
+        let still = im["fixed_width_small_still"]["url"].as_str().or_else(|| im["fixed_width_still"]["url"].as_str()).unwrap_or("");
+        if mp4.is_empty() {
+            continue;
+        }
+        let num = |x: &serde_json::Value| x.as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let mut item = GifItem {
+            id: g["id"].as_str().unwrap_or("").to_owned(),
+            title: g["title"].as_str().unwrap_or("").to_owned(),
+            mp4,
+            w: num(&im["original"]["width"]),
+            h: num(&im["original"]["height"]),
+            preview: None,
+            thumb: Vec::new(),
+        };
+        if !still.is_empty() {
+            if let Ok(mut r) = ureq::get(still).call() {
+                if let Ok(b) = r.body_mut().read_to_vec() {
+                    if let Ok(img) = image::load_from_memory(&b) {
+                        item.thumb = jpeg_thumb(&img);
+                        let t = img.thumbnail(160, 160).to_rgba8();
+                        item.preview = Some(([t.width() as usize, t.height() as usize], t.into_raw()));
+                    }
+                }
+            }
+        }
+        out.push(item);
+    }
+    Ok(out)
+}
+
+/// Lokale Nachricht anzeigen, Medium hochladen, Nachricht bauen und senden.
+#[allow(clippy::too_many_arguments)]
+async fn upload_and_send(
+    client: &Client,
+    send: &(impl Fn(UiEvent) + Clone),
+    dir: &std::path::Path,
+    chat: &Jid,
+    data: Vec<u8>,
+    mref: MediaRef,
+    caption: String,
+    mt: whatsapp_rust::wacore::download::MediaType,
+    build: impl FnOnce(&whatsapp_rust::upload::UploadResponse) -> wa::Message,
+) -> Result<(), String> {
+    let temp = format!("local-u-{}", chrono::Utc::now().timestamp_millis());
+    let _ = std::fs::create_dir_all(dir);
+    let local = dir.join(format!("{}.{}", safe_name(&temp), mref.ext()));
+    let _ = std::fs::write(&local, &data);
+    send(UiEvent::Message(ChatMessage {
+        chat: chat.clone(),
+        is_group: chat.is_group(),
+        from_me: true,
+        sender_name: String::new(),
+        sender: String::new(),
+        text: caption,
+        ts: chrono::Utc::now().timestamp(),
+        id: temp.clone(),
+        status: 0,
+        media: Some(mref.clone()),
+        quote: None,
+        x: Default::default(),
+    }));
+    let key = chat.to_string();
+    let fail = |e: String| {
+        send(UiEvent::SendFailed { chat: key.clone(), temp: temp.clone(), err: e.clone() });
+        e
+    };
+    let up = client.upload(data, mt, Default::default()).await.map_err(|e| fail(e.to_string()))?;
+    let msg = build(&up);
+    let r = client.send_message(chat, msg).await.map_err(|e| fail(e.to_string()))?;
+    let _ = std::fs::rename(&local, dir.join(format!("{}.{}", safe_name(&r.message_id), mref.ext())));
+    send(UiEvent::Sent { chat: key, temp, id: r.message_id });
+    Ok(())
+}
+
 /// Datei hochladen und als Foto (Bilder) oder Dokument senden.
 async fn send_file(
     client: &Client,
@@ -881,7 +1064,47 @@ async fn send_file(
     }
     let mime = mime_of(path);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    // GIFs schickt WhatsApp als Video; ohne Umwandlung gehen sie als Dokument.
+    // Videos und GIFs (als stummes MP4) als Video senden
+    let gif = mime == "image/gif";
+    if mime == "video/mp4" || gif {
+        let mp4_path = if gif {
+            let out = dir.join(format!("gif-{}.mp4", chrono::Utc::now().timestamp_millis()));
+            let _ = std::fs::create_dir_all(dir);
+            if gif_to_mp4(path, &out) { Some(out) } else { None }
+        } else {
+            Some(path.to_path_buf())
+        };
+        if let Some(mp4) = mp4_path {
+            let data = tokio::fs::read(&mp4).await.map_err(|e| e.to_string())?;
+            if gif {
+                let _ = std::fs::remove_file(&mp4);
+            }
+            let (thumb, w, h) = video_thumb(path).unwrap_or_default();
+            let mref = MediaRef { kind: if gif { "gif".into() } else { "video".into() }, mime: "video/mp4".into(), name, len: data.len() as u64, w, h, ..Default::default() };
+            let cap = if caption.is_empty() { None } else { Some(caption.clone()) };
+            return upload_and_send(client, send, dir, chat, data, mref, caption, M::Video, move |up| wa::Message {
+                video_message: whatsapp_rust::waproto::buffa::MessageField::some(wa::message::VideoMessage {
+                    url: Some(up.url.clone()),
+                    direct_path: Some(up.direct_path.clone()),
+                    media_key: Some(up.media_key.to_vec()),
+                    file_sha256: Some(up.file_sha256.to_vec()),
+                    file_enc_sha256: Some(up.file_enc_sha256.to_vec()),
+                    file_length: Some(up.file_length),
+                    media_key_timestamp: Some(up.media_key_timestamp),
+                    mimetype: Some("video/mp4".into()),
+                    width: (w > 0).then_some(w),
+                    height: (h > 0).then_some(h),
+                    gif_playback: Some(gif),
+                    jpeg_thumbnail: (!thumb.is_empty()).then_some(thumb),
+                    caption: cap,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await;
+        }
+        // ohne ffmpeg: GIF geht als Dokument
+    }
     let picture = matches!(mime, "image/jpeg" | "image/png" | "image/webp");
     let decoded = if picture {
         let d = data.clone();
@@ -1575,9 +1798,20 @@ pub fn spawn(
                                         }
                                         match ensure_file(&client, &dir, &id, &media).await {
                                             Ok(path) => {
-                                                let r = tokio::task::spawn_blocking(move || std::fs::read(path).ok().and_then(|b| decode_rgba(&b, 640))).await;
-                                                if let Ok(Some((size, rgba))) = r {
-                                                    send(UiEvent::Image { id, size, rgba, full: true });
+                                                let animated = media.kind == "sticker";
+                                                let r = tokio::task::spawn_blocking(move || {
+                                                    let b = std::fs::read(path).ok()?;
+                                                    let anim = if animated { decode_anim(&b) } else { None };
+                                                    Some((decode_rgba(&b, 640), anim))
+                                                })
+                                                .await;
+                                                if let Ok(Some((still, anim))) = r {
+                                                    if let Some((size, rgba)) = still {
+                                                        send(UiEvent::Image { id: id.clone(), size, rgba, full: true });
+                                                    }
+                                                    if let Some(frames) = anim {
+                                                        send(UiEvent::Anim { id, frames });
+                                                    }
                                                 }
                                             }
                                             Err(e) => log(format!("Medium {id} laden fehlgeschlagen: {e}")),
@@ -1610,6 +1844,154 @@ pub fn spawn(
                                         if let Err(e) = send_file(&client, &send, &dir, &chat, &path, caption).await {
                                             log(format!("Datei senden fehlgeschlagen: {e}"));
                                             send(UiEvent::Info(format!("Datei senden fehlgeschlagen: {e}")));
+                                        }
+                                    });
+                                }
+                                Cmd::FetchFile { id, media } => {
+                                    let dir = media_dir.clone();
+                                    tokio::spawn(async move {
+                                        match ensure_file(&client, &dir, &id, &media).await {
+                                            Ok(path) => send(UiEvent::FileReady { id, path }),
+                                            Err(e) => send(UiEvent::Info(format!("Herunterladen fehlgeschlagen: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::SendVoice { chat, ogg, seconds, waveform } => {
+                                    let dir = media_dir.clone();
+                                    tokio::spawn(async move {
+                                        use whatsapp_rust::wacore::download::MediaType as M;
+                                        let mime = "audio/ogg; codecs=opus";
+                                        let mref = MediaRef { kind: "ptt".into(), mime: mime.into(), len: ogg.len() as u64, seconds, ..Default::default() };
+                                        let wf = waveform.clone();
+                                        let r = upload_and_send(&client, &send, &dir, &chat, ogg, mref, String::new(), M::Audio, move |up| wa::Message {
+                                            audio_message: whatsapp_rust::waproto::buffa::MessageField::some(wa::message::AudioMessage {
+                                                url: Some(up.url.clone()),
+                                                direct_path: Some(up.direct_path.clone()),
+                                                media_key: Some(up.media_key.to_vec()),
+                                                file_sha256: Some(up.file_sha256.to_vec()),
+                                                file_enc_sha256: Some(up.file_enc_sha256.to_vec()),
+                                                file_length: Some(up.file_length),
+                                                media_key_timestamp: Some(up.media_key_timestamp),
+                                                mimetype: Some(mime.into()),
+                                                seconds: Some(seconds),
+                                                ptt: Some(true),
+                                                waveform: Some(wf),
+                                                ..Default::default()
+                                            }),
+                                            ..Default::default()
+                                        })
+                                        .await;
+                                        if let Err(e) = r {
+                                            log(format!("Sprachnachricht fehlgeschlagen: {e}"));
+                                        }
+                                    });
+                                }
+                                Cmd::MakeSticker { chat, path } => {
+                                    let dir = media_dir.clone();
+                                    tokio::spawn(async move {
+                                        use whatsapp_rust::wacore::download::MediaType as M;
+                                        let path = match path {
+                                            Some(p) => p,
+                                            None => match rfd::AsyncFileDialog::new()
+                                                .set_title("Bild für Sticker wählen")
+                                                .add_filter("Bilder", &["png", "jpg", "jpeg", "webp", "gif"])
+                                                .pick_file()
+                                                .await
+                                            {
+                                                Some(f) => f.path().to_path_buf(),
+                                                None => return,
+                                            },
+                                        };
+                                        let made = tokio::task::spawn_blocking(move || {
+                                            let img = image::open(&path).map_err(|e| e.to_string())?;
+                                            to_sticker_webp(&img)
+                                        })
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                        .and_then(|r| r);
+                                        let data = match made {
+                                            Ok(d) => d,
+                                            Err(e) => {
+                                                send(UiEvent::Info(format!("Sticker: {e}")));
+                                                return;
+                                            }
+                                        };
+                                        let mref = MediaRef { kind: "sticker".into(), mime: "image/webp".into(), len: data.len() as u64, w: 512, h: 512, ..Default::default() };
+                                        let r = upload_and_send(&client, &send, &dir, &chat, data, mref, String::new(), M::Sticker, |up| wa::Message {
+                                            sticker_message: whatsapp_rust::waproto::buffa::MessageField::some(wa::message::StickerMessage {
+                                                url: Some(up.url.clone()),
+                                                direct_path: Some(up.direct_path.clone()),
+                                                media_key: Some(up.media_key.to_vec()),
+                                                file_sha256: Some(up.file_sha256.to_vec()),
+                                                file_enc_sha256: Some(up.file_enc_sha256.to_vec()),
+                                                file_length: Some(up.file_length),
+                                                media_key_timestamp: Some(up.media_key_timestamp),
+                                                mimetype: Some("image/webp".into()),
+                                                width: Some(512),
+                                                height: Some(512),
+                                                is_animated: Some(false),
+                                                ..Default::default()
+                                            }),
+                                            ..Default::default()
+                                        })
+                                        .await;
+                                        if let Err(e) = r {
+                                            log(format!("Sticker senden fehlgeschlagen: {e}"));
+                                        }
+                                    });
+                                }
+                                Cmd::GifSearch { query, key } => {
+                                    tokio::spawn(async move {
+                                        match tokio::task::spawn_blocking(move || giphy_search(&query, &key)).await {
+                                            Ok(Ok(list)) => send(UiEvent::GifResults(list)),
+                                            Ok(Err(e)) => send(UiEvent::Info(format!("GIF-Suche: {e}"))),
+                                            Err(e) => send(UiEvent::Info(format!("GIF-Suche: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::SendGif { chat, gif } => {
+                                    let dir = media_dir.clone();
+                                    tokio::spawn(async move {
+                                        use whatsapp_rust::wacore::download::MediaType as M;
+                                        let url = gif.mp4.clone();
+                                        let data = match tokio::task::spawn_blocking(move || {
+                                            ureq::get(&url).call().map_err(|e| e.to_string())?.body_mut().with_config().limit(20 * 1024 * 1024).read_to_vec().map_err(|e| e.to_string())
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(d)) => d,
+                                            Ok(Err(e)) => {
+                                                send(UiEvent::Info(format!("GIF laden: {e}")));
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                send(UiEvent::Info(format!("GIF laden: {e}")));
+                                                return;
+                                            }
+                                        };
+                                        let (w, h, thumb) = (gif.w, gif.h, gif.thumb.clone());
+                                        let mref = MediaRef { kind: "gif".into(), mime: "video/mp4".into(), len: data.len() as u64, w, h, ..Default::default() };
+                                        let r = upload_and_send(&client, &send, &dir, &chat, data, mref, String::new(), M::Video, move |up| wa::Message {
+                                            video_message: whatsapp_rust::waproto::buffa::MessageField::some(wa::message::VideoMessage {
+                                                url: Some(up.url.clone()),
+                                                direct_path: Some(up.direct_path.clone()),
+                                                media_key: Some(up.media_key.to_vec()),
+                                                file_sha256: Some(up.file_sha256.to_vec()),
+                                                file_enc_sha256: Some(up.file_enc_sha256.to_vec()),
+                                                file_length: Some(up.file_length),
+                                                media_key_timestamp: Some(up.media_key_timestamp),
+                                                mimetype: Some("video/mp4".into()),
+                                                width: Some(w),
+                                                height: Some(h),
+                                                gif_playback: Some(true),
+                                                jpeg_thumbnail: (!thumb.is_empty()).then_some(thumb),
+                                                ..Default::default()
+                                            }),
+                                            ..Default::default()
+                                        })
+                                        .await;
+                                        if let Err(e) = r {
+                                            log(format!("GIF senden fehlgeschlagen: {e}"));
                                         }
                                     });
                                 }
