@@ -1,3 +1,5 @@
+#[macro_use]
+mod i18n;
 mod audio;
 mod backend;
 mod call;
@@ -54,6 +56,8 @@ struct Settings {
     keep_deleted: bool,
     /// Nur lokal angeheftete Chats (über die 3 von WhatsApp hinaus)
     local_pins: Vec<String>,
+    /// Sprache: "" = Systemsprache, "de" oder "en"
+    lang: String,
 }
 
 impl Default for Settings {
@@ -81,6 +85,7 @@ impl Default for Settings {
             skin_tone: 0,
             keep_deleted: false,
             local_pins: Vec::new(),
+            lang: String::new(),
         }
     }
 }
@@ -172,7 +177,7 @@ fn fmt_list_time(ts: i64) -> String {
     if day == today {
         d.format("%H:%M").to_string()
     } else if today.signed_duration_since(day).num_days() == 1 {
-        "Gestern".to_owned()
+        t!("Gestern", "Yesterday").to_owned()
     } else {
         d.format("%d.%m.%y").to_string()
     }
@@ -184,8 +189,8 @@ fn day_label(ts: i64) -> String {
     let today = chrono::Local::now().date_naive();
     let day = d.date_naive();
     match today.signed_duration_since(day).num_days() {
-        0 => "Heute".to_owned(),
-        1 => "Gestern".to_owned(),
+        0 => t!("Heute", "Today").to_owned(),
+        1 => t!("Gestern", "Yesterday").to_owned(),
         _ => d.format("%d.%m.%Y").to_string(),
     }
 }
@@ -231,7 +236,9 @@ enum Filter {
     Groups,
 }
 
-const MUTE_OPTS: &[(&str, Option<i64>)] = &[("8 Stunden", Some(8 * 3600)), ("1 Woche", Some(7 * 86_400)), ("Immer", None)];
+fn mute_opts() -> [(&'static str, Option<i64>); 3] {
+    [(t!("8 Stunden", "8 hours"), Some(8 * 3600)), (t!("1 Woche", "1 week"), Some(7 * 86_400)), (t!("Immer", "Always"), None)]
+}
 
 /// Aktion auf eine einzelne Nachricht.
 enum MsgAct {
@@ -364,11 +371,20 @@ struct App {
     status_seen: HashSet<String>,
     status_text: String,
     status_color: usize,
-    channels: Vec<(String, String, u64)>,
+    channels: Vec<backend::Channel>,
     channels_loaded: bool,
     /// Ausgewählter Kanal und seine Beiträge
     channel_sel: Option<String>,
-    channel_posts: HashMap<String, Vec<(i64, String, String)>>,
+    channel_posts: HashMap<String, Vec<backend::ChannelPost>>,
+    channel_search: String,
+    channel_results: Vec<backend::Channel>,
+    channel_link: String,
+    /// Kanal anlegen: (Name, Beschreibung)
+    channel_new: Option<(String, String)>,
+    channel_post_text: String,
+    channel_refresh: Option<std::time::Instant>,
+    /// 0 = Status, 1 = Kanäle finden
+    news_tab: u8,
 }
 
 fn user_of(key: &str) -> String {
@@ -695,6 +711,7 @@ impl App {
             v.dedup();
             *list = v;
         }
+        apply_lang(&settings.lang);
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, settings.dark, settings.font_size);
 
@@ -707,7 +724,7 @@ impl App {
             cmd,
             store,
             conn: Conn::Starting,
-            status: "Starte …".into(),
+            status: t!("Starte …", "Starting …").into(),
             qr: None,
             chats: HashMap::new(),
             msg_index: HashMap::new(),
@@ -787,6 +804,13 @@ impl App {
             channels_loaded: false,
             channel_sel: None,
             channel_posts: HashMap::new(),
+            channel_search: String::new(),
+            channel_results: Vec::new(),
+            channel_link: String::new(),
+            channel_new: None,
+            channel_post_text: String::new(),
+            channel_refresh: None,
+            news_tab: 0,
         };
         for r in recs {
             app.apply_rec(r);
@@ -1081,7 +1105,7 @@ impl App {
         }
         if chat.name == chat.jid.user.as_str() {
             return if chat.is_group {
-                "Gruppe".to_owned()
+                t!("Gruppe", "Group").to_owned()
             } else {
                 format!("+{}", chat.jid.user)
             };
@@ -1230,7 +1254,7 @@ impl App {
         let Some((pcm, ch, _)) = self.decoded.get(id).cloned() else { return };
         match audio::play(id, &pcm, ch, from, &data_dir().join("tmp")) {
             Ok(p) => self.player = Some(p),
-            Err(e) => self.info = Some(format!("Abspielen nicht möglich: {e}")),
+            Err(e) => self.info = Some(tf!("Abspielen nicht möglich: {e}", "Playback not possible: {e}")),
         }
     }
 
@@ -1334,7 +1358,7 @@ impl App {
         let quote = backend::Quote {
             id: m.id.clone(),
             sender: if m.from_me { String::new() } else if m.sender.is_empty() { jid.to_string() } else { m.sender.clone() },
-            name: if m.from_me { "Du".into() } else { m.sender_name.clone() },
+            name: if m.from_me { t!("Du", "You").into() } else { m.sender_name.clone() },
             text: match &m.media {
                 Some(md) if m.text.is_empty() => md.label(),
                 _ => m.text.clone(),
@@ -1407,7 +1431,7 @@ impl App {
                 m.x.deleted = true;
                 return;
             }
-            m.text = "🚫 Diese Nachricht wurde gelöscht.".into();
+            m.text = t!("🚫 Diese Nachricht wurde gelöscht.", "🚫 This message was deleted.").into();
             m.media = None;
             m.quote = None;
             m.x = backend::MsgExtra::default();
@@ -1492,7 +1516,7 @@ impl App {
                     if !self.settings.local_pins.contains(&user) {
                         self.settings.local_pins.push(user);
                     }
-                    self.info = Some("Nur in WhatsSnap angeheftet (am Handy sind höchstens 3 möglich).".into());
+                    self.info = Some(t!("Nur in WhatsSnap angeheftet (am Handy sind höchstens 3 möglich).", "Pinned in WhatsSnap only (the phone allows at most 3).").into());
                 } else {
                     let was_local = self.settings.local_pins.contains(&user);
                     self.settings.local_pins.retain(|u| *u != user);
@@ -1585,7 +1609,7 @@ impl App {
                             m.status = 9;
                         }
                     }
-                    self.info = Some(format!("Senden fehlgeschlagen: {err}"));
+                    self.info = Some(tf!("Senden fehlgeschlagen: {err}", "Sending failed: {err}"));
                 }
                 UiEvent::Receipt { ids, status } => {
                     for id in ids {
@@ -1615,7 +1639,16 @@ impl App {
                     self.privacy = list.into_iter().collect();
                 }
                 UiEvent::Blocklist(list) => self.blocklist = list,
-                UiEvent::Channels(list) => self.channels = list,
+                UiEvent::Channels(list) => {
+                    self.channels = list;
+                    self.channels_loaded = true;
+                }
+                UiEvent::ChannelSearch(list) => {
+                    if list.is_empty() {
+                        self.info = Some(t!("Keine Kanäle gefunden.", "No channels found.").into());
+                    }
+                    self.channel_results = list;
+                }
                 UiEvent::ChannelPosts { jid, posts } => {
                     self.channel_posts.insert(jid, posts);
                 }
@@ -1629,15 +1662,15 @@ impl App {
                     self.call_in = None;
                     let muted = self.call.as_ref().map(|c| c.3).unwrap_or(false);
                     let started = self.call.as_ref().map(|c| c.2).unwrap_or_else(std::time::Instant::now);
-                    let started = if text == "Verbunden" && self.call.as_ref().map(|c| c.1 != "Verbunden").unwrap_or(true) { std::time::Instant::now() } else { started };
+                    let started = if text == t!("Verbunden", "Connected") && self.call.as_ref().map(|c| c.1 != t!("Verbunden", "Connected")).unwrap_or(true) { std::time::Instant::now() } else { started };
                     self.call = Some((peer, text, started, muted));
                 }
                 UiEvent::CallEnded(reason) => {
                     self.call_in = None;
                     if let Some((peer, text, start, _)) = self.call.take() {
-                        let secs = if text == "Verbunden" { start.elapsed().as_secs() } else { 0 };
+                        let secs = if text == t!("Verbunden", "Connected") { start.elapsed().as_secs() } else { 0 };
                         let name = self.name_for_user(&peer).unwrap_or_else(|| format!("+{peer}"));
-                        self.info = Some(if secs > 0 { format!("{reason} – {name}, {}:{:02}", secs / 60, secs % 60) } else { format!("{reason} – {name}") });
+                        self.info = Some(if secs > 0 { tf!("{reason} – {name}, {}:{:02}", "{reason} – {name}, {}:{:02}", secs / 60, secs % 60) } else { tf!("{reason} – {name}", "{reason} – {name}") });
                     } else {
                         self.info = Some(reason);
                     }
@@ -1686,7 +1719,7 @@ impl App {
                         })
                         .collect();
                     if self.gif_results.is_empty() {
-                        self.info = Some("Keine GIFs gefunden.".into());
+                        self.info = Some(t!("Keine GIFs gefunden.", "No GIFs found.").into());
                     }
                 }
                 UiEvent::Members { group, members } => {
@@ -1792,7 +1825,7 @@ impl App {
                 .chats
                 .values()
                 .map(|c| (c.jid.user.to_string(), self.display_name(c)))
-                .filter(|(u, n)| !n.ends_with(u.as_str()) && n != "Gruppe")
+                .filter(|(u, n)| !n.ends_with(u.as_str()) && n != t!("Gruppe", "Group"))
                 .collect();
         }
     }
@@ -1864,7 +1897,7 @@ impl App {
 
     fn qr_view(&self, ui: &mut egui::Ui, data: &str) {
         let Ok(code) = qrcode::QrCode::new(data.as_bytes()) else {
-            ui.label("QR-Code konnte nicht erzeugt werden.");
+            ui.label(t!("QR-Code konnte nicht erzeugt werden.", "Could not create QR code."));
             return;
         };
         let n = code.width();
@@ -1924,15 +1957,15 @@ fn paint_pattern(ui: &egui::Ui, rect: egui::Rect, pal: &Palette) {
 
 impl App {
     fn settings_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pal: &Palette) {
-        const PAGES: [(&str, &str, &str); 8] = [
-            ("👤", "Profil", "Name, Info, Profilbild"),
-            ("🔑", "Konto", "Nummer, Abmelden"),
-            ("🔒", "Datenschutz", "Zuletzt online, Lesebestätigungen, Blockiert"),
-            ("💬", "Chats", "Design, Schrift, Enter zum Senden"),
-            ("🔔", "Benachrichtigungen", "Nachrichten, Gruppen, Ton"),
-            ("💾", "Speicher und Daten", "Automatischer Download, Speicherplatz"),
-            ("⚡", "WhatsSnap", "Tray, Autostart, Online-Status, GIFs"),
-            ("❓", "Hilfe", "Fehler melden, Version, Lizenzen"),
+        let pages: [(&str, &str, &str); 8] = [
+            ("👤", t!("Profil", "Profile"), t!("Name, Info, Profilbild", "Name, about, profile photo")),
+            ("🔑", t!("Konto", "Account"), t!("Nummer, Abmelden", "Number, log out")),
+            ("🔒", t!("Datenschutz", "Privacy"), t!("Zuletzt online, Lesebestätigungen, Blockiert", "Last seen, read receipts, blocked")),
+            ("💬", t!("Chats", "Chats"), t!("Design, Schrift, Enter zum Senden", "Theme, font, Enter to send")),
+            ("🔔", t!("Benachrichtigungen", "Notifications"), t!("Nachrichten, Gruppen, Ton", "Messages, groups, sound")),
+            ("💾", t!("Speicher und Daten", "Storage and data"), t!("Automatischer Download, Speicherplatz", "Auto-download, storage usage")),
+            ("⚡", t!("WhatsSnap", "WhatsSnap"), t!("Tray, Autostart, Online-Status, GIFs", "Tray, autostart, online status, GIFs")),
+            ("❓", t!("Hilfe", "Help"), t!("Fehler melden, Version, Lizenzen", "Report bugs, version, licenses")),
         ];
         let mut changed = false;
         let mut theme_changed = false;
@@ -1943,10 +1976,10 @@ impl App {
                 ui.add_space(20.0);
                 ui.horizontal(|ui| {
                     ui.add_space(24.0);
-                    ui.label(RichText::new("Einstellungen").size(22.0).family(theme::bold()));
+                    ui.label(RichText::new(t!("Einstellungen", "Settings")).size(22.0).family(theme::bold()));
                 });
                 ui.add_space(12.0);
-                for (i, (icon, title, sub)) in PAGES.iter().enumerate() {
+                for (i, (icon, title, sub)) in pages.iter().enumerate() {
                     let on = self.settings_page == i as u8;
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(292.0, 58.0), egui::Sense::click());
                     let r = rect.shrink2(egui::vec2(8.0, 2.0));
@@ -1975,7 +2008,7 @@ impl App {
                         ui.vertical(|ui| {
                             ui.set_max_width(520.0);
                             ui.add_space(22.0);
-                            let (_, title, _) = PAGES[self.settings_page as usize];
+                            let (_, title, _) = pages[self.settings_page as usize];
                             ui.label(RichText::new(title).size(20.0).family(theme::bold()));
                             ui.add_space(10.0);
                             match self.settings_page {
@@ -2007,19 +2040,19 @@ impl App {
         ui.horizontal(|ui| {
             draw_avatar(ui, self.avatars.get(&me), &self.settings.profile_name, 96.0, self.settings.dark);
             ui.add_space(12.0);
-            if ui.button("Profilbild ändern …").clicked() {
+            if ui.button(t!("Profilbild ändern …", "Change profile photo …")).clicked() {
                 let _ = self.cmd.send(Cmd::SetProfilePicture(None));
             }
         });
         ui.add_space(10.0);
-        ui.label(RichText::new("Name").small().color(pal.dim));
+        ui.label(RichText::new(t!("Name", "Name")).small().color(pal.dim));
         ui.add(egui::TextEdit::singleline(&mut self.settings.profile_name).desired_width(360.0).margin(egui::vec2(10.0, 7.0)));
-        ui.label(RichText::new("Diesen Namen sehen deine Kontakte, wenn sie dich nicht gespeichert haben.").small().color(pal.dim));
+        ui.label(RichText::new(t!("Diesen Namen sehen deine Kontakte, wenn sie dich nicht gespeichert haben.", "Your contacts see this name if they haven't saved you.")).small().color(pal.dim));
         ui.add_space(8.0);
-        ui.label(RichText::new("Info").small().color(pal.dim));
+        ui.label(RichText::new(t!("Info", "About")).small().color(pal.dim));
         ui.add(egui::TextEdit::singleline(&mut self.settings.profile_about).desired_width(360.0).margin(egui::vec2(10.0, 7.0)));
         ui.add_space(8.0);
-        if ui.button("Bei WhatsApp speichern").clicked() {
+        if ui.button(t!("Bei WhatsApp speichern", "Save to WhatsApp")).clicked() {
             if !self.settings.profile_name.trim().is_empty() {
                 let _ = self.cmd.send(Cmd::SetPushName(self.settings.profile_name.trim().to_owned()));
             }
@@ -2032,38 +2065,38 @@ impl App {
 
     fn page_account(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         let num = self.me.iter().find(|u| u.len() <= 15).cloned().unwrap_or_default();
-        ui.label(RichText::new("Telefonnummer").small().color(pal.dim));
+        ui.label(RichText::new(t!("Telefonnummer", "Phone number")).small().color(pal.dim));
         ui.label(RichText::new(if num.is_empty() { "–".to_owned() } else { format!("+{num}") }).size(15.0));
         ui.add_space(8.0);
-        ui.label(RichText::new("Verbindung").small().color(pal.dim));
+        ui.label(RichText::new(t!("Verbindung", "Connection")).small().color(pal.dim));
         ui.label(RichText::new(match self.conn {
-            Conn::Online => "Verbunden",
-            Conn::LoggedOut => "Abgemeldet",
-            Conn::NeedsQr => "Nicht verknüpft",
-            Conn::Starting => "Verbinde …",
+            Conn::Online => t!("Verbunden", "Connected"),
+            Conn::LoggedOut => t!("Abgemeldet", "Logged out"),
+            Conn::NeedsQr => t!("Nicht verknüpft", "Not linked"),
+            Conn::Starting => t!("Verbinde …", "Connecting …"),
         }));
         ui.add_space(16.0);
-        ui.label(RichText::new("Dieses Gerät erscheint am Handy unter WhatsApp → Verknüpfte Geräte. Nummer ändern, Konto löschen und Sicherheitsbenachrichtigungen gibt es nur in der Handy-App.").small().color(pal.dim));
+        ui.label(RichText::new(t!("Dieses Gerät erscheint am Handy unter WhatsApp → Verknüpfte Geräte. Nummer ändern, Konto löschen und Sicherheitsbenachrichtigungen gibt es nur in der Handy-App.", "This device appears on your phone under WhatsApp → Linked devices. Changing your number, deleting your account and security notifications are only available in the phone app.")).small().color(pal.dim));
         ui.add_space(12.0);
         if self.confirm == Some(1) {
-            ui.label(RichText::new("Wirklich abmelden? WhatsSnap wird vom Handy getrennt, danach ist ein neuer QR-Scan nötig.").color(pal.danger));
+            ui.label(RichText::new(t!("Wirklich abmelden? WhatsSnap wird vom Handy getrennt, danach ist ein neuer QR-Scan nötig.", "Really log out? WhatsSnap will be unlinked from your phone; you'll need to scan a new QR code.")).color(pal.danger));
             ui.horizontal(|ui| {
-                if ui.button("Ja, abmelden").clicked() {
+                if ui.button(t!("Ja, abmelden", "Yes, log out")).clicked() {
                     let _ = self.cmd.send(Cmd::Logout);
                     self.confirm = None;
                 }
-                if ui.button("Abbrechen").clicked() {
+                if ui.button(t!("Abbrechen", "Cancel")).clicked() {
                     self.confirm = None;
                 }
             });
-        } else if ui.button(RichText::new("Abmelden").color(pal.danger)).clicked() {
+        } else if ui.button(RichText::new(t!("Abmelden", "Log out")).color(pal.danger)).clicked() {
             self.confirm = Some(1);
         }
         ui.add_space(8.0);
         if self.confirm == Some(2) {
-            ui.label(RichText::new("Gespeicherten Verlauf, Medien und Profilbilder auf diesem PC löschen? Die Chats am Handy bleiben.").color(pal.danger));
+            ui.label(RichText::new(t!("Gespeicherten Verlauf, Medien und Profilbilder auf diesem PC löschen? Die Chats am Handy bleiben.", "Delete saved history, media and profile photos on this PC? Your chats on the phone stay.")).color(pal.danger));
             ui.horizontal(|ui| {
-                if ui.button("Ja, löschen").clicked() {
+                if ui.button(t!("Ja, löschen", "Yes, delete")).clicked() {
                     let d = data_dir();
                     let _ = std::fs::write(d.join("history.jsonl"), b"");
                     let _ = std::fs::remove_dir_all(d.join("media"));
@@ -2073,14 +2106,14 @@ impl App {
                     self.selected = None;
                     self.images.clear();
                     self.img_requested.clear();
-                    self.info = Some("Lokale Daten gelöscht. Neue Nachrichten kommen weiter an.".into());
+                    self.info = Some(t!("Lokale Daten gelöscht. Neue Nachrichten kommen weiter an.", "Local data deleted. New messages keep arriving.").into());
                     self.confirm = None;
                 }
-                if ui.button("Abbrechen").clicked() {
+                if ui.button(t!("Abbrechen", "Cancel")).clicked() {
                     self.confirm = None;
                 }
             });
-        } else if ui.button("Lokale Daten löschen …").clicked() {
+        } else if ui.button(t!("Lokale Daten löschen …", "Delete local data …")).clicked() {
             self.confirm = Some(2);
         }
     }
@@ -2092,17 +2125,17 @@ impl App {
             let _ = self.cmd.send(Cmd::FetchBlocklist);
         }
         if self.conn != Conn::Online {
-            ui.label(RichText::new("Nur verfügbar, wenn WhatsSnap verbunden ist.").color(pal.dim));
+            ui.label(RichText::new(t!("Nur verfügbar, wenn WhatsSnap verbunden ist.", "Only available while WhatsSnap is connected.")).color(pal.dim));
             return;
         }
-        let opts_std: &[(&str, &str)] = &[("all", "Alle"), ("contacts", "Meine Kontakte"), ("none", "Niemand")];
+        let opts_std: &[(&str, &str)] = &[("all", t!("Alle", "Everyone")), ("contacts", t!("Meine Kontakte", "My contacts")), ("none", t!("Niemand", "Nobody"))];
         let rows: [(&str, &str, &[(&str, &str)]); 6] = [
-            ("last", "Zuletzt online", opts_std),
-            ("online", "Wer sieht, wenn ich online bin", &[("all", "Alle"), ("matchlastseen", "Wie „Zuletzt online“")]),
-            ("profile", "Profilbild", opts_std),
-            ("status", "Info", opts_std),
-            ("groupadd", "Wer mich zu Gruppen hinzufügen darf", &[("all", "Alle"), ("contacts", "Meine Kontakte")]),
-            ("calladd", "Anrufe von Unbekannten", &[("all", "Zulassen"), ("known", "Stummschalten")]),
+            ("last", t!("Zuletzt online", "Last seen"), opts_std),
+            ("online", t!("Wer sieht, wenn ich online bin", "Who can see when I'm online"), &[("all", t!("Alle", "Everyone")), ("matchlastseen", t!("Wie „Zuletzt online“", "Same as last seen"))]),
+            ("profile", t!("Profilbild", "Profile photo"), opts_std),
+            ("status", t!("Info", "About"), opts_std),
+            ("groupadd", t!("Wer mich zu Gruppen hinzufügen darf", "Who can add me to groups"), &[("all", t!("Alle", "Everyone")), ("contacts", t!("Meine Kontakte", "My contacts"))]),
+            ("calladd", t!("Anrufe von Unbekannten", "Calls from unknown numbers"), &[("all", t!("Zulassen", "Allow")), ("known", t!("Stummschalten", "Silence"))]),
         ];
         let mut set: Option<(String, String)> = None;
         for (cat, label, opts) in rows {
@@ -2120,33 +2153,33 @@ impl App {
         ui.add_space(8.0);
         let rr = self.privacy.get("readreceipts").map(|v| v != "none").unwrap_or(true);
         let mut rr2 = rr;
-        if toggle(ui, &mut rr2, "Lesebestätigungen (blaue Haken)", pal).changed() {
+        if toggle(ui, &mut rr2, t!("Lesebestätigungen (blaue Haken)", "Read receipts (blue ticks)"), pal).changed() {
             set = Some(("readreceipts".into(), if rr2 { "all".into() } else { "none".into() }));
         }
-        ui.label(RichText::new("Wenn aus, siehst du auch die Lesebestätigungen anderer nicht. In Gruppen werden sie immer gesendet.").small().color(pal.dim));
+        ui.label(RichText::new(t!("Wenn aus, siehst du auch die Lesebestätigungen anderer nicht. In Gruppen werden sie immer gesendet.", "If off, you won't see other people's read receipts either. Read receipts are always sent in groups.")).small().color(pal.dim));
         if let Some((c, v)) = set {
             self.privacy.insert(c.clone(), v.clone());
             let _ = self.cmd.send(Cmd::SetPrivacy { cat: c, val: v });
         }
         ui.add_space(14.0);
-        ui.label(RichText::new("Standarddauer für selbstlöschende Nachrichten (neue Chats)").size(14.5));
+        ui.label(RichText::new(t!("Standarddauer für selbstlöschende Nachrichten (neue Chats)", "Default timer for disappearing messages (new chats)")).size(14.5));
         ui.horizontal_wrapped(|ui| {
-            for (secs, l) in [(0u32, "Aus"), (86_400, "24 Stunden"), (604_800, "7 Tage"), (7_776_000, "90 Tage")] {
+            for (secs, l) in [(0u32, t!("Aus", "Off")), (86_400, t!("24 Stunden", "24 hours")), (604_800, t!("7 Tage", "7 days")), (7_776_000, t!("90 Tage", "90 days"))] {
                 if ui.button(l).clicked() {
                     let _ = self.cmd.send(Cmd::SetDefaultDisappearing(secs));
-                    self.info = Some(format!("Standard für selbstlöschende Nachrichten: {l}"));
+                    self.info = Some(tf!("Standard für selbstlöschende Nachrichten: {l}", "Default for disappearing messages: {l}"));
                 }
             }
         });
         ui.add_space(14.0);
-        ui.label(RichText::new(format!("Blockierte Kontakte ({})", self.blocklist.len())).size(14.5));
+        ui.label(RichText::new(tf!("Blockierte Kontakte ({})", "Blocked contacts ({})", self.blocklist.len())).size(14.5));
         let mut unblock = None;
         for j in &self.blocklist {
             let u = user_of(j);
             let name = self.names.get(&u).map(|n| n.0.clone()).unwrap_or_else(|| format!("+{u}"));
             ui.horizontal(|ui| {
                 ui.label(name);
-                if ui.small_button("Freigeben").clicked() {
+                if ui.small_button(t!("Freigeben", "Unblock")).clicked() {
                     unblock = Some(j.clone());
                 }
             });
@@ -2154,85 +2187,96 @@ impl App {
         if let Some(j) = unblock.and_then(|j| j.parse::<Jid>().ok()) {
             let _ = self.cmd.send(Cmd::Block { jid: j, on: false });
         }
-        ui.label(RichText::new("Blockieren geht über das ⋮-Menü im Chat.").small().color(pal.dim));
+        ui.label(RichText::new(t!("Blockieren geht über das ⋮-Menü im Chat.", "Block someone via the ⋮ menu in their chat.")).small().color(pal.dim));
     }
 
     fn page_chats(&mut self, ui: &mut egui::Ui, pal: &Palette, changed: &mut bool, theme_changed: &mut bool) {
-        ui.label(RichText::new("Design").size(14.5));
+        ui.label(RichText::new("Sprache / Language").size(14.5));
         ui.horizontal(|ui| {
-            *theme_changed |= ui.radio_value(&mut self.settings.dark, true, "Dunkel").changed();
-            *theme_changed |= ui.radio_value(&mut self.settings.dark, false, "Hell").changed();
+            for (v, l) in [("", t!("Systemsprache", "System language")), ("de", "Deutsch"), ("en", "English")] {
+                if ui.radio(self.settings.lang == v, l).clicked() && self.settings.lang != v {
+                    self.settings.lang = v.to_owned();
+                    apply_lang(v);
+                    *changed = true;
+                }
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(RichText::new(t!("Design", "Theme")).size(14.5));
+        ui.horizontal(|ui| {
+            *theme_changed |= ui.radio_value(&mut self.settings.dark, true, t!("Dunkel", "Dark")).changed();
+            *theme_changed |= ui.radio_value(&mut self.settings.dark, false, t!("Hell", "Light")).changed();
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("Schriftgröße");
+            ui.label(t!("Schriftgröße", "Font size"));
             *theme_changed |= ui.add(egui::Slider::new(&mut self.settings.font_size, 12.0..=20.0)).changed();
         });
         ui.add_space(8.0);
-        *changed |= toggle(ui, &mut self.settings.enter_sends, "Enter sendet die Nachricht (sonst Strg+Enter)", pal).changed();
-        ui.label(RichText::new("Zeilenumbruch: Shift+Enter").small().color(pal.dim));
+        *changed |= toggle(ui, &mut self.settings.enter_sends, t!("Enter sendet die Nachricht (sonst Strg+Enter)", "Enter sends the message (otherwise Ctrl+Enter)"), pal).changed();
+        ui.label(RichText::new(t!("Zeilenumbruch: Shift+Enter", "New line: Shift+Enter")).small().color(pal.dim));
     }
 
     fn page_notify(&mut self, ui: &mut egui::Ui, pal: &Palette, changed: &mut bool) {
-        *changed |= toggle(ui, &mut self.settings.notifications, "Benachrichtigungen für Nachrichten", pal).changed();
-        *changed |= toggle(ui, &mut self.settings.notify_groups, "Benachrichtigungen für Gruppen", pal).changed();
-        *changed |= toggle(ui, &mut self.settings.preview, "Nachrichtentext anzeigen", pal).changed();
-        *changed |= toggle(ui, &mut self.settings.sound, "Ton abspielen", pal).changed();
+        *changed |= toggle(ui, &mut self.settings.notifications, t!("Benachrichtigungen für Nachrichten", "Notifications for messages"), pal).changed();
+        *changed |= toggle(ui, &mut self.settings.notify_groups, t!("Benachrichtigungen für Gruppen", "Notifications for groups"), pal).changed();
+        *changed |= toggle(ui, &mut self.settings.preview, t!("Nachrichtentext anzeigen", "Show message text"), pal).changed();
+        *changed |= toggle(ui, &mut self.settings.sound, t!("Ton abspielen", "Play sound"), pal).changed();
         ui.add_space(8.0);
-        if ui.button("Test-Benachrichtigung senden").clicked() {
+        if ui.button(t!("Test-Benachrichtigung senden", "Send test notification")).clicked() {
             let _ = self.cmd.send(Cmd::TestNotify);
             if self.settings.sound {
                 backend::play_notify_sound();
             }
         }
         ui.add_space(6.0);
-        ui.label(RichText::new("Einzelne Chats stummschalten: Rechtsklick auf den Chat. Das wird mit WhatsApp abgeglichen.").small().color(pal.dim));
+        ui.label(RichText::new(t!("Einzelne Chats stummschalten: Rechtsklick auf den Chat. Das wird mit WhatsApp abgeglichen.", "Mute single chats: right-click the chat. This is synced with WhatsApp.")).small().color(pal.dim));
     }
 
     fn page_storage(&mut self, ui: &mut egui::Ui, pal: &Palette, changed: &mut bool) {
-        *changed |= toggle(ui, &mut self.settings.autoload, "Fotos und Sticker automatisch herunterladen", pal).changed();
-        ui.label(RichText::new("Videos, Dokumente und Sprachnachrichten werden immer erst beim Anklicken geladen.").small().color(pal.dim));
+        *changed |= toggle(ui, &mut self.settings.autoload, t!("Fotos und Sticker automatisch herunterladen", "Download photos and stickers automatically"), pal).changed();
+        ui.label(RichText::new(t!("Videos, Dokumente und Sprachnachrichten werden immer erst beim Anklicken geladen.", "Videos, documents and voice messages are only downloaded when you click them.")).small().color(pal.dim));
         ui.add_space(12.0);
         let size = dir_size(&data_dir().join("media")) + dir_size(&data_dir().join("avatars"));
-        ui.label(RichText::new(format!("Belegt durch Medien: {}", fmt_size(size))).size(14.5));
-        if ui.button("Heruntergeladene Medien löschen").clicked() {
+        ui.label(RichText::new(tf!("Belegt durch Medien: {}", "Used by media: {}", fmt_size(size))).size(14.5));
+        if ui.button(t!("Heruntergeladene Medien löschen", "Delete downloaded media")).clicked() {
             let _ = std::fs::remove_dir_all(data_dir().join("media"));
             self.images.clear();
             self.img_requested.clear();
             self.decoded.clear();
-            self.info = Some("Medien gelöscht. Sie werden bei Bedarf neu geladen.".into());
+            self.info = Some(t!("Medien gelöscht. Sie werden bei Bedarf neu geladen.", "Media deleted. It will be downloaded again when needed.").into());
         }
     }
 
     fn page_wasnap(&mut self, ui: &mut egui::Ui, pal: &Palette, changed: &mut bool) {
-        *changed |= toggle(ui, &mut self.settings.background, "Beim Schließen im Hintergrund weiterlaufen (Symbol in der Leiste)", pal).changed();
-        if toggle(ui, &mut self.autostart, "Beim Anmelden am PC automatisch starten (unsichtbar in der Leiste)", pal).changed() {
+        *changed |= toggle(ui, &mut self.settings.background, t!("Beim Schließen im Hintergrund weiterlaufen (Symbol in der Leiste)", "Keep running in the background when closed (icon in the panel)"), pal).changed();
+        if toggle(ui, &mut self.autostart, t!("Beim Anmelden am PC automatisch starten (unsichtbar in der Leiste)", "Start automatically when logging in (hidden in the panel)"), pal).changed() {
             if let Err(e) = set_autostart(self.autostart) {
-                self.info = Some(format!("Autostart: {e}"));
+                self.info = Some(tf!("Autostart: {e}", "Autostart: {e}"));
                 self.autostart = !self.autostart;
             }
         }
         ui.add_space(8.0);
-        *changed |= toggle(ui, &mut self.settings.show_online, "Online anzeigen, solange das Fenster aktiv ist", pal).changed();
-        ui.label(RichText::new("Aus: andere sehen dich über WhatsSnap nie online. Dein Handy bekommt dann weiter alle Benachrichtigungen.").small().color(pal.dim));
-        *changed |= toggle(ui, &mut self.settings.send_typing, "Anderen „schreibt …“ anzeigen", pal).changed();
+        *changed |= toggle(ui, &mut self.settings.show_online, t!("Online anzeigen, solange das Fenster aktiv ist", "Show me online while the window is active"), pal).changed();
+        ui.label(RichText::new(t!("Aus: andere sehen dich über WhatsSnap nie online. Dein Handy bekommt dann weiter alle Benachrichtigungen.", "Off: others never see you online via WhatsSnap. Your phone keeps receiving all notifications.")).small().color(pal.dim));
+        *changed |= toggle(ui, &mut self.settings.send_typing, t!("Anderen „schreibt …“ anzeigen", "Show others when I'm typing"), pal).changed();
         ui.add_space(8.0);
-        ui.label(RichText::new("Zusatzfunktionen").size(14.5));
-        *changed |= toggle(ui, &mut self.settings.keep_deleted, "Gelöschte Nachrichten anderer weiter anzeigen", pal).changed();
-        ui.label(RichText::new("Bleiben mit „🚫 gelöscht“ markiert sichtbar. Wirkt auch für ältere, schon gespeicherte Löschungen (nach Neustart). Fotos nur, wenn sie vorher geladen waren.").small().color(pal.dim));
-        ui.label(RichText::new("Frühere Fassungen bearbeiteter Nachrichten: Maus über „Bearbeitet ⓘ“ halten. Mehr als 3 Chats anheften geht immer; ab dem 4. nur in WhatsSnap.").small().color(pal.dim));
+        ui.label(RichText::new(t!("Zusatzfunktionen", "Extra features")).size(14.5));
+        *changed |= toggle(ui, &mut self.settings.keep_deleted, t!("Gelöschte Nachrichten anderer weiter anzeigen", "Keep showing messages others deleted"), pal).changed();
+        ui.label(RichText::new(t!("Bleiben mit „🚫 gelöscht“ markiert sichtbar. Wirkt auch für ältere, schon gespeicherte Löschungen (nach Neustart). Fotos nur, wenn sie vorher geladen waren.", "They stay visible, marked “🚫 deleted”. Also applies to older deletions already saved (after a restart). Photos only if they were downloaded before.")).small().color(pal.dim));
+        ui.label(RichText::new(t!("Frühere Fassungen bearbeiteter Nachrichten: Maus über „Bearbeitet ⓘ“ halten. Mehr als 3 Chats anheften geht immer; ab dem 4. nur in WhatsSnap.", "Earlier versions of edited messages: hover over “Edited ⓘ”. You can pin more than 3 chats; from the 4th on they're pinned in WhatsSnap only.")).small().color(pal.dim));
         ui.add_space(12.0);
-        ui.label(RichText::new("GIF-Suche: Giphy-API-Schlüssel (kostenlos auf developers.giphy.com)").size(14.0));
+        ui.label(RichText::new(t!("GIF-Suche: Giphy-API-Schlüssel (kostenlos auf developers.giphy.com)", "GIF search: Giphy API key (free at developers.giphy.com)")).size(14.0));
         *changed |= ui.add(egui::TextEdit::singleline(&mut self.settings.giphy_key).desired_width(360.0).margin(egui::vec2(10.0, 7.0))).changed();
         ui.add_space(12.0);
-        ui.label(RichText::new("Tastenkürzel").size(14.5));
+        ui.label(RichText::new(t!("Tastenkürzel", "Keyboard shortcuts")).size(14.5));
         for (k, d) in [
-            ("Strg+F", "Chats und Nachrichten durchsuchen"),
-            ("Strg+N", "Neuer Chat (Nummer eingeben)"),
-            ("Alt+↑ / Alt+↓", "Vorheriger / nächster Chat"),
-            ("Esc", "Antwort, Suche oder Chat schließen"),
-            ("Strg+V", "Bild aus der Zwischenablage senden"),
-            ("Shift+Enter", "Neue Zeile"),
+            (t!("Strg+F", "Ctrl+F"), t!("Chats und Nachrichten durchsuchen", "Search chats and messages")),
+            (t!("Strg+N", "Ctrl+N"), t!("Neuer Chat (Nummer eingeben)", "New chat (enter number)")),
+            ("Alt+↑ / Alt+↓", t!("Vorheriger / nächster Chat", "Previous / next chat")),
+            ("Esc", t!("Antwort, Suche oder Chat schließen", "Close reply, search or chat")),
+            (t!("Strg+V", "Ctrl+V"), t!("Bild aus der Zwischenablage senden", "Send image from clipboard")),
+            ("Shift+Enter", t!("Neue Zeile", "New line")),
         ] {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(k).code());
@@ -2243,23 +2287,23 @@ impl App {
 
     fn page_help(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         ui.label(format!("WhatsSnap {}", env!("CARGO_PKG_VERSION")));
-        ui.label(RichText::new("Inoffizieller WhatsApp-Client für Linux. Nicht von WhatsApp oder Meta.").small().color(pal.dim));
+        ui.label(RichText::new(t!("Inoffizieller WhatsApp-Client für Linux. Nicht von WhatsApp oder Meta.", "Unofficial WhatsApp client for Linux. Not affiliated with WhatsApp or Meta.")).small().color(pal.dim));
         ui.add_space(8.0);
-        ui.hyperlink_to("Projekt auf GitHub", "https://github.com/Xinzoooo/wa-snap");
-        ui.hyperlink_to("Fehler melden", "https://github.com/Xinzoooo/wa-snap/issues");
+        ui.hyperlink_to(t!("Projekt auf GitHub", "Project on GitHub"), "https://github.com/Xinzoooo/wa-snap");
+        ui.hyperlink_to(t!("Fehler melden", "Report a bug"), "https://github.com/Xinzoooo/wa-snap/issues");
         ui.add_space(8.0);
-        if ui.button("Log-Ordner öffnen").clicked() {
+        if ui.button(t!("Log-Ordner öffnen", "Open log folder")).clicked() {
             let _ = std::process::Command::new("xdg-open").arg(data_dir()).spawn();
         }
         ui.add_space(12.0);
-        ui.label(RichText::new("Lizenzen: WhatsSnap MIT · Schrift Inter (OFL 1.1) · Emojis Fluent Emoji (MIT, Microsoft) und Twemoji (CC-BY 4.0) · libopus, libwebp (BSD)").small().color(pal.dim));
+        ui.label(RichText::new(t!("Lizenzen: WhatsSnap MIT · Schrift Inter (OFL 1.1) · Emojis Fluent Emoji (MIT, Microsoft) und Twemoji (CC-BY 4.0) · libopus, libwebp (BSD)", "Licenses: WhatsSnap MIT · Inter font (OFL 1.1) · Emojis Fluent Emoji (MIT, Microsoft) and Twemoji (CC-BY 4.0) · libopus, libwebp (BSD)")).small().color(pal.dim));
     }
 
     /// Emoji-Auswahl wie bei WhatsApp: Suche, Zuletzt, Kategorien, Hauttöne.
     fn emoji_grid(&mut self, ui: &mut egui::Ui, pal: &Palette) {
         const PER_ROW: usize = 9;
         const ROW_H: f32 = 40.0;
-        ui.add(egui::TextEdit::singleline(&mut self.emoji_search).hint_text("🔍 Emoji suchen (z. B. lachen, Herz, Daumen)").desired_width(f32::INFINITY));
+        ui.add(egui::TextEdit::singleline(&mut self.emoji_search).hint_text(t!("🔍 Emoji suchen (z. B. lachen, Herz, Daumen)", "🔍 Search emoji (e.g. laugh, heart, thumbs)")).desired_width(f32::INFINITY));
         let cats = emoji::picker();
         // Zeilen bauen: Überschrift oder bis zu 9 Emojis (mit Hautton-Varianten)
         let mut rows: Vec<(Option<String>, Vec<(String, Vec<String>)>)> = Vec::new();
@@ -2278,19 +2322,19 @@ impl App {
                 .take(200)
                 .map(|i| (i.e.clone(), i.skins.clone()))
                 .collect();
-            rows.push((Some(format!("Suchergebnisse ({})", hits.len())), Vec::new()));
+            rows.push((Some(tf!("Suchergebnisse ({})", "Search results ({})", hits.len())), Vec::new()));
             push_items(&mut rows, hits);
         } else {
             if !self.settings.recent_emojis.is_empty() {
                 cat_rows.push(rows.len());
-                rows.push((Some("Letzte".into()), Vec::new()));
+                rows.push((Some(t!("Letzte", "Recent").into()), Vec::new()));
                 push_items(&mut rows, self.settings.recent_emojis.iter().map(|e| (e.clone(), Vec::new())).collect());
             } else {
                 cat_rows.push(0);
             }
             for (name, items) in cats {
                 cat_rows.push(rows.len());
-                rows.push((Some(name.clone()), Vec::new()));
+                rows.push((Some(i18n::tr(name).to_owned()), Vec::new()));
                 push_items(&mut rows, items.iter().map(|i| (i.e.clone(), i.skins.clone())).collect());
             }
         }
@@ -2395,7 +2439,7 @@ impl App {
                         .filter(|(k, _)| !Self::has(&self.settings.archived, k))
                         .map(|(_, c)| c.unread.min(1))
                         .sum();
-                    let r = icon_button(ui, "💬", 20.0, if chats_on { pal.text } else { pal.dim }, pal, "Chats");
+                    let r = icon_button(ui, "💬", 20.0, if chats_on { pal.text } else { pal.dim }, pal, t!("Chats", "Chats"));
                     if chats_on {
                         ui.painter().circle_filled(r.rect.center(), r.rect.width() / 2.0, pal.selected);
                         ui.painter().text(r.rect.center(), egui::Align2::CENTER_CENTER, "💬", egui::FontId::proportional(20.0), pal.text);
@@ -2413,7 +2457,7 @@ impl App {
                     ui.add_space(4.0);
                     let new_status = self.status_groups().iter().any(|(u, items)| !u.is_empty() && items.iter().any(|m| !self.status_seen.contains(&m.id)));
                     let col = if self.show_status { pal.text } else { pal.dim };
-                    let r = icon_button(ui, "◎", 20.0, col, pal, "Status");
+                    let r = icon_button(ui, "◎", 20.0, col, pal, t!("Aktuelles: Status und Kanäle", "Updates: status and channels"));
                     if self.show_status {
                         ui.painter().circle_filled(r.rect.center(), r.rect.width() / 2.0, pal.selected);
                         ui.painter().text(r.rect.center(), egui::Align2::CENTER_CENTER, "◎", egui::FontId::proportional(20.0), pal.text);
@@ -2428,7 +2472,7 @@ impl App {
                     }
                     ui.add_space(4.0);
                     let col = if self.show_starred { pal.text } else { pal.dim };
-                    let r = icon_button(ui, "☆", 20.0, col, pal, "Markierte Nachrichten");
+                    let r = icon_button(ui, "☆", 20.0, col, pal, t!("Markierte Nachrichten", "Starred messages"));
                     if self.show_starred {
                         ui.painter().circle_filled(r.rect.center(), r.rect.width() / 2.0, pal.selected);
                         ui.painter().text(r.rect.center(), egui::Align2::CENTER_CENTER, "★", egui::FontId::proportional(20.0), pal.text);
@@ -2442,7 +2486,7 @@ impl App {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
                     ui.add_space(12.0);
                     let col = if self.show_settings { pal.text } else { pal.dim };
-                    let r = icon_button(ui, "⚙", 20.0, col, pal, "Einstellungen");
+                    let r = icon_button(ui, "⚙", 20.0, col, pal, t!("Einstellungen", "Settings"));
                     if self.show_settings {
                         ui.painter().circle_filled(r.rect.center(), r.rect.width() / 2.0, pal.selected);
                         ui.painter().text(r.rect.center(), egui::Align2::CENTER_CENTER, "⚙", egui::FontId::proportional(20.0), pal.text);
@@ -2452,7 +2496,7 @@ impl App {
                         self.show_status = false;
                     }
                     let icon = if self.settings.dark { "☀" } else { "🌙" };
-                    if icon_button(ui, icon, 18.0, pal.dim, pal, "Hell/Dunkel").clicked() {
+                    if icon_button(ui, icon, 18.0, pal.dim, pal, t!("Hell/Dunkel", "Light/dark")).clicked() {
                         self.settings.dark = !self.settings.dark;
                         theme::apply(ctx, self.settings.dark, self.settings.font_size);
                         self.save_settings();
@@ -2476,12 +2520,12 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.add_space(20.0);
                     if self.show_archive {
-                        if icon_button(ui, "⬅", 18.0, pal.text, pal, "Zurück").clicked() {
+                        if icon_button(ui, "⬅", 18.0, pal.text, pal, t!("Zurück", "Back")).clicked() {
                             self.show_archive = false;
                         }
-                        ui.label(RichText::new("Archiviert").size(19.0).family(theme::bold()));
+                        ui.label(RichText::new(t!("Archiviert", "Archived")).size(19.0).family(theme::bold()));
                     } else {
-                        ui.label(RichText::new("Chats").size(22.0).family(theme::bold()));
+                        ui.label(RichText::new(t!("Chats", "Chats")).size(22.0).family(theme::bold()));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(14.0);
@@ -2490,24 +2534,24 @@ impl App {
                         ui.painter().rect_filled(rect.shrink(2.0), 12.0, fill);
                         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "+", egui::FontId::new(24.0, theme::bold()), pal.on_accent);
                         let new_id = egui::Id::new("new_menu");
-                        if resp.on_hover_text("Neuer Chat oder neue Gruppe").clicked() {
+                        if resp.on_hover_text(t!("Neuer Chat oder neue Gruppe", "New chat or new group")).clicked() {
                             ui.memory_mut(|m| m.toggle_popup(new_id));
                         }
                         let anchor = ui.interact(rect, egui::Id::new("new_btn_anchor"), egui::Sense::hover());
                         egui::popup::popup_below_widget(ui, new_id, &anchor, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                             ui.set_min_width(200.0);
-                            if ui.button("💬  Neuer Chat (Nummer)").clicked() {
+                            if ui.button(t!("💬  Neuer Chat (Nummer)", "💬  New chat (number)")).clicked() {
                                 ui.memory_mut(|m| m.request_focus(egui::Id::new("list_search")));
-                                self.info = Some("Telefonnummer mit Ländervorwahl in die Suche tippen, z. B. +49 151 …".into());
+                                self.info = Some(t!("Telefonnummer mit Ländervorwahl in die Suche tippen, z. B. +49 151 …", "Type a phone number with country code into the search, e.g. +49 151 …").into());
                             }
-                            if ui.button("👥  Neue Gruppe").clicked() {
+                            if ui.button(t!("👥  Neue Gruppe", "👥  New group")).clicked() {
                                 self.new_group = Some((String::new(), HashSet::new(), String::new()));
                             }
                         });
                         let st = match self.conn {
                             Conn::Online => None,
                             Conn::LoggedOut => Some(("abgemeldet", pal.danger)),
-                            _ => Some(("verbinde …", Color32::from_rgb(0xd9, 0xa4, 0x2b))),
+                            _ => Some((t!("verbinde …", "connecting …"), Color32::from_rgb(0xd9, 0xa4, 0x2b))),
                         };
                         if let Some((t, c)) = st {
                             ui.label(RichText::new(t).small().color(c));
@@ -2529,7 +2573,7 @@ impl App {
                                     egui::TextEdit::singleline(&mut self.search)
                                         .id(egui::Id::new("list_search"))
                                         .frame(false)
-                                        .hint_text("Suchen oder neuen Chat beginnen")
+                                        .hint_text(t!("Suchen oder neuen Chat beginnen", "Search or start a new chat"))
                                         .margin(egui::vec2(4.0, 8.0))
                                         .desired_width(ui.available_width() - 30.0),
                                 );
@@ -2541,7 +2585,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.add_space(16.0);
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        for (f, l) in [(Filter::All, "Alle"), (Filter::Unread, "Ungelesen"), (Filter::Groups, "Gruppen")] {
+                        for (f, l) in [(Filter::All, t!("Alle", "All")), (Filter::Unread, t!("Ungelesen", "Unread")), (Filter::Groups, t!("Gruppen", "Groups"))] {
                             if chip(ui, l, self.filter == f, pal) {
                                 self.filter = f;
                             }
@@ -2568,7 +2612,7 @@ impl App {
                     if !hits.is_empty() {
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            let t = format!("{} Nachrichten {}", hits.len(), if self.show_msg_results { "▾" } else { "▸" });
+                            let t = tf!("{} Nachrichten {}", "{} messages {}", hits.len(), if self.show_msg_results { "▾" } else { "▸" });
                             if ui.add(egui::Label::new(RichText::new(t).size(12.5).color(pal.accent)).sense(egui::Sense::click())).clicked() {
                                 self.show_msg_results = !self.show_msg_results;
                             }
@@ -2613,7 +2657,7 @@ impl App {
                 if digits.len() >= 7 && looks_like_number {
                     ui.horizontal(|ui| {
                         ui.add_space(16.0);
-                        if ui.button(format!("Chat mit +{digits} starten")).clicked() {
+                        if ui.button(tf!("Chat mit +{digits} starten", "Chat with +{digits}")).clicked() {
                             let jid = Jid::pn(digits.clone());
                             let key = jid.to_string();
                             let c = self.chat_entry(&jid, false);
@@ -2634,7 +2678,7 @@ impl App {
                     }
                     let p = ui.painter();
                     p.text(inner.left_center() + egui::vec2(30.0, 0.0), egui::Align2::CENTER_CENTER, "🗄", egui::FontId::proportional(17.0), pal.dim);
-                    p.text(inner.left_center() + egui::vec2(70.0, 0.0), egui::Align2::LEFT_CENTER, "Archiviert", egui::FontId::proportional(15.5), pal.text);
+                    p.text(inner.left_center() + egui::vec2(70.0, 0.0), egui::Align2::LEFT_CENTER, t!("Archiviert", "Archived"), egui::FontId::proportional(15.5), pal.text);
                     p.text(inner.right_center() - egui::vec2(14.0, 0.0), egui::Align2::RIGHT_CENTER, archived_n.to_string(), egui::FontId::proportional(12.5), pal.dim);
                     if resp.clicked() {
                         self.show_archive = true;
@@ -2664,10 +2708,10 @@ impl App {
                     ui.add_space(30.0);
                     ui.vertical_centered(|ui| {
                         let t = match (self.filter, self.show_archive) {
-                            (_, true) => "Keine archivierten Chats",
-                            (Filter::Unread, _) => "Keine ungelesenen Chats",
-                            (Filter::Groups, _) => "Keine Gruppen",
-                            _ => "Noch keine Chats",
+                            (_, true) => t!("Keine archivierten Chats", "No archived chats"),
+                            (Filter::Unread, _) => t!("Keine ungelesenen Chats", "No unread chats"),
+                            (Filter::Groups, _) => t!("Keine Gruppen", "No groups"),
+                            _ => t!("Noch keine Chats", "No chats yet"),
                         };
                         ui.label(RichText::new(t).color(pal.dim));
                     });
@@ -2744,7 +2788,7 @@ impl App {
                         let typing = self.typing.get(user.as_str()).filter(|t| t.2.elapsed().as_secs() < 12);
                         let draft = if sel { None } else { self.drafts.get(key).filter(|d| !d.trim().is_empty()) };
                         if let Some((from, rec, _)) = typing {
-                            let what = if *rec { "nimmt Sprachnachricht auf …" } else { "schreibt …" };
+                            let what = if *rec { t!("nimmt Sprachnachricht auf …", "recording audio …") } else { t!("schreibt …", "typing …") };
                             let t = if c.is_group {
                                 format!("{} {what}", self.names.get(from).map(|n| n.0.clone()).unwrap_or_else(|| format!("+{from}")))
                             } else {
@@ -2752,7 +2796,7 @@ impl App {
                             };
                             p.text(egui::pos2(px, y2), egui::Align2::LEFT_CENTER, t, egui::FontId::proportional(14.0), pal.accent);
                         } else if let Some(d) = draft {
-                            let g = p.layout_no_wrap("Entwurf: ".into(), egui::FontId::proportional(14.0), pal.accent);
+                            let g = p.layout_no_wrap(t!("Entwurf: ", "Draft: ").into(), egui::FontId::proportional(14.0), pal.accent);
                             let w = g.size().x;
                             p.galley(egui::pos2(px, y2 - g.size().y / 2.0), g, pal.accent);
                             let pclip = egui::Rect::from_min_max(egui::pos2(px, y2 - 10.0), egui::pos2(txt_rect.right() - icons_w - 6.0, y2 + 10.0));
@@ -2773,7 +2817,7 @@ impl App {
                                 ""
                             };
                             let body = match (&m.media, &m.x.kind) {
-                                _ if m.x.view_once => "⏱ Einmal-Ansicht".to_owned(),
+                                _ if m.x.view_once => t!("⏱ Einmal-Ansicht", "⏱ View once").to_owned(),
                                 (Some(md), _) if m.text.is_empty() => md.label(),
                                 (Some(md), _) => format!("{} {}", md.label(), m.text.replace('\n', " ")),
                                 (None, Some(k)) if m.text.is_empty() => k.label(),
@@ -2793,18 +2837,18 @@ impl App {
                         let (is_muted, is_arch) = (muted, Self::has(&self.settings.archived, key));
                         let unread = c.unread;
                         resp.context_menu(|ui| {
-                            if ui.button(if is_arch { "Aus Archiv holen" } else { "Chat archivieren" }).clicked() {
+                            if ui.button(if is_arch { t!("Aus Archiv holen", "Unarchive") } else { t!("Chat archivieren", "Archive chat") }).clicked() {
                                 act = Some(Act::Archive(k.clone()));
                                 ui.close_menu();
                             }
                             if is_muted {
-                                if ui.button("Stummschaltung aufheben").clicked() {
+                                if ui.button(t!("Stummschaltung aufheben", "Unmute")).clicked() {
                                     act = Some(Act::Mute(k.clone(), None));
                                     ui.close_menu();
                                 }
                             } else {
-                                ui.menu_button("Stummschalten", |ui| {
-                                    for (l, d) in MUTE_OPTS {
+                                ui.menu_button(t!("Stummschalten", "Silence"), |ui| {
+                                    for (l, d) in mute_opts().iter() {
                                         if ui.button(*l).clicked() {
                                             act = Some(Act::Mute(k.clone(), *d));
                                             ui.close_menu();
@@ -2812,11 +2856,11 @@ impl App {
                                     }
                                 });
                             }
-                            if ui.button(if *pinned { "Chat loslösen" } else { "Chat anheften" }).clicked() {
+                            if ui.button(if *pinned { t!("Chat loslösen", "Unpin chat") } else { t!("Chat anheften", "Pin chat") }).clicked() {
                                 act = Some(Act::Pin(k.clone()));
                                 ui.close_menu();
                             }
-                            if unread > 0 && ui.button("Als gelesen markieren").clicked() {
+                            if unread > 0 && ui.button(t!("Als gelesen markieren", "Mark as read")).clicked() {
                                 act = Some(Act::Read(k.clone()));
                                 ui.close_menu();
                             }
@@ -2873,13 +2917,13 @@ impl App {
                                 let k = (96.0 / sz.y).min(1.0);
                                 ui.add(egui::Image::new((tex.id(), sz * k)).corner_radius(6.0));
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new("Bild aus der Zwischenablage senden?").family(theme::bold()));
-                                    ui.label(RichText::new("Text im Eingabefeld wird zur Bildunterschrift.").small().color(pal.dim));
+                                    ui.label(RichText::new(t!("Bild aus der Zwischenablage senden?", "Send image from clipboard?")).family(theme::bold()));
+                                    ui.label(RichText::new(t!("Text im Eingabefeld wird zur Bildunterschrift.", "Text in the input field becomes the caption.")).small().color(pal.dim));
                                     ui.horizontal(|ui| {
-                                        if ui.button("Senden").clicked() {
+                                        if ui.button(t!("Senden", "Send")).clicked() {
                                             paste_send = Some(path.clone());
                                         }
-                                        if ui.button("Abbrechen").clicked() {
+                                        if ui.button(t!("Abbrechen", "Cancel")).clicked() {
                                             self.pending_paste = None;
                                         }
                                     });
@@ -2896,9 +2940,9 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("✏ Nachricht bearbeiten").size(13.0).family(theme::bold()).color(pal.accent));
+                                ui.label(RichText::new(t!("✏ Nachricht bearbeiten", "✏ Edit message")).size(13.0).family(theme::bold()).color(pal.accent));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("×").on_hover_text("Bearbeiten abbrechen").clicked() {
+                                    if ui.small_button("×").on_hover_text(t!("Bearbeiten abbrechen", "Cancel editing")).clicked() {
                                         self.editing = None;
                                         self.input.clear();
                                     }
@@ -2967,12 +3011,12 @@ impl App {
                             ui.horizontal(|ui| {
                                 ui.vertical(|ui| {
                                     ui.spacing_mut().item_spacing.y = 1.0;
-                                    ui.label(RichText::new(format!("Antwort an {}", q.name)).size(12.5).family(theme::bold()).color(pal.accent));
+                                    ui.label(RichText::new(tf!("Antwort an {}", "Reply to {}", q.name)).size(12.5).family(theme::bold()).color(pal.accent));
                                     let t: String = q.text.replace('\n', " ").chars().take(120).collect();
                                     ui.add(egui::Label::new(RichText::new(t).size(13.0).color(pal.dim)).truncate());
                                 });
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.small_button("×").on_hover_text("Antwort abbrechen").clicked() {
+                                    if ui.small_button("×").on_hover_text(t!("Antwort abbrechen", "Cancel reply")).clicked() {
                                         self.reply_to = None;
                                     }
                                 });
@@ -2987,24 +3031,24 @@ impl App {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
-                            let clip = icon_button(ui, "📎", 19.0, pal.dim, pal, "Anhängen");
+                            let clip = icon_button(ui, "📎", 19.0, pal.dim, pal, t!("Anhängen", "Attach"));
                             let attach_id = egui::Id::new("attach_menu");
                             if clip.clicked() && enabled {
                                 ui.memory_mut(|m| m.toggle_popup(attach_id));
                             }
                             egui::popup::popup_above_or_below_widget(ui, attach_id, &clip, egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                                 ui.set_min_width(230.0);
-                                if ui.button("📄  Foto, Video oder Datei").clicked() {
+                                if ui.button(t!("📄  Foto, Video oder Datei", "📄  Photo, video or file")).clicked() {
                                     attach = true;
                                 }
-                                if ui.button("🖼  Sticker aus Bild").clicked() {
+                                if ui.button(t!("🖼  Sticker aus Bild", "🖼  Sticker from image")).clicked() {
                                     make_sticker = true;
                                 }
-                                if ui.button("📋  Bild aus Zwischenablage").clicked() {
+                                if ui.button(t!("📋  Bild aus Zwischenablage", "📋  Image from clipboard")).clicked() {
                                     paste_now = true;
                                 }
                             });
-                            let emoji_btn = icon_button(ui, "", 19.0, pal.dim, pal, "Emoji");
+                            let emoji_btn = icon_button(ui, "", 19.0, pal.dim, pal, t!("Emoji", "Emoji"));
                             {
                                 // Smiley als Umriss, wie das Symbol bei WhatsApp
                                 let c = emoji_btn.rect.center();
@@ -3034,7 +3078,7 @@ impl App {
                                 |ui| {
                                     ui.set_width(400.0);
                                     ui.horizontal(|ui| {
-                                        for (i, l) in ["Emoji", "GIF", "Sticker"].iter().enumerate() {
+                                        for (i, l) in [t!("Emoji", "Emoji"), "GIF", t!("Sticker", "Stickers")].iter().enumerate() {
                                             if chip(ui, l, self.picker_tab == i as u8, pal) {
                                                 self.picker_tab = i as u8;
                                             }
@@ -3043,13 +3087,13 @@ impl App {
                                     ui.add_space(4.0);
                                     if self.picker_tab == 1 {
                                         if self.settings.giphy_key.trim().is_empty() {
-                                            ui.label(RichText::new("Für die GIF-Suche brauchst du einen kostenlosen API-Schlüssel von Giphy (developers.giphy.com → Create an API Key). Hier eintragen:").small().color(pal.dim));
-                                            if ui.add(egui::TextEdit::singleline(&mut self.settings.giphy_key).hint_text("Giphy-API-Schlüssel").desired_width(340.0)).lost_focus() {
+                                            ui.label(RichText::new(t!("Für die GIF-Suche brauchst du einen kostenlosen API-Schlüssel von Giphy (developers.giphy.com → Create an API Key). Hier eintragen:", "GIF search needs a free Giphy API key (developers.giphy.com → Create an API Key). Enter it here:")).small().color(pal.dim));
+                                            if ui.add(egui::TextEdit::singleline(&mut self.settings.giphy_key).hint_text(t!("Giphy-API-Schlüssel", "Giphy API key")).desired_width(340.0)).lost_focus() {
                                                 self.save_settings();
                                             }
                                             return;
                                         }
-                                        let r = ui.add(egui::TextEdit::singleline(&mut self.gif_query).hint_text("GIFs suchen (Enter) …").desired_width(340.0));
+                                        let r = ui.add(egui::TextEdit::singleline(&mut self.gif_query).hint_text(t!("GIFs suchen (Enter) …", "Search GIFs (Enter) …")).desired_width(340.0));
                                         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.gif_query.trim().is_empty() {
                                             self.gif_loading = true;
                                             let _ = self.cmd.send(Cmd::GifSearch { query: self.gif_query.trim().to_owned(), key: self.settings.giphy_key.trim().to_owned() });
@@ -3079,7 +3123,7 @@ impl App {
                                         return;
                                     }
                                     if self.picker_tab == 2 {
-                                        if ui.button("➕ Eigenen Sticker aus Bild erstellen").clicked() {
+                                        if ui.button(t!("➕ Eigenen Sticker aus Bild erstellen", "➕ Create your own sticker from an image")).clicked() {
                                             make_sticker = true;
                                             ui.memory_mut(|m| m.close_popup());
                                         }
@@ -3087,7 +3131,7 @@ impl App {
                                         let list = self.known_stickers();
                                         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                                             if list.is_empty() {
-                                                ui.label(RichText::new("Noch keine Sticker. Sticker, die du bekommst, erscheinen hier und können weitergeschickt werden.").small().color(pal.dim));
+                                                ui.label(RichText::new(t!("Noch keine Sticker. Sticker, die du bekommst, erscheinen hier und können weitergeschickt werden.", "No stickers yet. Stickers you receive show up here and can be sent again.")).small().color(pal.dim));
                                             }
                                             ui.horizontal_wrapped(|ui| {
                                                 for (id, md) in list {
@@ -3123,17 +3167,17 @@ impl App {
                                 let blink = (ui.input(|i| i.time) * 2.0) as i64 % 2 == 0;
                                 ui.label(RichText::new(if blink { "●" } else { " " }).color(pal.danger).size(16.0));
                                 ui.label(RichText::new(format!("{}:{:02}", secs / 60, secs % 60)).size(15.0));
-                                ui.label(RichText::new("Sprachnachricht wird aufgenommen").size(13.0).color(pal.dim));
+                                ui.label(RichText::new(t!("Sprachnachricht wird aufgenommen", "Recording voice message")).size(13.0).color(pal.dim));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::click());
                                     let c = rect.center();
                                     ui.painter().circle_filled(c, 20.0, pal.accent);
                                     let pts = vec![c + egui::vec2(-6.0, -7.0), c + egui::vec2(8.0, 0.0), c + egui::vec2(-6.0, 7.0), c + egui::vec2(-3.0, 0.0)];
                                     ui.painter().add(egui::Shape::convex_polygon(pts, pal.on_accent, egui::Stroke::NONE));
-                                    if resp.on_hover_text("Senden").clicked() {
+                                    if resp.on_hover_text(t!("Senden", "Send")).clicked() {
                                         rec_action = 2;
                                     }
-                                    if icon_button(ui, "🗑", 18.0, pal.danger, pal, "Verwerfen").clicked() {
+                                    if icon_button(ui, "🗑", 18.0, pal.danger, pal, t!("Verwerfen", "Discard")).clicked() {
                                         rec_action = 3;
                                     }
                                 });
@@ -3148,7 +3192,7 @@ impl App {
                                 egui::TextEdit::multiline(&mut self.input)
                                     .id(input_id)
                                     .frame(false)
-                                    .hint_text(if enabled { "Gib eine Nachricht ein." } else { "Nicht verbunden …" })
+                                    .hint_text(if enabled { t!("Gib eine Nachricht ein.", "Type a message") } else { t!("Nicht verbunden …", "Not connected …") })
                                     .desired_rows(1)
                                     .margin(egui::vec2(6.0, 9.0))
                                     .desired_width(ui.available_width() - send_w),
@@ -3159,7 +3203,7 @@ impl App {
                                 ui.painter().circle_filled(c, 20.0, pal.accent);
                                 let pts = vec![c + egui::vec2(-6.0, -7.0), c + egui::vec2(8.0, 0.0), c + egui::vec2(-6.0, 7.0), c + egui::vec2(-3.0, 0.0)];
                                 ui.painter().add(egui::Shape::convex_polygon(pts, pal.on_accent, egui::Stroke::NONE));
-                                if resp.on_hover_text("Senden (Enter)").clicked() {
+                                if resp.on_hover_text(t!("Senden (Enter)", "Send (Enter)")).clicked() {
                                     do_send = true;
                                 }
                             } else {
@@ -3178,7 +3222,7 @@ impl App {
                                     .collect();
                                 p.add(egui::Shape::line(arc, st));
                                 p.line_segment([c + egui::vec2(0.0, 7.0), c + egui::vec2(0.0, 10.0)], st);
-                                if resp.on_hover_text("Sprachnachricht aufnehmen").clicked() && enabled {
+                                if resp.on_hover_text(t!("Sprachnachricht aufnehmen", "Record voice message")).clicked() && enabled {
                                     rec_action = 1;
                                 }
                             }
@@ -3192,7 +3236,7 @@ impl App {
         if paste_now {
             self.try_paste_image(ctx);
             if self.pending_paste.is_none() && self.info.is_none() {
-                self.info = Some("In der Zwischenablage ist kein Bild.".into());
+                self.info = Some(t!("In der Zwischenablage ist kein Bild.", "There's no image in the clipboard.").into());
             }
         }
         // Dateien per Ziehen-und-Ablegen oder über 📎 senden
@@ -3234,14 +3278,14 @@ impl App {
                             }
                             self.recording = Some(r);
                         }
-                        Err(e) => self.info = Some(format!("Aufnahme nicht möglich: {e}")),
+                        Err(e) => self.info = Some(tf!("Aufnahme nicht möglich: {e}", "Recording not possible: {e}")),
                     },
                     2 => {
                         if let Some(r) = self.recording.take() {
                             let secs = r.seconds().round().max(1.0) as u32;
                             match r.finish().and_then(|pcm| {
                                 if pcm.len() < (audio::RATE / 2) as usize {
-                                    return Err("Aufnahme zu kurz oder kein Mikrofon-Signal".into());
+                                    return Err(t!("Aufnahme zu kurz oder kein Mikrofon-Signal", "Recording too short or no microphone signal").into());
                                 }
                                 let wf = audio::waveform(&pcm, 1);
                                 audio::encode_ogg_opus(&pcm).map(|ogg| (ogg, wf))
@@ -3249,7 +3293,7 @@ impl App {
                                 Ok((ogg, waveform)) => {
                                     let _ = self.cmd.send(Cmd::SendVoice { chat: jid.clone(), ogg, seconds: secs, waveform });
                                 }
-                                Err(e) => self.info = Some(format!("Sprachnachricht: {e}")),
+                                Err(e) => self.info = Some(tf!("Sprachnachricht: {e}", "Voice message: {e}")),
                             }
                         }
                     }
@@ -3297,11 +3341,11 @@ impl App {
             let Some(key) = self.selected.clone() else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.35);
-                    ui.label(RichText::new("WhatsSnap für Linux").size(28.0).family(theme::bold()));
+                    ui.label(RichText::new(t!("WhatsSnap für Linux", "WhatsSnap for Linux")).size(28.0).family(theme::bold()));
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Nachrichten senden und empfangen, ohne Browser.").color(pal.dim));
+                    ui.label(RichText::new(t!("Nachrichten senden und empfangen, ohne Browser.", "Send and receive messages without a browser.")).color(pal.dim));
                     ui.add_space(24.0);
-                    ui.label(RichText::new("🔒 Deine privaten Nachrichten sind Ende-zu-Ende-verschlüsselt.").small().color(pal.dim));
+                    ui.label(RichText::new(t!("🔒 Deine privaten Nachrichten sind Ende-zu-Ende-verschlüsselt.", "🔒 Your personal messages are end-to-end encrypted.")).small().color(pal.dim));
                 });
                 return;
             };
@@ -3323,7 +3367,7 @@ impl App {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         let av = ui.scope(|ui| draw_avatar(ui, self.avatars.get(&user), &title, 40.0, dark)).response;
-                        if av.interact(egui::Sense::click()).on_hover_text("Kontakt-/Gruppeninfo").clicked() {
+                        if av.interact(egui::Sense::click()).on_hover_text(t!("Kontakt-/Gruppeninfo", "Contact/group info")).clicked() {
                             toggle_info = true;
                         }
                         ui.add_space(6.0);
@@ -3333,7 +3377,7 @@ impl App {
                             ui.label(RichText::new(&title).size(16.0).family(theme::bold()));
                             let typing = self.typing.get(user.as_str()).filter(|t| t.2.elapsed().as_secs() < 12);
                             let (sub, col) = if let Some((from, rec, _)) = typing {
-                                let what = if *rec { "nimmt Sprachnachricht auf …" } else { "schreibt …" };
+                                let what = if *rec { t!("nimmt Sprachnachricht auf …", "recording audio …") } else { t!("schreibt …", "typing …") };
                                 let t = if is_group {
                                     format!("{} {what}", self.names.get(from).map(|n| n.0.clone()).unwrap_or_else(|| format!("+{from}")))
                                 } else {
@@ -3341,24 +3385,24 @@ impl App {
                                 };
                                 (t, pal.accent)
                             } else if is_group {
-                                ("Gruppe".to_owned(), pal.dim)
+                                (t!("Gruppe", "Group").to_owned(), pal.dim)
                             } else if let Some((online, seen)) = self.presence.get(user.as_str()) {
                                 if *online {
                                     ("online".to_owned(), pal.dim)
                                 } else if let Some(t) = seen {
-                                    (format!("zuletzt online {}", fmt_last_seen(*t)), pal.dim)
+                                    (tf!("zuletzt online {}", "last seen {}", fmt_last_seen(*t)), pal.dim)
                                 } else {
                                     (format!("+{user}"), pal.dim)
                                 }
                             } else if chat.jid.server == whatsapp_rust::Server::Pn {
                                 (format!("+{user}"), pal.dim)
                             } else {
-                                ("Kontakt".to_owned(), pal.dim)
+                                (t!("Kontakt", "Contact").to_owned(), pal.dim)
                             };
                             ui.label(RichText::new(sub).size(12.5).color(col));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let dots = icon_button(ui, "", 17.0, pal.dim, pal, "Menü");
+                            let dots = icon_button(ui, "", 17.0, pal.dim, pal, t!("Menü", "Menu"));
                             for dy in [-5.0, 0.0, 5.0] {
                                 ui.painter().circle_filled(dots.rect.center() + egui::vec2(0.0, dy), 1.8, pal.dim);
                             }
@@ -3369,29 +3413,29 @@ impl App {
                             egui::popup::popup_below_widget(ui, menu_id, &dots, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                                 ui.set_min_width(240.0);
                                 if muted {
-                                    if ui.button("Stummschaltung aufheben").clicked() {
+                                    if ui.button(t!("Stummschaltung aufheben", "Unmute")).clicked() {
                                         act = Some(Act::Mute(key.clone(), None));
                                     }
                                 } else {
-                                    ui.label(RichText::new("Stummschalten für").small().color(pal.dim));
-                                    for (l, d) in MUTE_OPTS {
+                                    ui.label(RichText::new(t!("Stummschalten für", "Mute for")).small().color(pal.dim));
+                                    for (l, d) in mute_opts().iter() {
                                         if ui.button(format!("   {l}")).clicked() {
                                             act = Some(Act::Mute(key.clone(), *d));
                                         }
                                     }
                                 }
-                                if ui.button(if pinned { "Chat loslösen" } else { "Chat anheften" }).clicked() {
+                                if ui.button(if pinned { t!("Chat loslösen", "Unpin chat") } else { t!("Chat anheften", "Pin chat") }).clicked() {
                                     act = Some(Act::Pin(key.clone()));
                                     ui.close_menu();
                                 }
-                                if ui.button(if archived { "Aus Archiv holen" } else { "Chat archivieren" }).clicked() {
+                                if ui.button(if archived { t!("Aus Archiv holen", "Unarchive") } else { t!("Chat archivieren", "Archive chat") }).clicked() {
                                     act = Some(Act::Archive(key.clone()));
                                     ui.close_menu();
                                 }
                                 ui.separator();
-                                ui.label(RichText::new("Selbstlöschende Nachrichten").small().color(pal.dim));
+                                ui.label(RichText::new(t!("Selbstlöschende Nachrichten", "Disappearing messages")).small().color(pal.dim));
                                 ui.horizontal(|ui| {
-                                    for (secs, l) in [(0u32, "Aus"), (86_400, "24 Std."), (604_800, "7 Tage"), (7_776_000, "90 Tage")] {
+                                    for (secs, l) in [(0u32, t!("Aus", "Off")), (86_400, t!("24 Std.", "24 hrs")), (604_800, t!("7 Tage", "7 days")), (7_776_000, t!("90 Tage", "90 days"))] {
                                         if ui.small_button(l).clicked() {
                                             chat_cmd = Some(Cmd::SetChatDisappearing { chat: chat_jid.clone(), secs });
                                         }
@@ -3399,26 +3443,26 @@ impl App {
                                 });
                                 if !is_group {
                                     let blocked = self.blocklist.iter().any(|b| user_of(b) == user);
-                                    if ui.button(if blocked { "Blockierung aufheben" } else { "Blockieren" }).clicked() {
+                                    if ui.button(if blocked { t!("Blockierung aufheben", "Unblock") } else { t!("Blockieren", "Block") }).clicked() {
                                         chat_cmd = Some(Cmd::Block { jid: chat_jid.clone(), on: !blocked });
                                     }
                                 }
                                 ui.separator();
-                                if ui.button("Chat exportieren (.txt)").clicked() {
+                                if ui.button(t!("Chat exportieren (.txt)", "Export chat (.txt)")).clicked() {
                                     export_chat = true;
                                 }
-                                if ui.button("Chat schließen").clicked() {
+                                if ui.button(t!("Chat schließen", "Close chat")).clicked() {
                                     self.selected = None;
                                 }
                             });
-                            if !is_group && self.conn == Conn::Online && self.call.is_none() && icon_button(ui, "📞", 17.0, pal.dim, pal, "Sprachanruf").clicked() {
+                            if !is_group && self.conn == Conn::Online && self.call.is_none() && icon_button(ui, "📞", 17.0, pal.dim, pal, t!("Sprachanruf", "Voice call")).clicked() {
                                 chat_cmd = Some(Cmd::Call(chat_jid.clone()));
-                                self.call = Some((user.clone(), "Rufe an …".into(), std::time::Instant::now(), false));
+                                self.call = Some((user.clone(), t!("Rufe an …", "Calling …").into(), std::time::Instant::now(), false));
                             }
-                            if icon_button(ui, "ℹ", 17.0, if self.show_info { pal.accent } else { pal.dim }, pal, "Kontakt-/Gruppeninfo").clicked() {
+                            if icon_button(ui, "ℹ", 17.0, if self.show_info { pal.accent } else { pal.dim }, pal, t!("Kontakt-/Gruppeninfo", "Contact/group info")).clicked() {
                                 toggle_info = true;
                             }
-                            if icon_button(ui, "🔍", 17.0, pal.dim, pal, "Im Chat suchen").clicked() {
+                            if icon_button(ui, "🔍", 17.0, pal.dim, pal, t!("Im Chat suchen", "Search in chat")).clicked() {
                                 self.chat_search = if self.chat_search.is_some() { None } else { Some(String::new()) };
                             }
                         });
@@ -3429,7 +3473,7 @@ impl App {
             if let Some(q) = self.chat_search.as_mut() {
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
-                    ui.add(egui::TextEdit::singleline(q).hint_text("Nachrichten durchsuchen").desired_width(320.0).margin(egui::vec2(10.0, 6.0)));
+                    ui.add(egui::TextEdit::singleline(q).hint_text(t!("Nachrichten durchsuchen", "Search messages")).desired_width(320.0).margin(egui::vec2(10.0, 6.0)));
                 });
             }
             let needle = self.chat_search.as_deref().unwrap_or("").to_lowercase();
@@ -3473,7 +3517,7 @@ impl App {
                     ui.add_space(10.0);
                     if needle.is_empty() {
                         ui.vertical_centered(|ui| {
-                            let label = if hidden > 0 { format!("Ältere Nachrichten anzeigen ({hidden})") } else { "Ältere Nachrichten vom Handy laden".to_owned() };
+                            let label = if hidden > 0 { tf!("Ältere Nachrichten anzeigen ({hidden})", "Show older messages ({hidden})") } else { t!("Ältere Nachrichten vom Handy laden", "Load older messages from phone").to_owned() };
                             if ui.add(egui::Button::new(RichText::new(label).size(12.5).color(pal.dim)).fill(pal.bubble_them).corner_radius(12.0)).clicked() {
                                 older_req = true;
                             }
@@ -3558,7 +3602,7 @@ impl App {
                                     if let Some(q) = &m.quote {
                                         // Zitat: farbiger Balken links, Name und Text gekürzt
                                         let qname = if q.sender.is_empty() || self.me.contains(&user_of(&q.sender)) {
-                                            "Du".to_owned()
+                                            t!("Du", "You").to_owned()
                                         } else {
                                             let u = user_of(&q.sender);
                                             self.names.get(&u).map(|n| n.0.clone()).unwrap_or_else(|| if q.name.is_empty() { format!("+{u}") } else { q.name.clone() })
@@ -3586,7 +3630,7 @@ impl App {
                                         ui.add_space(3.0);
                                     }
                                     if m.x.view_once {
-                                        ui.label(RichText::new("⏱ Einmal-Ansicht – nur auf dem Handy sichtbar").size(14.0).italics().color(pal.dim));
+                                        ui.label(RichText::new(t!("⏱ Einmal-Ansicht – nur auf dem Handy sichtbar", "⏱ View once – only visible on the phone")).size(14.0).italics().color(pal.dim));
                                     } else if let Some(md) = &m.media {
                                         self.media_block(ui, m, md, max_w, pal, &mut media_req, &mut open_req, &mut audio_req);
                                     }
@@ -3606,17 +3650,17 @@ impl App {
                                                 ui.label(RichText::new("★").size(11.0).color(pal.dim));
                                             }
                                             if m.x.expiration > 0 {
-                                                ui.label(RichText::new("⏱").size(10.0).color(pal.dim)).on_hover_text("Selbstlöschende Nachricht");
+                                                ui.label(RichText::new("⏱").size(10.0).color(pal.dim)).on_hover_text(t!("Selbstlöschende Nachricht", "Disappearing message"));
                                             }
                                             if m.x.deleted {
-                                                ui.label(RichText::new("🚫 gelöscht").size(11.0).color(pal.danger))
-                                                    .on_hover_text("Der Absender hat diese Nachricht für alle gelöscht. WhatsSnap zeigt sie weiter an.");
+                                                ui.label(RichText::new(t!("🚫 gelöscht", "🚫 deleted")).size(11.0).color(pal.danger))
+                                                    .on_hover_text(t!("Der Absender hat diese Nachricht für alle gelöscht. WhatsSnap zeigt sie weiter an.", "The sender deleted this message for everyone. WhatsSnap keeps showing it."));
                                             }
                                             if m.x.edited {
-                                                let l = ui.label(RichText::new(if m.x.prev.is_empty() { "Bearbeitet" } else { "Bearbeitet ⓘ" }).size(11.0).italics().color(pal.dim));
+                                                let l = ui.label(RichText::new(if m.x.prev.is_empty() { t!("Bearbeitet", "Edited") } else { t!("Bearbeitet ⓘ", "Edited ⓘ") }).size(11.0).italics().color(pal.dim));
                                                 if !m.x.prev.is_empty() {
-                                                    let hist: Vec<String> = m.x.prev.iter().enumerate().map(|(i, t)| format!("Fassung {}: {t}", i + 1)).collect();
-                                                    l.on_hover_text(format!("Frühere Fassungen:\n{}", hist.join("\n")));
+                                                    let hist: Vec<String> = m.x.prev.iter().enumerate().map(|(i, t)| tf!("Fassung {}: {t}", "Version {}: {t}", i + 1)).collect();
+                                                    l.on_hover_text(tf!("Frühere Fassungen:\n{}", "Earlier versions:\n{}", hist.join("\n")));
                                                 }
                                             }
                                             ui.label(RichText::new(fmt_time(m.ts)).size(11.0).color(pal.dim));
@@ -3672,7 +3716,7 @@ impl App {
                                 let tip: Vec<String> = list
                                     .iter()
                                     .map(|(f, e)| {
-                                        let n = if f.is_empty() { "Du".to_owned() } else { self.names.get(f).map(|n| n.0.clone()).unwrap_or_else(|| format!("+{f}")) };
+                                        let n = if f.is_empty() { t!("Du", "You").to_owned() } else { self.names.get(f).map(|n| n.0.clone()).unwrap_or_else(|| format!("+{f}")) };
                                         format!("{e} {n}")
                                     })
                                     .collect();
@@ -3698,34 +3742,34 @@ impl App {
                                     }
                                 });
                                 ui.separator();
-                                if ui.button("Antworten").clicked() {
+                                if ui.button(t!("Antworten", "Reply")).clicked() {
                                     msg_act = Some(MsgAct::Reply(m.id.clone()));
                                     ui.close_menu();
                                 }
-                                if ui.button("Weiterleiten").clicked() {
+                                if ui.button(t!("Weiterleiten", "Forward")).clicked() {
                                     msg_act = Some(MsgAct::Forward(m.id.clone()));
                                     ui.close_menu();
                                 }
                                 let is_star = self.starred.contains(&m.id);
-                                if ui.button(if is_star { "Markierung entfernen" } else { "Mit Stern markieren" }).clicked() {
+                                if ui.button(if is_star { t!("Markierung entfernen", "Unstar") } else { t!("Mit Stern markieren", "Star") }).clicked() {
                                     msg_act = Some(MsgAct::Star(m.id.clone(), !is_star));
                                     ui.close_menu();
                                 }
-                                if m.from_me && m.media.is_none() && m.x.kind.is_none() && !m.id.starts_with("local-") && now_ts() - m.ts < 15 * 60 && ui.button("Bearbeiten").clicked() {
+                                if m.from_me && m.media.is_none() && m.x.kind.is_none() && !m.id.starts_with("local-") && now_ts() - m.ts < 15 * 60 && ui.button(t!("Bearbeiten", "Edit")).clicked() {
                                     msg_act = Some(MsgAct::Edit(m.id.clone()));
                                     ui.close_menu();
                                 }
-                                if !m.text.is_empty() && ui.button("Text kopieren").clicked() {
+                                if !m.text.is_empty() && ui.button(t!("Text kopieren", "Copy text")).clicked() {
                                     ui.ctx().copy_text(m.text.clone());
                                     ui.close_menu();
                                 }
-                                if m.media.is_some() && ui.button("Öffnen").clicked() {
+                                if m.media.is_some() && ui.button(t!("Öffnen", "Open")).clicked() {
                                     if let Some(md) = &m.media {
                                         open_req.push((m.id.clone(), md.clone()));
                                     }
                                     ui.close_menu();
                                 }
-                                if m.from_me && !m.id.starts_with("local-") && now_ts() - m.ts < 2 * 86_400 && ui.button("Für alle löschen").clicked() {
+                                if m.from_me && !m.id.starts_with("local-") && now_ts() - m.ts < 2 * 86_400 && ui.button(t!("Für alle löschen", "Delete for everyone")).clicked() {
                                     msg_act = Some(MsgAct::Revoke(m.id.clone()));
                                     ui.close_menu();
                                 }
@@ -3786,7 +3830,7 @@ impl App {
             if self.msg_index.contains_key(&id) {
                 self.jump_to = Some(id);
             } else {
-                self.info = Some("Die zitierte Nachricht ist nicht im geladenen Verlauf.".into());
+                self.info = Some(t!("Die zitierte Nachricht ist nicht im geladenen Verlauf.", "The quoted message isn't in the loaded history.").into());
             }
         }
         // Knopf "Nach unten" mit Zähler neuer Nachrichten
@@ -3816,7 +3860,7 @@ impl App {
                             p.circle_filled(bc, 10.0, pal2.accent);
                             p.text(bc, egui::Align2::CENTER_CENTER, n.min(99).to_string(), egui::FontId::new(11.0, theme::bold()), pal2.on_accent);
                         }
-                        resp.on_hover_text("Nach unten").clicked()
+                        resp.on_hover_text(t!("Nach unten", "Scroll down")).clicked()
                     })
                     .inner;
                 if clicked {
@@ -3860,7 +3904,7 @@ impl App {
                 continue;
             }
             let name = if self.me.contains(u) {
-                "Du".to_owned()
+                t!("Du", "You").to_owned()
             } else {
                 self.names.get(u).map(|n| n.0.clone()).or_else(|| {
                     self.chats.values().find(|c| !c.is_group && c.jid.user.as_str() == u.as_str()).map(|c| self.display_name(c))
@@ -3885,7 +3929,7 @@ impl App {
         match k {
             Extra::Poll { name, options, multi, secret } => {
                 ui.label(RichText::new(name).size(15.0).family(theme::bold()));
-                ui.label(RichText::new(if *multi { "Wähle eine oder mehrere Optionen" } else { "Wähle eine Option" }).size(12.0).color(pal.dim));
+                ui.label(RichText::new(if *multi { t!("Wähle eine oder mehrere Optionen", "Select one or more options") } else { t!("Wähle eine Option", "Select one option") }).size(12.0).color(pal.dim));
                 ui.add_space(4.0);
                 let votes = self.votes.get(&m.id);
                 let mine: Vec<String> = votes.and_then(|v| v.get("")).cloned().unwrap_or_default();
@@ -3924,18 +3968,18 @@ impl App {
                     }
                 }
                 if secret.is_empty() {
-                    ui.label(RichText::new("Abstimmen ist bei dieser Umfrage hier nicht möglich.").size(11.0).color(pal.dim));
+                    ui.label(RichText::new(t!("Abstimmen ist bei dieser Umfrage hier nicht möglich.", "Voting isn't possible for this poll here.")).size(11.0).color(pal.dim));
                 }
             }
             Extra::Location { lat, lon, name, address, live } => {
-                ui.label(RichText::new(if *live { "📍 Live-Standort" } else { "📍 Standort" }).size(14.0).family(theme::bold()));
+                ui.label(RichText::new(if *live { t!("📍 Live-Standort", "📍 Live location") } else { t!("📍 Standort", "📍 Location") }).size(14.0).family(theme::bold()));
                 if !name.is_empty() {
                     ui.label(RichText::new(name).size(14.0));
                 }
                 if !address.is_empty() {
                     ui.label(RichText::new(address).size(12.5).color(pal.dim));
                 }
-                if ui.link(RichText::new("In Karte öffnen").size(13.0)).clicked() {
+                if ui.link(RichText::new(t!("In Karte öffnen", "Open in map")).size(13.0)).clicked() {
                     let url = format!("https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=16/{lat}/{lon}");
                     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
                 }
@@ -3952,7 +3996,7 @@ impl App {
                 if !tel.is_empty() {
                     ui.label(RichText::new(&tel).size(13.0).color(pal.dim));
                     let digits: String = tel.chars().filter(|c| c.is_ascii_digit()).collect();
-                    if digits.len() >= 7 && ui.button("Chat starten").clicked() {
+                    if digits.len() >= 7 && ui.button(t!("Chat starten", "Start chat")).clicked() {
                         *msg_act = Some(MsgAct::OpenNumber(digits));
                     }
                 }
@@ -3989,7 +4033,7 @@ impl App {
         ui.add_space(18.0);
         ui.horizontal(|ui| {
             ui.add_space(24.0);
-            ui.label(RichText::new("Markierte Nachrichten").size(22.0).family(theme::bold()));
+            ui.label(RichText::new(t!("Markierte Nachrichten", "Starred messages")).size(22.0).family(theme::bold()));
         });
         ui.add_space(10.0);
         let mut list: Vec<(&Chat, &ChatMessage)> = self
@@ -4001,12 +4045,12 @@ impl App {
         if list.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
-                ui.label(RichText::new("Noch keine markierten Nachrichten. Rechtsklick auf eine Nachricht → Mit Stern markieren.").color(pal.dim));
+                ui.label(RichText::new(t!("Noch keine markierten Nachrichten. Rechtsklick auf eine Nachricht → Mit Stern markieren.", "No starred messages yet. Right-click a message → Star.")).color(pal.dim));
             });
         }
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             for (c, m) in list {
-                let who = if m.from_me { "Du".to_owned() } else if c.is_group { m.sender_name.clone() } else { self.display_name(c) };
+                let who = if m.from_me { t!("Du", "You").to_owned() } else if c.is_group { m.sender_name.clone() } else { self.display_name(c) };
                 let resp = egui::Frame::new()
                     .fill(pal.bubble_them)
                     .corner_radius(8.0)
@@ -4061,7 +4105,7 @@ impl App {
                 let pts = vec![c + egui::vec2(-5.0, -8.0), c + egui::vec2(9.0, 0.0), c + egui::vec2(-5.0, 8.0)];
                 p.add(egui::Shape::convex_polygon(pts, pal.text, egui::Stroke::NONE));
             }
-            if resp.on_hover_text(if playing.is_some() { "Pause" } else { "Abspielen" }).clicked() {
+            if resp.on_hover_text(if playing.is_some() { t!("Pause", "Pause") } else { t!("Abspielen", "Play") }).clicked() {
                 *audio_req = Some((m.id.clone(), md.clone(), None));
             }
             ui.vertical(|ui| {
@@ -4087,7 +4131,7 @@ impl App {
                     }
                 }
                 let shown = if playing.is_some() || pos > 0.0 { pos } else { dur };
-                let label = if md.kind == "ptt" { "" } else { "  🎵 Audio" };
+                let label = if md.kind == "ptt" { "" } else { t!("  🎵 Audio", "  🎵 Audio") };
                 let shown = shown.round() as u32;
                 ui.label(RichText::new(format!("{}:{:02}{label}", shown / 60, shown % 60)).size(11.0).color(pal.dim));
             });
@@ -4129,7 +4173,7 @@ impl App {
             let tex = &frames[idx];
             let size = media_size(md, Some(&(tex.clone(), true)), max_w);
             let resp = ui.add(egui::Image::new((tex.id(), size)).sense(egui::Sense::click()));
-            if resp.on_hover_text("Öffnen").clicked() {
+            if resp.on_hover_text(t!("Öffnen", "Open")).clicked() {
                 open_req.push((m.id.clone(), md.clone()));
             }
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(delays[idx].max(30) as u64));
@@ -4144,7 +4188,7 @@ impl App {
             let size = media_size(md, None, max_w);
             let (r, resp) = ui.allocate_exact_size(size, egui::Sense::click());
             ui.painter().rect_filled(r, 6.0, pal.hover);
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, format!("⬇ {} laden", md.label()), egui::FontId::proportional(13.0), pal.text);
+            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, tf!("⬇ {} laden", "⬇ Load {}", md.label()), egui::FontId::proportional(13.0), pal.text);
             if resp.clicked() {
                 media_req.push((format!("{}#ok", m.id), md.clone()));
             }
@@ -4161,11 +4205,11 @@ impl App {
                 None => {
                     let (r, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                     ui.painter().rect_filled(r, 6.0, pal.hover);
-                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "Lädt …", egui::FontId::proportional(13.0), pal.dim);
+                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, t!("Lädt …", "Loading …"), egui::FontId::proportional(13.0), pal.dim);
                     resp
                 }
             };
-            if resp.on_hover_text("Öffnen").clicked() {
+            if resp.on_hover_text(t!("Öffnen", "Open")).clicked() {
                 open_req.push((m.id.clone(), md.clone()));
             }
             return;
@@ -4181,7 +4225,7 @@ impl App {
             if md.kind == "gif" {
                 ui.painter().text(resp.rect.left_bottom() + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, "GIF", egui::FontId::new(12.0, theme::bold()), Color32::WHITE);
             }
-            if resp.on_hover_text("Im Standardprogramm abspielen").clicked() {
+            if resp.on_hover_text(t!("Im Standardprogramm abspielen", "Play in default app")).clicked() {
                 open_req.push((m.id.clone(), md.clone()));
             }
             return;
@@ -4204,7 +4248,7 @@ impl App {
             })
             .response
             .interact(egui::Sense::click());
-        if resp.on_hover_text("Herunterladen und öffnen").clicked() {
+        if resp.on_hover_text(t!("Herunterladen und öffnen", "Download and open")).clicked() {
             open_req.push((m.id.clone(), md.clone()));
         }
         ui.add_space(2.0);
@@ -4215,10 +4259,29 @@ fn fmt_last_seen(ts: i64) -> String {
     let label = day_label(ts);
     let t = fmt_time(ts);
     match label.as_str() {
-        "Heute" => format!("heute um {t}"),
-        "Gestern" => format!("gestern um {t}"),
-        d => format!("am {d} um {t}"),
+        "Heute" => tf!("heute um {t}", "today at {t}"),
+        "Gestern" => tf!("gestern um {t}", "yesterday at {t}"),
+        d => tf!("am {d} um {t}", "on {d} at {t}"),
     }
+}
+
+/// 1234 → "1.234", 1234567 → "1,2 Mio."
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        tf!("{} Mio.", "{}M", format!("{:.1}", n as f64 / 1e6).replace('.', ","))
+    } else if n >= 1000 {
+        format!("{}.{:03}", n / 1000, n % 1000)
+    } else {
+        n.to_string()
+    }
+}
+
+fn apply_lang(lang: &str) {
+    i18n::set_en(match lang {
+        "en" => true,
+        "de" => false,
+        _ => !i18n::system_is_german(),
+    });
 }
 
 fn dir_size(p: &std::path::Path) -> u64 {
@@ -4287,25 +4350,25 @@ impl eframe::App for App {
                     ui.add_space(56.0);
                     match self.conn {
                         Conn::NeedsQr => {
-                            ui.label(RichText::new("Mit WhatsApp verknüpfen").size(26.0).family(theme::bold()));
+                            ui.label(RichText::new(t!("Mit WhatsApp verknüpfen", "Link with WhatsApp")).size(26.0).family(theme::bold()));
                             ui.add_space(6.0);
-                            ui.label(RichText::new("1. WhatsApp auf dem Handy öffnen").color(pal.dim));
-                            ui.label(RichText::new("2. Einstellungen → Verknüpfte Geräte → Gerät hinzufügen").color(pal.dim));
-                            ui.label(RichText::new("3. Diesen Code scannen").color(pal.dim));
+                            ui.label(RichText::new(t!("1. WhatsApp auf dem Handy öffnen", "1. Open WhatsApp on your phone")).color(pal.dim));
+                            ui.label(RichText::new(t!("2. Einstellungen → Verknüpfte Geräte → Gerät hinzufügen", "2. Settings → Linked devices → Link a device")).color(pal.dim));
+                            ui.label(RichText::new(t!("3. Diesen Code scannen", "3. Scan this code")).color(pal.dim));
                             ui.add_space(18.0);
                             if let Some(q) = self.qr.clone() {
                                 self.qr_view(ui, &q);
                             }
                         }
                         Conn::LoggedOut => {
-                            ui.label(RichText::new("Abgemeldet").size(24.0).family(theme::bold()));
+                            ui.label(RichText::new(t!("Abgemeldet", "Logged out")).size(24.0).family(theme::bold()));
                             ui.label(
-                                RichText::new("Die Verknüpfung wurde auf dem Handy entfernt. Bitte neu starten und erneut scannen.")
+                                RichText::new(t!("Die Verknüpfung wurde auf dem Handy entfernt. Bitte neu starten und erneut scannen.", "The link was removed on the phone. Please restart and scan again."))
                                     .color(pal.dim),
                             );
                         }
                         _ => {
-                            ui.label(RichText::new("WhatsSnap").size(26.0).family(theme::bold()));
+                            ui.label(RichText::new(t!("WhatsSnap", "WhatsSnap")).size(26.0).family(theme::bold()));
                             ui.label(RichText::new(&self.status).color(pal.dim));
                             ui.add_space(8.0);
                             ui.spinner();
@@ -4319,6 +4382,7 @@ impl eframe::App for App {
         self.rail(ctx, &pal);
         if self.show_status {
             self.status_view(ctx, &pal);
+            self.channel_create_dialog(ctx);
             self.forward_dialog(ctx, &pal);
             self.call_overlay(ctx, &pal);
             return;
@@ -4383,10 +4447,10 @@ impl App {
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
-                        if icon_button(ui, "×", 18.0, pal.dim, pal, "Schließen").clicked() {
+                        if icon_button(ui, "×", 18.0, pal.dim, pal, t!("Schließen", "Close")).clicked() {
                             close = true;
                         }
-                        ui.label(RichText::new(if is_group { "Gruppeninfo" } else { "Kontaktinfo" }).size(16.0).family(theme::bold()));
+                        ui.label(RichText::new(if is_group { t!("Gruppeninfo", "Group info") } else { t!("Kontaktinfo", "Contact info") }).size(16.0).family(theme::bold()));
                     });
                     ui.add_space(10.0);
                     ui.vertical_centered(|ui| {
@@ -4395,7 +4459,7 @@ impl App {
                         ui.label(RichText::new(&title).size(20.0).family(theme::bold()));
                         let gi = self.group_info.get(&user);
                         let sub = if is_group {
-                            format!("Gruppe · {} Mitglieder", gi.map(|g| g.members.len()).unwrap_or(0))
+                            tf!("Gruppe · {} Mitglieder", "Group · {} members", gi.map(|g| g.members.len()).unwrap_or(0))
                         } else if jid.server == whatsapp_rust::Server::Pn {
                             format!("+{user}")
                         } else {
@@ -4414,14 +4478,14 @@ impl App {
                     };
                     if let Some(g) = self.group_info.get(&user).cloned() {
                         if !g.description.is_empty() {
-                            section(ui, "Beschreibung");
+                            section(ui, t!("Beschreibung", "Description"));
                             ui.horizontal(|ui| {
                                 ui.add_space(16.0);
                                 ui.label(&g.description);
                             });
                         }
                     }
-                    section(ui, &format!("Medien, Links und Doks  ·  {} Fotos · {} Links · {} Doks", pics.len(), links, docs));
+                    section(ui, &tf!("Medien, Links und Doks  ·  {} Fotos · {} Links · {} Doks", "Media, links and docs  ·  {} photos · {} links · {} docs", pics.len(), links, docs));
                     ui.horizontal_wrapped(|ui| {
                         ui.add_space(12.0);
                         for (id, md) in pics.iter().take(9) {
@@ -4442,24 +4506,24 @@ impl App {
                         let gi = self.group_info.get(&user).cloned();
                         let admin = gi.as_ref().map(|g| g.i_am_admin).unwrap_or(false);
                         if admin {
-                            section(ui, "Gruppenname");
+                            section(ui, t!("Gruppenname", "Group name"));
                             ui.horizontal(|ui| {
                                 ui.add_space(16.0);
                                 if self.rename_buf.is_empty() {
                                     self.rename_buf = title.clone();
                                 }
                                 ui.add(egui::TextEdit::singleline(&mut self.rename_buf).desired_width(200.0));
-                                if ui.button("Ändern").clicked() && !self.rename_buf.trim().is_empty() {
+                                if ui.button(t!("Ändern", "Change")).clicked() && !self.rename_buf.trim().is_empty() {
                                     cmds.push(Cmd::GroupRename { jid: jid.clone(), name: self.rename_buf.trim().to_owned() });
                                 }
                             });
                         }
-                        section(ui, &format!("{} Mitglieder", gi.as_ref().map(|g| g.members.len()).unwrap_or(0)));
+                        section(ui, &tf!("{} Mitglieder", "{} members", gi.as_ref().map(|g| g.members.len()).unwrap_or(0)));
                         if admin {
                             ui.horizontal(|ui| {
                                 ui.add_space(16.0);
-                                ui.add(egui::TextEdit::singleline(&mut self.add_numbers).hint_text("Nummern, z. B. +49151…").desired_width(180.0));
-                                if ui.button("Hinzufügen").clicked() {
+                                ui.add(egui::TextEdit::singleline(&mut self.add_numbers).hint_text(t!("Nummern, z. B. +49151…", "Numbers, e.g. +49151…")).desired_width(180.0));
+                                if ui.button(t!("Hinzufügen", "Add")).clicked() {
                                     let nums: Vec<String> = self
                                         .add_numbers
                                         .split([',', ';', ' '])
@@ -4475,7 +4539,7 @@ impl App {
                             });
                             ui.horizontal(|ui| {
                                 ui.add_space(16.0);
-                                if ui.button("🔗 Einladungslink kopieren").clicked() {
+                                if ui.button(t!("🔗 Einladungslink kopieren", "🔗 Copy invite link")).clicked() {
                                     cmds.push(Cmd::GroupInvite(jid.clone()));
                                 }
                             });
@@ -4487,7 +4551,7 @@ impl App {
                                 let mu = user_of(&mj);
                                 let me = self.me.contains(&mu) || self.me.contains(&pn);
                                 let name = if me {
-                                    "Du".to_owned()
+                                    t!("Du", "You").to_owned()
                                 } else {
                                     self.name_for_user(&pn).or_else(|| self.name_for_user(&mu)).unwrap_or_else(|| if pn.is_empty() { mu.clone() } else { format!("+{pn}") })
                                 };
@@ -4497,23 +4561,23 @@ impl App {
                                         draw_avatar(ui, self.avatars.get(&pn).or_else(|| self.avatars.get(&mu)), &name, 34.0, self.settings.dark);
                                         ui.label(RichText::new(&name).size(14.5));
                                         if owner || is_admin {
-                                            ui.label(RichText::new(if owner { "Ersteller" } else { "Admin" }).size(11.0).color(pal.accent));
+                                            ui.label(RichText::new(if owner { t!("Ersteller", "Creator") } else { t!("Admin", "Admin") }).size(11.0).color(pal.accent));
                                         }
                                     })
                                     .response
                                     .interact(egui::Sense::click());
                                 if !me {
                                     resp.context_menu(|ui| {
-                                        if !pn.is_empty() && ui.button("Nachricht senden").clicked() {
+                                        if !pn.is_empty() && ui.button(t!("Nachricht senden", "Send message")).clicked() {
                                             jump = Some(format!("chat:{pn}"));
                                             ui.close_menu();
                                         }
                                         if admin {
-                                            if ui.button(if is_admin { "Admin-Rechte entziehen" } else { "Zum Admin machen" }).clicked() {
+                                            if ui.button(if is_admin { t!("Admin-Rechte entziehen", "Dismiss as admin") } else { t!("Zum Admin machen", "Make group admin") }).clicked() {
                                                 cmds.push(Cmd::GroupAdmin { jid: jid.clone(), member: mj.clone(), on: !is_admin });
                                                 ui.close_menu();
                                             }
-                                            if ui.button(RichText::new("Aus der Gruppe entfernen").color(pal.danger)).clicked() {
+                                            if ui.button(RichText::new(t!("Aus der Gruppe entfernen", "Remove from group")).color(pal.danger)).clicked() {
                                                 cmds.push(Cmd::GroupRemove { jid: jid.clone(), member: mj.clone() });
                                                 ui.close_menu();
                                             }
@@ -4531,7 +4595,7 @@ impl App {
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.add_space(16.0);
-                            if ui.button(RichText::new("Gruppe verlassen").color(pal.danger)).clicked() {
+                            if ui.button(RichText::new(t!("Gruppe verlassen", "Exit group")).color(pal.danger)).clicked() {
                                 cmds.push(Cmd::GroupLeave(jid.clone()));
                             }
                         });
@@ -4543,7 +4607,7 @@ impl App {
                             .filter(|(_, ms)| ms.iter().any(|(u, pn)| *u == user || *pn == user))
                             .filter_map(|(g, _)| self.chats.values().find(|c| c.is_group && c.jid.user.as_str() == g).map(|c| self.display_name(c)))
                             .collect();
-                        section(ui, &format!("{} gemeinsame Gruppen", common.len()));
+                        section(ui, &tf!("{} gemeinsame Gruppen", "{} groups in common", common.len()));
                         for g in common {
                             ui.horizontal(|ui| {
                                 ui.add_space(16.0);
@@ -4555,7 +4619,7 @@ impl App {
                         let blocked = self.blocklist.iter().any(|b| user_of(b) == user);
                         ui.horizontal(|ui| {
                             ui.add_space(16.0);
-                            if ui.button(RichText::new(if blocked { "Blockierung aufheben".to_owned() } else { format!("{title} blockieren") }).color(pal.danger)).clicked() {
+                            if ui.button(RichText::new(if blocked { t!("Blockierung aufheben", "Unblock").to_owned() } else { tf!("{title} blockieren", "Block {title}") }).color(pal.danger)).clicked() {
                                 cmds.push(Cmd::Block { jid: jid.clone(), on: !blocked });
                             }
                         });
@@ -4591,7 +4655,7 @@ impl App {
         let mut out = String::new();
         for m in &c.messages {
             let dt = chrono::DateTime::from_timestamp(m.ts, 0).map(|d| d.with_timezone(&chrono::Local).format("%d.%m.%y, %H:%M").to_string()).unwrap_or_default();
-            let who = if m.from_me { "Ich".to_owned() } else if c.is_group { m.sender_name.clone() } else { title.clone() };
+            let who = if m.from_me { t!("Ich", "Me").to_owned() } else if c.is_group { m.sender_name.clone() } else { title.clone() };
             let body = match (&m.media, &m.x.kind) {
                 (Some(md), _) if m.text.is_empty() => md.label(),
                 (Some(md), _) => format!("{} {}", md.label(), m.text),
@@ -4603,10 +4667,10 @@ impl App {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
         let dir = ["Downloads", "Download"].iter().map(|d| home.join(d)).find(|p| p.is_dir()).unwrap_or(home);
         let safe: String = title.chars().map(|ch| if ch.is_alphanumeric() || ch == ' ' || ch == '-' { ch } else { '_' }).collect();
-        let path = dir.join(format!("WhatsSnap-Chat mit {}.txt", safe.trim()));
+        let path = dir.join(tf!("WhatsSnap-Chat mit {}.txt", "WhatsSnap chat with {}.txt", safe.trim()));
         match std::fs::write(&path, out) {
-            Ok(()) => self.info = Some(format!("Exportiert: {}", path.display())),
-            Err(e) => self.info = Some(format!("Export fehlgeschlagen: {e}")),
+            Ok(()) => self.info = Some(tf!("Exportiert: {}", "Exported: {}", path.display())),
+            Err(e) => self.info = Some(tf!("Export fehlgeschlagen: {e}", "Export failed: {e}")),
         }
     }
 
@@ -4647,13 +4711,13 @@ impl App {
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.add_space(20.0);
-                    ui.label(RichText::new("Status").size(22.0).family(theme::bold()));
+                    ui.label(RichText::new(t!("Aktuelles", "Updates")).size(22.0).family(theme::bold()));
                 });
                 ui.add_space(10.0);
                 // eigener Status
                 egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 6)).show(ui, |ui| {
-                    ui.label(RichText::new("Mein Status").size(13.0).color(pal.dim));
-                    ui.add(egui::TextEdit::multiline(&mut self.status_text).hint_text("Text-Status schreiben …").desired_rows(2).desired_width(f32::INFINITY));
+                    ui.label(RichText::new(t!("Mein Status", "My status")).size(13.0).color(pal.dim));
+                    ui.add(egui::TextEdit::multiline(&mut self.status_text).hint_text(t!("Text-Status schreiben …", "Write a text status …")).desired_rows(2).desired_width(f32::INFINITY));
                     ui.horizontal(|ui| {
                         for (i, (_, c)) in COLORS.iter().enumerate() {
                             let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
@@ -4669,52 +4733,102 @@ impl App {
                     ui.horizontal(|ui| {
                         let recipients = self.status_recipients();
                         let ok = self.conn == Conn::Online;
-                        if ui.add_enabled(ok && !self.status_text.trim().is_empty(), egui::Button::new("Text posten")).clicked() {
+                        if ui.add_enabled(ok && !self.status_text.trim().is_empty(), egui::Button::new(t!("Text posten", "Post text"))).clicked() {
                             post = Some(Cmd::PostTextStatus { text: self.status_text.trim().to_owned(), argb: COLORS[self.status_color].0, recipients: recipients.clone() });
                             self.status_text.clear();
                         }
-                        if ui.add_enabled(ok, egui::Button::new("📷 Foto posten …")).clicked() {
+                        if ui.add_enabled(ok, egui::Button::new(t!("📷 Foto posten …", "📷 Post photo …"))).clicked() {
                             post = Some(Cmd::PostPhotoStatus { caption: std::mem::take(&mut self.status_text).trim().to_owned(), recipients });
                         }
                     });
-                    ui.label(RichText::new(format!("Geht an {} Kontakte mit Einzelchat.", self.status_recipients().len())).size(11.0).color(pal.dim));
+                    ui.label(RichText::new(tf!("Geht an {} Kontakte mit Einzelchat.", "Goes to {} contacts you have a chat with.", self.status_recipients().len())).size(11.0).color(pal.dim));
                 });
                 ui.separator();
                 if groups.is_empty() {
                     ui.add_space(20.0);
-                    ui.vertical_centered(|ui| ui.label(RichText::new("Keine Status-Updates in den letzten 24 Stunden.").color(pal.dim)));
+                    ui.vertical_centered(|ui| ui.label(RichText::new(t!("Keine Status-Updates in den letzten 24 Stunden.", "No status updates in the last 24 hours.")).color(pal.dim)));
                 }
                 if !self.channels_loaded && self.conn == Conn::Online {
                     self.channels_loaded = true;
                     let _ = self.cmd.send(Cmd::FetchChannels);
                 }
                 egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-                    if !self.channels.is_empty() {
+                    // Kanäle (dieselben Abos wie am Handy)
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        ui.label(RichText::new(t!("Kanäle", "Channels")).size(13.0).color(pal.dim));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            if ui.small_button(t!("+ Erstellen", "+ Create")).clicked() {
+                                self.channel_new = Some((String::new(), String::new()));
+                            }
+                            if ui.small_button(if self.news_tab == 1 { t!("Fertig", "Done") } else { t!("🔍 Finden", "🔍 Find") }).clicked() {
+                                self.news_tab = if self.news_tab == 1 { 0 } else { 1 };
+                            }
+                        });
+                    });
+                    if self.news_tab == 1 {
+                        egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 4)).show(ui, |ui| {
+                            let r = ui.add(egui::TextEdit::singleline(&mut self.channel_search).hint_text(t!("Kanäle suchen (Enter)", "Search channels (Enter)")).desired_width(f32::INFINITY));
+                            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.channel_search.trim().is_empty() {
+                                let _ = self.cmd.send(Cmd::ChannelSearch(self.channel_search.trim().to_owned()));
+                            }
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut self.channel_link).hint_text(t!("oder Kanal-Link einfügen", "or paste a channel link")).desired_width(220.0));
+                                if ui.button(t!("Abonnieren", "Follow")).clicked() && self.channel_link.contains("channel") {
+                                    let _ = self.cmd.send(Cmd::ChannelByLink(std::mem::take(&mut self.channel_link)));
+                                }
+                            });
+                            for c in self.channel_results.clone() {
+                                let followed = self.channels.iter().any(|x| x.jid == c.jid);
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(RichText::new(format!("📢 {}", c.name)).size(14.0));
+                                        ui.label(RichText::new(tf!("{} Abonnenten", "{} followers", fmt_count(c.subscribers))).size(11.5).color(pal.dim));
+                                    });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if !followed && ui.small_button(t!("Abonnieren", "Follow")).clicked() {
+                                            if let Ok(j) = c.jid.parse::<Jid>() {
+                                                let _ = self.cmd.send(Cmd::ChannelFollow { jid: j, on: true });
+                                            }
+                                        }
+                                        if followed {
+                                            ui.label(RichText::new(t!("✓ abonniert", "✓ following")).size(11.5).color(pal.accent));
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                    }
+                    if self.channels.is_empty() && self.news_tab == 0 {
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
-                            ui.label(RichText::new("Kanäle").size(13.0).color(pal.dim));
+                            ui.label(RichText::new(if self.channels_loaded { t!("Keine Kanäle abonniert.", "Not following any channels.") } else { t!("Kanäle werden geladen …", "Loading channels …") }).size(12.5).color(pal.dim));
                         });
-                        for (jid, name, subs) in self.channels.clone() {
-                            let sel = self.channel_sel.as_deref() == Some(jid.as_str());
-                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
-                            let inner = rect.shrink2(egui::vec2(8.0, 2.0));
-                            if sel || resp.hovered() {
-                                ui.painter().rect_filled(inner, 10.0, if sel { pal.selected } else { pal.hover });
-                            }
-                            ui.painter().text(inner.left_center() + egui::vec2(16.0, -8.0), egui::Align2::LEFT_CENTER, format!("📢 {name}"), egui::FontId::proportional(15.0), pal.text);
-                            ui.painter().text(inner.left_center() + egui::vec2(16.0, 11.0), egui::Align2::LEFT_CENTER, format!("{subs} Abonnenten"), egui::FontId::proportional(12.0), pal.dim);
-                            if resp.clicked() {
-                                self.channel_sel = Some(jid.clone());
-                                self.status_sel = None;
-                                if let Ok(j) = jid.parse::<Jid>() {
-                                    let _ = self.cmd.send(Cmd::FetchChannelPosts(j));
-                                }
-                            }
-                        }
-                        ui.separator();
                     }
+                    for c in self.channels.clone() {
+                        let sel = self.channel_sel.as_deref() == Some(c.jid.as_str());
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
+                        let inner = rect.shrink2(egui::vec2(8.0, 2.0));
+                        if sel || resp.hovered() {
+                            ui.painter().rect_filled(inner, 10.0, if sel { pal.selected } else { pal.hover });
+                        }
+                        ui.painter().text(inner.left_center() + egui::vec2(16.0, -8.0), egui::Align2::LEFT_CENTER, format!("📢 {}", c.name), egui::FontId::proportional(15.0), pal.text);
+                        let sub = if c.admin { tf!("Dein Kanal · {} Abonnenten", "Your channel · {} followers", fmt_count(c.subscribers)) } else { tf!("{} Abonnenten", "{} followers", fmt_count(c.subscribers)) };
+                        ui.painter().text(inner.left_center() + egui::vec2(16.0, 11.0), egui::Align2::LEFT_CENTER, sub, egui::FontId::proportional(12.0), pal.dim);
+                        if resp.clicked() {
+                            self.channel_sel = Some(c.jid.clone());
+                            self.status_sel = None;
+                            self.channel_refresh = None;
+                        }
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add_space(20.0);
+                        ui.label(RichText::new(t!("Status", "Status")).size(13.0).color(pal.dim));
+                    });
                     for (who, items) in &groups {
-                        let name = if who.is_empty() { "Mein Status".to_owned() } else { self.name_for_user(who).unwrap_or_else(|| format!("+{who}")) };
+                        let name = if who.is_empty() { t!("Mein Status", "My status").to_owned() } else { self.name_for_user(who).unwrap_or_else(|| format!("+{who}")) };
                         let unseen = items.iter().any(|m| !self.status_seen.contains(&m.id));
                         let sel = self.status_sel.as_ref().map(|s| &s.0 == who).unwrap_or(false);
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 66.0), egui::Sense::click());
@@ -4750,42 +4864,119 @@ impl App {
         let mut mark: Option<(String, String)> = None;
         egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(0x10, 0x10, 0x10))).show(ctx, |ui| {
             if let Some(ch) = self.channel_sel.clone() {
-                let name = self.channels.iter().find(|c| c.0 == ch).map(|c| c.1.clone()).unwrap_or_default();
+                // alle 60 Sekunden neu laden, solange der Kanal offen ist
+                if self.channel_refresh.map(|t| t.elapsed().as_secs() >= 60).unwrap_or(true) && self.conn == Conn::Online {
+                    self.channel_refresh = Some(std::time::Instant::now());
+                    if let Ok(j) = ch.parse::<Jid>() {
+                        let _ = self.cmd.send(Cmd::FetchChannelPosts(j));
+                    }
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(5));
+                let info = self.channels.iter().find(|c| c.jid == ch).cloned().unwrap_or_default();
+                let jid = ch.parse::<Jid>().ok();
                 ui.add_space(14.0);
-                ui.vertical_centered(|ui| ui.label(RichText::new(format!("📢 {name}")).size(18.0).color(Color32::WHITE).family(theme::bold())));
+                ui.horizontal(|ui| {
+                    ui.add_space(60.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("📢 {}", info.name)).size(18.0).color(Color32::WHITE).family(theme::bold()));
+                        ui.label(RichText::new(tf!("{} Abonnenten", "{} followers", fmt_count(info.subscribers))).color(Color32::from_gray(160)));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(60.0);
+                        if !info.admin && ui.button(t!("Deabonnieren", "Unfollow")).clicked() {
+                            if let Some(j) = jid.clone() {
+                                let _ = self.cmd.send(Cmd::ChannelFollow { jid: j, on: false });
+                                self.channel_sel = None;
+                            }
+                        }
+                    });
+                });
+                if !info.description.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(60.0);
+                        ui.label(RichText::new(&info.description).color(Color32::from_gray(180)).size(13.0));
+                    });
+                }
                 ui.add_space(8.0);
+                let post_h = if info.admin { 70.0 } else { 0.0 };
+                let mut react: Option<(u64, String)> = None;
                 match self.channel_posts.get(&ch) {
                     None => {
                         ui.vertical_centered(|ui| ui.spinner());
                     }
                     Some(posts) => {
-                        egui::ScrollArea::vertical().auto_shrink([false; 2]).stick_to_bottom(true).show(ui, |ui| {
-                            for (ts, text, media) in posts {
+                        egui::ScrollArea::vertical().auto_shrink([false; 2]).max_height(ui.available_height() - post_h).stick_to_bottom(true).show(ui, |ui| {
+                            for p in posts {
                                 egui::Frame::new()
                                     .fill(Color32::from_rgb(0x24, 0x26, 0x26))
                                     .corner_radius(8.0)
                                     .inner_margin(egui::Margin::symmetric(12, 8))
                                     .outer_margin(egui::Margin::symmetric(60, 4))
                                     .show(ui, |ui| {
-                                        ui.set_width(ui.available_width().min(620.0));
-                                        if !media.is_empty() {
-                                            ui.label(RichText::new(media).color(Color32::from_gray(170)));
+                                        ui.set_width(ui.available_width().min(640.0));
+                                        ui.style_mut().visuals.override_text_color = Some(Color32::WHITE);
+                                        if !p.media.is_empty() {
+                                            ui.label(RichText::new(&p.media).color(Color32::from_gray(170)));
                                         }
-                                        if !text.is_empty() {
-                                            ui.label(RichText::new(text).color(Color32::WHITE).size(14.5));
+                                        if !p.text.is_empty() {
+                                            ui.horizontal_wrapped(|ui| rich_label(ui, &p.text, 14.5, &mut self.emoji));
                                         }
-                                        ui.label(RichText::new(format!("{} {}", day_label(*ts), fmt_time(*ts))).size(11.0).color(Color32::from_gray(150)));
+                                        ui.horizontal(|ui| {
+                                            for (e, n) in &p.reactions {
+                                                if let Some(id) = self.emoji.get(ui.ctx(), &emoji::key(e)) {
+                                                    ui.add(egui::Image::new((id, egui::vec2(16.0, 16.0))));
+                                                }
+                                                ui.label(RichText::new(fmt_count(*n)).size(11.5).color(Color32::from_gray(170)));
+                                            }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.label(RichText::new(format!("{} {}", day_label(p.ts), fmt_time(p.ts))).size(11.0).color(Color32::from_gray(150)));
+                                                if !p.mine {
+                                                    ui.menu_button(RichText::new("☺+").size(12.0), |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            for e in ["👍", "❤️", "😂", "😮", "😢", "🙏"] {
+                                                                let clicked = match self.emoji.get(ui.ctx(), &emoji::key(e)) {
+                                                                    Some(id) => ui.add(egui::Button::image(egui::Image::new((id, egui::vec2(24.0, 24.0)))).frame(false)).clicked(),
+                                                                    None => ui.button(e).clicked(),
+                                                                };
+                                                                if clicked {
+                                                                    react = Some((p.server_id, e.to_owned()));
+                                                                    ui.close_menu();
+                                                                }
+                                                            }
+                                                        });
+                                                    });
+                                                }
+                                            });
+                                        });
                                     });
+                            }
+                            if posts.is_empty() {
+                                ui.vertical_centered(|ui| ui.label(RichText::new(t!("Noch keine Beiträge.", "No posts yet.")).color(Color32::from_gray(160))));
                             }
                         });
                     }
+                }
+                if let (Some((sid, e)), Some(j)) = (react, jid.clone()) {
+                    let _ = self.cmd.send(Cmd::ChannelReact { jid: j, server_id: sid, emoji: e });
+                    self.channel_refresh = Some(std::time::Instant::now() - std::time::Duration::from_secs(57));
+                }
+                if info.admin {
+                    ui.horizontal(|ui| {
+                        ui.add_space(60.0);
+                        ui.add(egui::TextEdit::multiline(&mut self.channel_post_text).hint_text(t!("Beitrag für deinen Kanal …", "Post to your channel …")).desired_rows(2).desired_width(ui.available_width() - 200.0));
+                        if ui.add_enabled(!self.channel_post_text.trim().is_empty(), egui::Button::new(t!("Veröffentlichen", "Publish"))).clicked() {
+                            if let Some(j) = jid.clone() {
+                                let _ = self.cmd.send(Cmd::ChannelPost { jid: j, text: std::mem::take(&mut self.channel_post_text).trim().to_owned() });
+                            }
+                        }
+                    });
                 }
                 return;
             }
             let Some((who, idx)) = self.status_sel.clone() else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.4);
-                    ui.label(RichText::new("Klicke auf einen Kontakt, um seinen Status anzusehen.").color(Color32::from_gray(170)));
+                    ui.label(RichText::new(t!("Klicke auf einen Kontakt, um seinen Status anzusehen.", "Click a contact to view their status.")).color(Color32::from_gray(170)));
                 });
                 return;
             };
@@ -4795,7 +4986,7 @@ impl App {
             if !self.status_seen.contains(&m.id) && !who.is_empty() {
                 mark = Some((m.id.clone(), m.sender.clone()));
             }
-            let name = if who.is_empty() { "Mein Status".to_owned() } else { self.name_for_user(&who).unwrap_or_else(|| format!("+{who}")) };
+            let name = if who.is_empty() { t!("Mein Status", "My status").to_owned() } else { self.name_for_user(&who).unwrap_or_else(|| format!("+{who}")) };
             // Fortschrittsbalken
             let full = ui.available_rect_before_wrap();
             let bar_y = full.top() + 12.0;
@@ -4830,7 +5021,7 @@ impl App {
                     }
                 } else {
                     child.label(RichText::new(md.label()).size(20.0).color(Color32::WHITE));
-                    if child.button("Öffnen").clicked() {
+                    if child.button(t!("Öffnen", "Open")).clicked() {
                         let _ = self.cmd.send(Cmd::OpenMedia { id: m.id.clone(), media: md.clone() });
                     }
                 }
@@ -4854,13 +5045,13 @@ impl App {
             let bottom = egui::Rect::from_min_size(egui::pos2(full.left(), full.bottom() - 50.0), egui::vec2(full.width(), 40.0));
             let mut b = ui.new_child(egui::UiBuilder::new().max_rect(bottom).layout(egui::Layout::left_to_right(egui::Align::Center)));
             b.add_space(full.width() / 2.0 - 170.0);
-            if b.add_enabled(idx > 0, egui::Button::new("◀ Zurück")).clicked() {
+            if b.add_enabled(idx > 0, egui::Button::new(t!("◀ Zurück", "◀ Back"))).clicked() {
                 go = -1;
             }
-            if !who.is_empty() && b.button("Antworten im Chat").clicked() {
+            if !who.is_empty() && b.button(t!("Antworten im Chat", "Reply in chat")).clicked() {
                 open_chat = Some(who.clone());
             }
-            if b.button("Weiter ▶").clicked() {
+            if b.button(t!("Weiter ▶", "Next ▶")).clicked() {
                 go = 1;
             }
             let keys = ui.input(|i| (i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::ArrowLeft)));
@@ -4900,6 +5091,31 @@ impl App {
         }
     }
 
+    fn channel_create_dialog(&mut self, ctx: &egui::Context) {
+        let Some((mut name, mut desc)) = self.channel_new.take() else { return };
+        let mut open = true;
+        let mut create = false;
+        egui::Window::new(t!("Kanal erstellen", "Create channel"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+                ui.add(egui::TextEdit::singleline(&mut name).hint_text(t!("Name des Kanals", "Channel name")).desired_width(f32::INFINITY));
+                ui.add(egui::TextEdit::multiline(&mut desc).hint_text(t!("Beschreibung (optional)", "Description (optional)")).desired_rows(3).desired_width(f32::INFINITY));
+                ui.label(RichText::new(t!("Kanäle sind öffentlich auffindbar. Abonnenten sehen deine Beiträge, aber nicht deine Nummer.", "Channels are publicly discoverable. Followers see your posts but not your number.")).small());
+                if ui.add_enabled(!name.trim().is_empty() && self.conn == Conn::Online, egui::Button::new(t!("Erstellen", "Create"))).clicked() {
+                    create = true;
+                }
+            });
+        if create {
+            let _ = self.cmd.send(Cmd::ChannelCreate { name: name.trim().to_owned(), description: desc.trim().to_owned() });
+        } else if open {
+            self.channel_new = Some((name, desc));
+        }
+    }
+
     /// Empfänger für eigenen Status: alle Kontakte mit Einzelchat (Telefonnummer).
     fn status_recipients(&self) -> Vec<Jid> {
         self.chats.values().filter(|c| !c.is_group && c.jid.server == whatsapp_rust::Server::Pn).map(|c| c.jid.clone()).collect()
@@ -4930,17 +5146,17 @@ impl App {
                                 draw_avatar(ui, self.avatars.get(&from), &title, 48.0, self.settings.dark);
                                 ui.vertical(|ui| {
                                     ui.label(RichText::new(&title).size(17.0).family(theme::bold()));
-                                    ui.label(RichText::new(if video { "Videoanruf (wird als Sprachanruf angenommen)" } else { "WhatsApp-Sprachanruf" }).color(pal.dim));
+                                    ui.label(RichText::new(if video { t!("Videoanruf (wird als Sprachanruf angenommen)", "Video call (will be answered as a voice call)") } else { t!("WhatsApp-Sprachanruf", "WhatsApp voice call") }).color(pal.dim));
                                 });
                             });
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                if ui.add(egui::Button::new(RichText::new("✆  Annehmen").color(Color32::WHITE)).fill(pal.accent).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0))).clicked() {
+                                if ui.add(egui::Button::new(RichText::new(t!("✆  Annehmen", "✆  Accept")).color(Color32::WHITE)).fill(pal.accent).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0))).clicked() {
                                     cmd = Some(Cmd::AcceptCall(id.clone()));
-                                    self.call = Some((from.clone(), "Verbinde …".into(), std::time::Instant::now(), false));
+                                    self.call = Some((from.clone(), t!("Verbinde …", "Connecting …").into(), std::time::Instant::now(), false));
                                     clear_in = true;
                                 }
-                                if ui.add(egui::Button::new(RichText::new("Ablehnen").color(Color32::WHITE)).fill(pal.danger).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0))).clicked() {
+                                if ui.add(egui::Button::new(RichText::new(t!("Ablehnen", "Decline")).color(Color32::WHITE)).fill(pal.danger).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0))).clicked() {
                                     cmd = Some(Cmd::RejectCall(id.clone()));
                                     clear_in = true;
                                 }
@@ -4952,7 +5168,7 @@ impl App {
                                 draw_avatar(ui, self.avatars.get(&peer), &title, 48.0, self.settings.dark);
                                 ui.vertical(|ui| {
                                     ui.label(RichText::new(&title).size(17.0).family(theme::bold()));
-                                    let t = if text == "Verbunden" {
+                                    let t = if text == t!("Verbunden", "Connected") {
                                         let s = start.elapsed().as_secs();
                                         format!("{}:{:02}", s / 60, s % 60)
                                     } else {
@@ -4963,14 +5179,14 @@ impl App {
                             });
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                let ml = if muted { "🎤 Stumm aus" } else { "🎤 Stumm" };
+                                let ml = if muted { t!("🎤 Stumm aus", "🎤 Unmute") } else { t!("🎤 Stumm", "🎤 Mute") };
                                 if ui.add(egui::Button::new(ml).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0)).selected(muted)).clicked() {
                                     cmd = Some(Cmd::MuteCall(!muted));
                                     if let Some(c) = self.call.as_mut() {
                                         c.3 = !muted;
                                     }
                                 }
-                                if ui.add(egui::Button::new(RichText::new("Auflegen").color(Color32::WHITE)).fill(pal.danger).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0))).clicked() {
+                                if ui.add(egui::Button::new(RichText::new(t!("Auflegen", "Hang up")).color(Color32::WHITE)).fill(pal.danger).corner_radius(18.0).min_size(egui::vec2(140.0, 36.0))).clicked() {
                                     cmd = Some(Cmd::Hangup);
                                 }
                             });
@@ -4990,16 +5206,16 @@ impl App {
         let Some((mut name, mut sel, mut nums)) = self.new_group.take() else { return };
         let mut open = true;
         let mut create = false;
-        egui::Window::new("Neue Gruppe")
+        egui::Window::new(t!("Neue Gruppe", "New group"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_width(360.0);
-                ui.add(egui::TextEdit::singleline(&mut name).hint_text("Gruppenname").desired_width(f32::INFINITY).margin(egui::vec2(10.0, 7.0)));
+                ui.add(egui::TextEdit::singleline(&mut name).hint_text(t!("Gruppenname", "Group name")).desired_width(f32::INFINITY).margin(egui::vec2(10.0, 7.0)));
                 ui.add_space(6.0);
-                ui.label(RichText::new("Mitglieder auswählen").small().color(pal.dim));
+                ui.label(RichText::new(t!("Mitglieder auswählen", "Select members")).small().color(pal.dim));
                 let mut people: Vec<(String, String)> = self
                     .chats
                     .values()
@@ -5019,9 +5235,9 @@ impl App {
                         }
                     }
                 });
-                ui.add(egui::TextEdit::singleline(&mut nums).hint_text("Weitere Nummern (mit Komma getrennt)").desired_width(f32::INFINITY));
+                ui.add(egui::TextEdit::singleline(&mut nums).hint_text(t!("Weitere Nummern (mit Komma getrennt)", "More numbers (comma-separated)")).desired_width(f32::INFINITY));
                 ui.add_space(6.0);
-                if ui.add_enabled(!name.trim().is_empty() && self.conn == Conn::Online, egui::Button::new("Gruppe erstellen")).clicked() {
+                if ui.add_enabled(!name.trim().is_empty() && self.conn == Conn::Online, egui::Button::new(t!("Gruppe erstellen", "Create group"))).clicked() {
                     create = true;
                 }
             });
@@ -5051,7 +5267,7 @@ impl App {
             self.show_archive = false;
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("list_search")));
             if new {
-                self.info = Some("Telefonnummer mit Ländervorwahl in die Suche tippen, z. B. +49 151 …".into());
+                self.info = Some(t!("Telefonnummer mit Ländervorwahl in die Suche tippen, z. B. +49 151 …", "Type a phone number with country code into the search, e.g. +49 151 …").into());
             }
         }
         if esc && !ctx.memory(|m| m.any_popup_open()) {
@@ -5092,14 +5308,14 @@ impl App {
         let Some((id, mut q)) = self.forward.take() else { return };
         let mut open = true;
         let mut target: Option<String> = None;
-        egui::Window::new("Weiterleiten an …")
+        egui::Window::new(t!("Weiterleiten an …", "Forward to …"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_width(340.0);
-                let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text("Chat suchen").desired_width(f32::INFINITY).margin(egui::vec2(10.0, 7.0)));
+                let r = ui.add(egui::TextEdit::singleline(&mut q).hint_text(t!("Chat suchen", "Search chat")).desired_width(f32::INFINITY).margin(egui::vec2(10.0, 7.0)));
                 r.request_focus();
                 ui.add_space(6.0);
                 let needle = q.to_lowercase();
@@ -5139,7 +5355,7 @@ impl App {
                 if let (Some(msg), Some(c)) = (msg, self.chats.get(&k)) {
                     let name = self.display_name(c);
                     let _ = self.cmd.send(Cmd::Forward { chat: c.jid.clone(), msg });
-                    self.info = Some(format!("Weitergeleitet an {name}"));
+                    self.info = Some(tf!("Weitergeleitet an {name}", "Forwarded to {name}"));
                 }
             }
             None if open => self.forward = Some((id, q)),
@@ -5161,7 +5377,7 @@ impl App {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("Zwischenablage-{}.png", now_ts()));
         if let Err(e) = rgba.save(&path) {
-            self.info = Some(format!("Bild aus der Zwischenablage: {e}"));
+            self.info = Some(tf!("Bild aus der Zwischenablage: {e}", "Image from clipboard: {e}"));
             return;
         }
         let thumb = image::DynamicImage::ImageRgba8(rgba).thumbnail(240, 240).to_rgba8();
@@ -5292,8 +5508,7 @@ fn install_desktop() -> std::io::Result<()> {
         .args(["-f", "-t"])
         .arg(share.join("icons/hicolor"))
         .status();
-    println!(
-        "Fertig. WhatsSnap steht jetzt im Anwendungsmenü und kann an die Taskleiste angeheftet werden."
+    println!("{}", t!("Fertig. WhatsSnap steht jetzt im Anwendungsmenü und kann an die Taskleiste angeheftet werden.", "Done. WhatsSnap is now in the application menu and can be pinned to the taskbar.")
     );
     Ok(())
 }
@@ -5301,7 +5516,7 @@ fn install_desktop() -> std::io::Result<()> {
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|a| a == "--install-desktop") {
         if let Err(e) = install_desktop() {
-            eprintln!("Installation fehlgeschlagen: {e}");
+            eprintln!("{}", tf!("Installation fehlgeschlagen: {e}", "Installation failed: {e}"));
             std::process::exit(1);
         }
         return Ok(());
@@ -5309,7 +5524,7 @@ fn main() -> eframe::Result<()> {
     // Tray-Klicks, zweiter Programmstart und Menü landen alle hier.
     let (ev_tx, ev_rx) = channel::<tray::TrayMsg>();
     if !single_instance(ev_tx.clone()) {
-        println!("WhatsSnap läuft schon, das Fenster wird geöffnet.");
+        println!("{}", t!("WhatsSnap läuft schon, das Fenster wird geöffnet.", "WhatsSnap is already running, opening its window."));
         return Ok(());
     }
 
@@ -5348,12 +5563,12 @@ fn main() -> eframe::Result<()> {
                     .with_inner_size([1280.0, 800.0])
                     .with_min_inner_size([640.0, 420.0])
                     .with_app_id("wa-snap")
-                    .with_title("WhatsSnap"),
+                    .with_title(t!("WhatsSnap", "WhatsSnap")),
                 run_and_return: true,
                 ..Default::default()
             };
             let core_ref = &mut core;
-            eframe::run_native("WhatsSnap", opts, Box::new(|cc| Ok(Box::new(Shell::new(cc, core_ref)))))?;
+            eframe::run_native(t!("WhatsSnap", "WhatsSnap"), opts, Box::new(|cc| Ok(Box::new(Shell::new(cc, core_ref)))))?;
         }
         show = true;
         let background = STASH.with(|s| s.borrow().as_ref().map(|a| a.settings.background).unwrap_or(true));

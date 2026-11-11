@@ -5,7 +5,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.12)
+## Funktionen (v0.13)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - 3D-Emojis im Stil von WhatsApp (Microsoft Fluent Emoji, fehlende aus Twemoji) in Nachrichten, Chatliste und Auswahl; alle 1900+ Emojis mit Kategorien wie bei WhatsApp, „Letzte“, deutscher Suche und Hauttönen (Rechtsklick); reine Emoji-Nachrichten werden groß angezeigt
@@ -24,7 +24,8 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Stummschalten für 8 Stunden, 1 Woche oder immer
 - Sprachanrufe: anrufen (📞 im Chat-Kopf), annehmen und ablehnen mit Anzeige oben, stummschalten, auflegen; Ton über PipeWire (`pw-record`/`pw-play`), ersatzweise PulseAudio oder ALSA. Videoanrufe werden als Sprachanruf angenommen
 - Status: Status der letzten 24 Stunden ansehen (◎ in der linken Leiste, grüner Ring = neu, Pfeiltasten blättern), eigenen Text- oder Foto-Status posten, aus dem Status in den Chat antworten
-- Kanäle: abonnierte Kanäle und ihre letzten Beiträge lesen (im Status-Bereich)
+- Kanäle (im Bereich „Aktuelles“): dieselben Abos wie am Handy, Beiträge lesen und mit Emojis reagieren, Kanäle suchen oder per Link abonnieren, deabonnieren, eigenen Kanal erstellen und darin posten
+- Oberfläche auf Deutsch oder Englisch (Einstellungen → Chats; Standard ist die Systemsprache)
 - Chat exportieren als Textdatei in den Downloads-Ordner (⋮-Menü im Chat)
 - Zusatzfunktionen: von anderen gelöschte Nachrichten weiter anzeigen (Schalter unter Einstellungen → WhatsSnap, standardmäßig aus), frühere Fassungen bearbeiteter Nachrichten ansehen (Maus über „Bearbeitet ⓘ“), mehr als 3 Chats anheften (ab dem 4. nur in WhatsSnap)
 - Eigene Nachrichten bearbeiten (bis 15 Minuten), „Bearbeitet“-Hinweis
@@ -53,14 +54,14 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Rechtsklick auf eine Nachricht: Reagieren, Antworten, Text kopieren, für alle löschen; Reaktionen, Antworten (Zitate), gelöschte und bearbeitete Nachrichten von anderen werden angezeigt
 - Diagnose-Log: `~/.local/share/wa-snap/wa-snap.log`
 
-**Noch nicht vorhanden:** Videoanrufe, Videos direkt in der App abspielen, in Kanälen posten, englische Oberfläche. Fehler bitte als Issue melden.
+**Noch nicht vorhanden:** Videoanrufe, Videos direkt in der App abspielen, Fotos in Kanäle posten. Fehler bitte als Issue melden.
 
 ## Installation auf Fedora (empfohlen)
 
 Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.12.0-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.13.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
@@ -103,3 +104,17 @@ Die Sitzung liegt in `~/.local/share/wa-snap/whatsapp.db` (Linux), heruntergelad
 MIT, siehe [LICENSE](LICENSE).
 
 Eingebaut sind außerdem libopus (BSD) und libwebp (BSD). Mitgeliefert werden die Schrift [Inter](https://github.com/rsms/inter) (SIL Open Font License 1.1, [assets/fonts/OFL.txt](assets/fonts/OFL.txt)) die Emoji-Grafiken von [Fluent Emoji](https://github.com/microsoft/fluentui-emoji) (© Microsoft, MIT, [assets/FLUENT-EMOJI-LICENSE.txt](assets/FLUENT-EMOJI-LICENSE.txt)) und [Twemoji](https://github.com/jdecked/twemoji) (© Twitter, Inc. und weitere, CC-BY 4.0, [assets/TWEMOJI-LICENSE.txt](assets/TWEMOJI-LICENSE.txt)). Reihenfolge, Kategorien und deutsche Suchbegriffe stammen aus [Emojibase](https://github.com/milesj/emojibase) (MIT). `tools/pack_emoji.py` erzeugt daraus `assets/emoji.bin` und `assets/emoji_list.json`.
+
+---
+
+## English
+
+WhatsSnap is a fast, native WhatsApp client for Linux written in Rust (egui). It is unofficial and not affiliated with WhatsApp or Meta; using unofficial clients may get your account banned. The UI follows your system language (German or English) and can be switched under Settings → Chats.
+
+Install on Fedora 40+:
+
+```bash
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.13.0-1.x86_64.rpm
+```
+
+Then start “WhatsSnap” from the app menu and scan the QR code with WhatsApp → Settings → Linked devices.

@@ -62,10 +62,12 @@ pub enum UiEvent {
     Edited { id: String, text: String },
     /// Datenschutz-Einstellungen von WhatsApp: (Kategorie, Wert), z. B. ("last", "contacts").
     Privacy(Vec<(String, String)>),
-    /// Abonnierte Kanäle: (JID, Name, Abonnenten)
-    Channels(Vec<(String, String, u64)>),
-    /// Beiträge eines Kanals: (Zeit, Text, Medienhinweis)
-    ChannelPosts { jid: String, posts: Vec<(i64, String, String)> },
+    /// Abonnierte Kanäle (wie am Handy)
+    Channels(Vec<Channel>),
+    /// Beiträge eines Kanals
+    ChannelPosts { jid: String, posts: Vec<ChannelPost> },
+    /// Treffer der Kanalsuche
+    ChannelSearch(Vec<Channel>),
     /// Eingehender Sprachanruf klingelt.
     CallIncoming { id: String, from: String, name: String, video: bool },
     /// Zustand des laufenden Anrufs (Text für die Anzeige).
@@ -130,6 +132,15 @@ pub enum Cmd {
     FetchPrivacy,
     FetchChannels,
     FetchChannelPosts(Jid),
+    ChannelReact { jid: Jid, server_id: u64, emoji: String },
+    ChannelSearch(String),
+    /// Kanal abonnieren (true) oder deabonnieren
+    ChannelFollow { jid: Jid, on: bool },
+    /// Kanal über Einladungslink (whatsapp.com/channel/…) abonnieren
+    ChannelByLink(String),
+    ChannelCreate { name: String, description: String },
+    /// Textbeitrag in eigenem Kanal veröffentlichen
+    ChannelPost { jid: Jid, text: String },
     /// Text-Status posten (Hintergrundfarbe ARGB) an diese Empfänger.
     PostTextStatus { text: String, argb: u32, recipients: Vec<Jid> },
     /// Foto-Status posten (ohne Pfad: Dateiauswahl).
@@ -174,6 +185,40 @@ pub enum Cmd {
     /// Bekannten Sticker erneut senden (ohne neuen Upload).
     SendSticker { chat: Jid, media: MediaRef },
     Quit,
+}
+
+/// Ein Kanal (Newsletter).
+#[derive(Clone, Default)]
+pub struct Channel {
+    pub jid: String,
+    pub name: String,
+    pub description: String,
+    pub subscribers: u64,
+    /// Ich bin Inhaber oder Admin (darf posten)
+    pub admin: bool,
+}
+
+/// Ein Kanalbeitrag.
+#[derive(Clone, Default)]
+pub struct ChannelPost {
+    pub server_id: u64,
+    pub ts: i64,
+    pub text: String,
+    pub media: String,
+    pub mine: bool,
+    /// (Emoji, Anzahl)
+    pub reactions: Vec<(String, u64)>,
+}
+
+fn channel_of(n: whatsapp_rust::features::NewsletterMetadata) -> Channel {
+    use whatsapp_rust::features::NewsletterRole as R;
+    Channel {
+        jid: n.jid.to_string(),
+        name: n.name,
+        description: n.description.unwrap_or_default(),
+        subscribers: n.subscriber_count,
+        admin: matches!(n.role, Some(R::Owner) | Some(R::Admin)),
+    }
 }
 
 /// Details einer Gruppe.
@@ -271,13 +316,13 @@ impl MediaRef {
     /// Kurzer Text für Chatliste und Benachrichtigung.
     pub fn label(&self) -> String {
         match self.kind.as_str() {
-            "image" => "📷 Foto".into(),
-            "sticker" => "Sticker".into(),
-            "video" => "🎥 Video".into(),
+            "image" => t!("📷 Foto", "📷 Photo").into(),
+            "sticker" => t!("Sticker", "Stickers").into(),
+            "video" => t!("🎥 Video", "🎥 Video").into(),
             "gif" => "GIF".into(),
-            "ptt" => format!("🎤 Sprachnachricht ({}:{:02})", self.seconds / 60, self.seconds % 60),
-            "audio" => "🎵 Audio".into(),
-            "document" => format!("📄 {}", if self.name.is_empty() { "Dokument" } else { &self.name }),
+            "ptt" => tf!("🎤 Sprachnachricht ({}:{:02})", "🎤 Voice message ({}:{:02})", self.seconds / 60, self.seconds % 60),
+            "audio" => t!("🎵 Audio", "🎵 Audio").into(),
+            "document" => format!("📄 {}", if self.name.is_empty() { t!("Dokument", "Document") } else { &self.name }),
             other => other.to_owned(),
         }
     }
@@ -413,7 +458,7 @@ async fn ensure_file(client: &Client, dir: &std::path::Path, id: &str, m: &Media
         return Ok(path);
     }
     if m.direct_path.is_empty() || m.key.is_empty() {
-        return Err("Medium ist nicht mehr verfügbar".into());
+        return Err(t!("Medium ist nicht mehr verfügbar", "Media is no longer available").into());
     }
     let bytes = client.download_from_params(&m.params()).await.map_err(|e| e.to_string())?;
     let _ = std::fs::create_dir_all(dir);
@@ -502,9 +547,9 @@ pub enum Extra {
 impl Extra {
     pub fn label(&self) -> String {
         match self {
-            Extra::Poll { name, .. } => format!("📊 {name}"),
+            Extra::Poll { name, .. } => tf!("📊 {name}", "📊 {name}"),
             Extra::Location { name, live, .. } => {
-                let base = if *live { "📍 Live-Standort" } else { "📍 Standort" };
+                let base = if *live { t!("📍 Live-Standort", "📍 Live location") } else { t!("📍 Standort", "📍 Location") };
                 if name.is_empty() { base.to_owned() } else { format!("{base}: {name}") }
             }
             Extra::Contact { name, .. } => format!("👤 {name}"),
@@ -640,7 +685,7 @@ pub fn log(msg: impl AsRef<str>) {
 /// Blockiert kurz, deshalb immer in einem eigenen Thread aufrufen.
 pub fn show_notification(title: &str, body: &str) -> Result<(), String> {
     let r = notify_rust::Notification::new()
-        .appname("WhatsSnap")
+        .appname(t!("WhatsSnap", "WhatsSnap"))
         .summary(title)
         .body(body)
         .icon("wa-snap")
@@ -653,7 +698,7 @@ pub fn show_notification(title: &str, body: &str) -> Result<(), String> {
         Err(e) => {
             log(format!("Benachrichtigung über D-Bus fehlgeschlagen: {e}"));
             match std::process::Command::new("notify-send")
-                .args(["-a", "WhatsSnap", "-i", "wa-snap", title, body])
+                .args(["-a", t!("WhatsSnap", "WhatsSnap"), "-i", "wa-snap", title, body])
                 .status()
             {
                 Ok(s) if s.success() => {
@@ -702,7 +747,7 @@ fn maybe_notify(state: &SharedNotify, m: &ChatMessage) {
         }
         let chat_name = st.names.get(&chat_user).cloned().unwrap_or_else(|| {
             if m.is_group {
-                "Gruppe".to_owned()
+                t!("Gruppe", "Group").to_owned()
             } else if !m.sender_name.is_empty() {
                 m.sender_name.clone()
             } else {
@@ -716,7 +761,7 @@ fn maybe_notify(state: &SharedNotify, m: &ChatMessage) {
             None => m.text.clone(),
         };
         let body = if !st.preview {
-            "Neue Nachricht".to_owned()
+            t!("Neue Nachricht", "New message").to_owned()
         } else if m.is_group && !m.sender_name.is_empty() {
             format!("{}: {}", m.sender_name, text)
         } else {
@@ -736,14 +781,14 @@ fn describe(message: &wa::Message, media_type: &str) -> String {
         return t.to_owned();
     }
     let label = match media_type {
-        "image" => "📷 Foto",
-        "video" | "gif" => "🎥 Video",
-        "ptt" | "audio" => "🎤 Sprachnachricht",
-        "document" => "📄 Dokument",
-        "sticker" => "Sticker",
-        "vcard" => "👤 Kontakt",
-        "location" | "livelocation" => "📍 Standort",
-        "" => "Nachricht",
+        "image" => t!("📷 Foto", "📷 Photo"),
+        "video" | "gif" => t!("🎥 Video", "🎥 Video"),
+        "ptt" | "audio" => t!("🎤 Sprachnachricht", "🎤 Voice message"),
+        "document" => t!("📄 Dokument", "📄 Document"),
+        "sticker" => t!("Sticker", "Stickers"),
+        "vcard" => t!("👤 Kontakt", "👤 Contact"),
+        "location" | "livelocation" => t!("📍 Standort", "📍 Location"),
+        "" => t!("Nachricht", "Message"),
         other => other,
     };
     if let Some(c) = message.get_caption() {
@@ -1160,9 +1205,9 @@ async fn run_call(
         while let Ok(ev) = events.recv().await {
             use whatsapp_rust::voip::CallEvent as E;
             let text = match ev {
-                E::RelayAllocated => "Verbunden",
-                E::RelayAllocateFailed(_) | E::RelayAllocateTimedOut => "Verbindung fehlgeschlagen",
-                E::RelayReconnectTimedOut => "Verbindung verloren",
+                E::RelayAllocated => t!("Verbunden", "Connected"),
+                E::RelayAllocateFailed(_) | E::RelayAllocateTimedOut => t!("Verbindung fehlgeschlagen", "Connection failed"),
+                E::RelayReconnectTimedOut => t!("Verbindung verloren", "Connection lost"),
                 _ => continue,
             };
             s2(UiEvent::CallState { peer: p2.clone(), text: text.into() });
@@ -1177,7 +1222,7 @@ async fn run_call(
         }
     }
     log(format!("Anruf mit {peer} beendet"));
-    send(UiEvent::CallEnded("Anruf beendet".into()));
+    send(UiEvent::CallEnded(t!("Anruf beendet", "Call ended").into()));
 }
 
 /// Datei hochladen und als Foto (Bilder) oder Dokument senden.
@@ -1192,7 +1237,7 @@ async fn send_file(
     use whatsapp_rust::wacore::download::MediaType as M;
     let data = tokio::fs::read(path).await.map_err(|e| format!("{}: {e}", path.display()))?;
     if data.len() > 100 * 1024 * 1024 {
-        return Err("Datei ist größer als 100 MB".into());
+        return Err(t!("Datei ist größer als 100 MB", "File is larger than 100 MB").into());
     }
     let mime = mime_of(path);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1365,7 +1410,7 @@ pub fn spawn(
                 let store = match SqliteStore::new(&dir.join("whatsapp.db").to_string_lossy()).await {
                     Ok(s) => s,
                     Err(e) => {
-                        send(UiEvent::Status(format!("Datenbank-Fehler: {e}")));
+                        send(UiEvent::Status(tf!("Datenbank-Fehler: {e}", "Database error: {e}")));
                         return;
                     }
                 };
@@ -1403,6 +1448,9 @@ pub fn spawn(
                             s(UiEvent::Connected);
                             let me: Vec<String> = [client.pn(), client.lid()].into_iter().flatten().map(|j| j.user.to_string()).collect();
                             s(UiEvent::Me(me));
+                            if let Ok(list) = client.newsletter().list_subscribed().await {
+                                s(UiEvent::Channels(list.into_iter().map(channel_of).collect()));
+                            }
                             match client.groups().get_participating().await {
                                 Ok(map) => {
                                     log(format!("Gruppen vom Server: {}", map.len()));
@@ -1565,7 +1613,7 @@ pub fn spawn(
                                                 }
                                                 let title = if name.is_empty() { format!("+{from}") } else { name.clone() };
                                                 std::thread::spawn(move || {
-                                                    let _ = show_notification(&format!("📞 Anruf von {title}"), "In WhatsSnap annehmen oder ablehnen");
+                                                    let _ = show_notification(&tf!("📞 Anruf von {title}", "📞 Call from {title}"), t!("In WhatsSnap annehmen oder ablehnen", "Accept or decline in WhatsSnap"));
                                                 });
                                                 play_notify_sound();
                                                 s(UiEvent::CallIncoming { id, from, name, video });
@@ -1573,7 +1621,7 @@ pub fn spawn(
                                             CallAction::Terminate { .. } | CallAction::Reject { .. } => {
                                                 let was_ringing = ringing.lock().ok().map(|mut r| r.remove(&id).is_some()).unwrap_or(false);
                                                 if was_ringing {
-                                                    s(UiEvent::CallEnded("Anruf beendet".into()));
+                                                    s(UiEvent::CallEnded(t!("Anruf beendet", "Call ended").into()));
                                                 }
                                             }
                                             _ => {}
@@ -1583,7 +1631,7 @@ pub fn spawn(
                                         if let Ok(mut r) = ringing.lock() {
                                             r.remove(&m.call_id);
                                         }
-                                        s(UiEvent::CallEnded("Verpasster Anruf".into()));
+                                        s(UiEvent::CallEnded(t!("Verpasster Anruf", "Missed call").into()));
                                     }
                                     Event::StarUpdate(st) => {
                                         s(UiEvent::Starred { id: st.message_id.clone(), on: st.action.starred.unwrap_or(false) });
@@ -1693,12 +1741,12 @@ pub fn spawn(
                 let bot = match bot {
                     Ok(b) => b,
                     Err(e) => {
-                        send(UiEvent::Status(format!("Start fehlgeschlagen: {e}")));
+                        send(UiEvent::Status(tf!("Start fehlgeschlagen: {e}", "Start failed: {e}")));
                         return;
                     }
                 };
 
-                send(UiEvent::Status("Verbinde …".into()));
+                send(UiEvent::Status(t!("Verbinde …", "Connecting …").into()));
                 let client: Arc<Client> = bot.client();
                 let mut handle = bot.spawn();
 
@@ -1707,7 +1755,7 @@ pub fn spawn(
                     Ok(()) => log(format!("{what}: ok")),
                     Err(e) => {
                         log(format!("{what} fehlgeschlagen: {e}"));
-                        send(UiEvent::Info(format!("{what} fehlgeschlagen: {e}")));
+                        send(UiEvent::Info(tf!("{what} fehlgeschlagen: {e}", "{what} failed: {e}")));
                     }
                 };
 
@@ -1756,7 +1804,7 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         match client.edit_message(chat, id.clone(), wa::Message::text(text.clone())).await {
                                             Ok(_) => send(UiEvent::Edited { id, text }),
-                                            Err(e) => send(UiEvent::Info(format!("Bearbeiten fehlgeschlagen: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Bearbeiten fehlgeschlagen: {e}", "Editing failed: {e}"))),
                                         }
                                     });
                                 }
@@ -1769,14 +1817,14 @@ pub fn spawn(
                                         } else {
                                             ca.unstar_message(&chat, part.as_ref(), &id, from_me).await
                                         };
-                                        report(&send, "Markieren", r.map_err(|e| e.to_string()));
+                                        report(&send, t!("Markieren", "Starring"), r.map_err(|e| e.to_string()));
                                     });
                                 }
                                 Cmd::LoadOlder { chat, id, from_me, ts } => {
                                     tokio::spawn(async move {
                                         match client.fetch_message_history(&chat, &id, from_me, ts * 1000, 50).await {
-                                            Ok(_) => send(UiEvent::Info("Ältere Nachrichten werden vom Handy geladen …".into())),
-                                            Err(e) => send(UiEvent::Info(format!("Ältere Nachrichten: {e}"))),
+                                            Ok(_) => send(UiEvent::Info(t!("Ältere Nachrichten werden vom Handy geladen …", "Loading older messages from your phone …").into())),
+                                            Err(e) => send(UiEvent::Info(tf!("Ältere Nachrichten: {e}", "Older messages: {e}"))),
                                         }
                                     });
                                 }
@@ -1784,7 +1832,7 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         let creator_jid = if creator.is_empty() { client.pn().unwrap_or_default() } else { creator.parse::<Jid>().unwrap_or_default() };
                                         if let Err(e) = client.polls().vote(chat, &poll, &creator_jid, &secret, &options).await {
-                                            send(UiEvent::Info(format!("Abstimmen fehlgeschlagen: {e}")));
+                                            send(UiEvent::Info(tf!("Abstimmen fehlgeschlagen: {e}", "Voting failed: {e}")));
                                         }
                                     });
                                 }
@@ -1812,7 +1860,7 @@ pub fn spawn(
                                         };
                                         if let Err(e) = client.send_message(&chat, msg).await {
                                             log(format!("Reaktion fehlgeschlagen: {e}"));
-                                            send(UiEvent::Info(format!("Reaktion fehlgeschlagen: {e}")));
+                                            send(UiEvent::Info(tf!("Reaktion fehlgeschlagen: {e}", "Reaction failed: {e}")));
                                         }
                                     });
                                 }
@@ -1820,7 +1868,7 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         match client.revoke_message(chat, id.clone(), whatsapp_rust::RevokeType::Sender).await {
                                             Ok(()) => send(UiEvent::Revoked { id }),
-                                            Err(e) => send(UiEvent::Info(format!("Löschen fehlgeschlagen: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Löschen fehlgeschlagen: {e}", "Deleting failed: {e}"))),
                                         }
                                     });
                                 }
@@ -1885,14 +1933,14 @@ pub fn spawn(
                                             (true, None) => ca.mute_chat(&jid).await,
                                             (false, _) => ca.unmute_chat(&jid).await,
                                         };
-                                        report(&send, &format!("Stummschalten {jid}"), r.map_err(|e| e.to_string()));
+                                        report(&send, &tf!("Stummschalten {jid}", "Muting {jid}"), r.map_err(|e| e.to_string()));
                                     });
                                 }
                                 Cmd::SetPin { jid, on } => {
                                     tokio::spawn(async move {
                                         let ca = client.chat_actions();
                                         let r = if on { ca.pin_chat(&jid).await } else { ca.unpin_chat(&jid).await };
-                                        report(&send, &format!("Anheften {jid}"), r.map_err(|e| e.to_string()));
+                                        report(&send, &tf!("Anheften {jid}", "Pinning {jid}"), r.map_err(|e| e.to_string()));
                                     });
                                 }
                                 Cmd::SetArchive { jid, on, last } => {
@@ -1904,7 +1952,7 @@ pub fn spawn(
                                         } else {
                                             ca.unarchive_chat(&jid, range).await
                                         };
-                                        report(&send, &format!("Archivieren {jid}"), r.map_err(|e| e.to_string()));
+                                        report(&send, &tf!("Archivieren {jid}", "Archiving {jid}"), r.map_err(|e| e.to_string()));
                                     });
                                 }
                                 Cmd::MarkRead { jid, msgs, last } => {
@@ -1935,23 +1983,23 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         let r = client.profile().set_push_name(&n).await;
                                         let ok = r.is_ok();
-                                        report(&send, "Profilname", r.map_err(|e| e.to_string()));
+                                        report(&send, t!("Profilname", "Profile name"), r.map_err(|e| e.to_string()));
                                         if ok {
-                                            send(UiEvent::Info("Profilname bei WhatsApp gespeichert".into()));
+                                            send(UiEvent::Info(t!("Profilname bei WhatsApp gespeichert", "Profile name saved to WhatsApp").into()));
                                         }
                                     });
                                 }
                                 Cmd::SetAbout(t) => {
                                     tokio::spawn(async move {
                                         let r = client.profile().set_status_text(&t).await;
-                                        report(&send, "Info-Text", r.map_err(|e| e.to_string()));
+                                        report(&send, t!("Info-Text", "About text"), r.map_err(|e| e.to_string()));
                                     });
                                 }
                                 Cmd::TestNotify => {
                                     std::thread::spawn(move || {
-                                        let m = match show_notification("WhatsSnap", "Test-Benachrichtigung") {
-                                            Ok(()) => "Test-Benachrichtigung verschickt. Wenn keine erschien, blockiert das System sie (Systemeinstellungen → Benachrichtigungen).".to_owned(),
-                                            Err(e) => format!("Benachrichtigung fehlgeschlagen: {e}"),
+                                        let m = match show_notification(t!("WhatsSnap", "WhatsSnap"), t!("Test-Benachrichtigung", "Test notification")) {
+                                            Ok(()) => t!("Test-Benachrichtigung verschickt. Wenn keine erschien, blockiert das System sie (Systemeinstellungen → Benachrichtigungen).", "Test notification sent. If none appeared, your system is blocking it (System Settings → Notifications).").to_owned(),
+                                            Err(e) => tf!("Benachrichtigung fehlgeschlagen: {e}", "Notification failed: {e}"),
                                         };
                                         send(UiEvent::Info(m));
                                     });
@@ -1997,13 +2045,13 @@ pub fn spawn(
                                 Cmd::OpenMedia { id, media } => {
                                     let dir = media_dir.clone();
                                     tokio::spawn(async move {
-                                        send(UiEvent::Info(format!("{} wird geladen …", media.label())));
+                                        send(UiEvent::Info(tf!("{} wird geladen …", "Loading {} …", media.label())));
                                         match ensure_file(&client, &dir, &id, &media).await {
                                             Ok(path) => {
                                                 let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
                                                 send(UiEvent::Info(String::new()));
                                             }
-                                            Err(e) => send(UiEvent::Info(format!("Herunterladen fehlgeschlagen: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Herunterladen fehlgeschlagen: {e}", "Download failed: {e}"))),
                                         }
                                     });
                                 }
@@ -2012,28 +2060,32 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         let path = match path {
                                             Some(p) => p,
-                                            None => match rfd::AsyncFileDialog::new().set_title("Datei senden").pick_file().await {
+                                            None => match rfd::AsyncFileDialog::new().set_title(t!("Datei senden", "Send file")).pick_file().await {
                                                 Some(f) => f.path().to_path_buf(),
                                                 None => return,
                                             },
                                         };
                                         if let Err(e) = send_file(&client, &send, &dir, &chat, &path, caption).await {
                                             log(format!("Datei senden fehlgeschlagen: {e}"));
-                                            send(UiEvent::Info(format!("Datei senden fehlgeschlagen: {e}")));
+                                            send(UiEvent::Info(tf!("Datei senden fehlgeschlagen: {e}", "Sending file failed: {e}")));
                                         }
                                     });
                                 }
                                 Cmd::FetchChannels => {
                                     tokio::spawn(async move {
                                         match client.newsletter().list_subscribed().await {
-                                            Ok(list) => send(UiEvent::Channels(list.into_iter().map(|n| (n.jid.to_string(), n.name, n.subscriber_count)).collect())),
+                                            Ok(list) => {
+                                                log(format!("Kanäle: {}", list.len()));
+                                                send(UiEvent::Channels(list.into_iter().map(channel_of).collect()))
+                                            }
                                             Err(e) => log(format!("Kanäle: {e}")),
                                         }
                                     });
                                 }
                                 Cmd::FetchChannelPosts(jid) => {
                                     tokio::spawn(async move {
-                                        match client.newsletter().get_messages(jid.clone(), 30, None).await {
+                                        let _ = client.newsletter().subscribe_live_updates(jid.clone()).await;
+                                        match client.newsletter().get_messages(jid.clone(), 40, None).await {
                                             Ok(list) => {
                                                 let posts = list
                                                     .into_iter()
@@ -2046,12 +2098,133 @@ pub fn spawn(
                                                             }
                                                             None => (String::new(), String::new()),
                                                         };
-                                                        (m.timestamp as i64, text, media)
+                                                        ChannelPost {
+                                                            server_id: m.server_id,
+                                                            ts: m.timestamp as i64,
+                                                            text,
+                                                            media,
+                                                            mine: m.is_sender,
+                                                            reactions: m.reactions.iter().map(|r| (r.code.clone(), r.count)).collect(),
+                                                        }
                                                     })
                                                     .collect();
                                                 send(UiEvent::ChannelPosts { jid: jid.to_string(), posts });
                                             }
-                                            Err(e) => send(UiEvent::Info(format!("Kanal laden: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Kanal laden: {e}", "Loading channel: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::ChannelReact { jid, server_id, emoji } => {
+                                    tokio::spawn(async move {
+                                        if let Err(e) = client.newsletter().send_reaction(&jid, server_id, &emoji).await {
+                                            send(UiEvent::Info(tf!("Reaktion: {e}", "Reaction: {e}")));
+                                        }
+                                    });
+                                }
+                                Cmd::ChannelSearch(q) => {
+                                    tokio::spawn(async move {
+                                        use whatsapp_rust::wacore::iq::mex_operations::fetch_newsletter_directory_search_results as op;
+                                        let vars = op::Variables {
+                                            fetch_status_metadata: Some(false),
+                                            input: Some(op::Input { categories: None, limit: Some(30), search_text: Some(q), start_cursor: None }),
+                                        };
+                                        let req = whatsapp_rust::features::MexRequest::new(op::NAME, op::DOC_ID, vars);
+                                        match client.mex().query(req).await {
+                                            Ok(resp) => {
+                                                let data = resp.data.unwrap_or_default();
+                                                let list: Vec<Channel> = data["xwa2_newsletters_directory_search"]["result"]
+                                                    .as_array()
+                                                    .cloned()
+                                                    .unwrap_or_default()
+                                                    .iter()
+                                                    .map(|r| {
+                                                        let t = &r["thread_metadata"];
+                                                        Channel {
+                                                            jid: r["id"].as_str().unwrap_or("").to_owned(),
+                                                            name: t["name"]["text"].as_str().unwrap_or("").to_owned(),
+                                                            description: t["description"]["text"].as_str().unwrap_or("").to_owned(),
+                                                            subscribers: t["subscribers_count"].as_i64().or_else(|| t["subscribers_count"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0) as u64,
+                                                            admin: false,
+                                                        }
+                                                    })
+                                                    .filter(|c| !c.jid.is_empty())
+                                                    .collect();
+                                                send(UiEvent::ChannelSearch(list));
+                                            }
+                                            Err(e) => send(UiEvent::Info(tf!("Kanalsuche: {e}", "Channel search: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::ChannelFollow { jid, on } => {
+                                    tokio::spawn(async move {
+                                        let n = client.newsletter();
+                                        let r = if on { n.join(&jid).await.map(|_| ()) } else { n.leave(&jid).await };
+                                        match r {
+                                            Ok(()) => {
+                                                send(UiEvent::Info(if on { t!("Kanal abonniert", "Channel followed").into() } else { t!("Kanal deabonniert", "Channel unfollowed").into() }));
+                                                if let Ok(list) = n.list_subscribed().await {
+                                                    send(UiEvent::Channels(list.into_iter().map(channel_of).collect()));
+                                                }
+                                            }
+                                            Err(e) => send(UiEvent::Info(tf!("Kanal: {e}", "Channel: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::ChannelByLink(link) => {
+                                    tokio::spawn(async move {
+                                        let code = link.trim().trim_end_matches('/').rsplit('/').next().unwrap_or("").to_owned();
+                                        let n = client.newsletter();
+                                        match n.get_metadata_by_invite(&code).await {
+                                            Ok(meta) => match n.join(&meta.jid).await {
+                                                Ok(_) => {
+                                                    send(UiEvent::Info(tf!("Kanal „{}“ abonniert", "Following channel “{}”", meta.name)));
+                                                    if let Ok(list) = n.list_subscribed().await {
+                                                        send(UiEvent::Channels(list.into_iter().map(channel_of).collect()));
+                                                    }
+                                                }
+                                                Err(e) => send(UiEvent::Info(tf!("Abonnieren: {e}", "Follow: {e}"))),
+                                            },
+                                            Err(e) => send(UiEvent::Info(tf!("Kanal-Link: {e}", "Channel link: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::ChannelCreate { name, description } => {
+                                    tokio::spawn(async move {
+                                        let n = client.newsletter();
+                                        let d = if description.trim().is_empty() { None } else { Some(description.as_str()) };
+                                        match n.create(&name, d).await {
+                                            Ok(_) => {
+                                                send(UiEvent::Info(tf!("Kanal „{name}“ erstellt", "Channel “{name}” created")));
+                                                if let Ok(list) = n.list_subscribed().await {
+                                                    send(UiEvent::Channels(list.into_iter().map(channel_of).collect()));
+                                                }
+                                            }
+                                            Err(e) => send(UiEvent::Info(tf!("Kanal erstellen: {e}", "Creating channel: {e}"))),
+                                        }
+                                    });
+                                }
+                                Cmd::ChannelPost { jid, text } => {
+                                    tokio::spawn(async move {
+                                        match client.send_message(&jid, wa::Message::text(text)).await {
+                                            Ok(_) => {
+                                                send(UiEvent::Info(t!("Beitrag veröffentlicht", "Post published").into()));
+                                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                                if let Ok(list) = client.newsletter().get_messages(jid.clone(), 40, None).await {
+                                                    let posts = list
+                                                        .into_iter()
+                                                        .map(|m| ChannelPost {
+                                                            server_id: m.server_id,
+                                                            ts: m.timestamp as i64,
+                                                            text: m.message.as_ref().and_then(|x| x.text_content().map(|t| t.to_owned())).unwrap_or_default(),
+                                                            media: m.message.as_ref().and_then(media_of).map(|x| x.0.label()).unwrap_or_default(),
+                                                            mine: m.is_sender,
+                                                            reactions: m.reactions.iter().map(|r| (r.code.clone(), r.count)).collect(),
+                                                        })
+                                                        .collect();
+                                                    send(UiEvent::ChannelPosts { jid: jid.to_string(), posts });
+                                                }
+                                            }
+                                            Err(e) => send(UiEvent::Info(tf!("Veröffentlichen: {e}", "Publishing: {e}"))),
                                         }
                                     });
                                 }
@@ -2059,15 +2232,15 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         let font = wa::message::extended_text_message::FontType::SYSTEM;
                                         match client.status().send_text(&text, argb, font, &recipients, Default::default()).await {
-                                            Ok(_) => send(UiEvent::Info(format!("Status gepostet ({} Empfänger)", recipients.len()))),
-                                            Err(e) => send(UiEvent::Info(format!("Status posten: {e}"))),
+                                            Ok(_) => send(UiEvent::Info(tf!("Status gepostet ({} Empfänger)", "Status posted ({} recipients)", recipients.len()))),
+                                            Err(e) => send(UiEvent::Info(tf!("Status posten: {e}", "Posting status: {e}"))),
                                         }
                                     });
                                 }
                                 Cmd::PostPhotoStatus { caption, recipients } => {
                                     tokio::spawn(async move {
                                         use whatsapp_rust::wacore::download::MediaType as M;
-                                        let Some(f) = rfd::AsyncFileDialog::new().set_title("Foto für Status").add_filter("Bilder", &["jpg", "jpeg", "png", "webp"]).pick_file().await else { return };
+                                        let Some(f) = rfd::AsyncFileDialog::new().set_title(t!("Foto für Status", "Photo for status")).add_filter(t!("Bilder", "Images"), &["jpg", "jpeg", "png", "webp"]).pick_file().await else { return };
                                         let path = f.path().to_path_buf();
                                         let prepared = tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, Vec<u8>), String> {
                                             let img = image::open(&path).map_err(|e| e.to_string())?;
@@ -2082,21 +2255,21 @@ pub fn spawn(
                                         let (data, thumb) = match prepared {
                                             Ok(x) => x,
                                             Err(e) => {
-                                                send(UiEvent::Info(format!("Foto-Status: {e}")));
+                                                send(UiEvent::Info(tf!("Foto-Status: {e}", "Photo status: {e}")));
                                                 return;
                                             }
                                         };
                                         let up = match client.upload(data, M::Image, Default::default()).await {
                                             Ok(u) => u,
                                             Err(e) => {
-                                                send(UiEvent::Info(format!("Foto-Status hochladen: {e}")));
+                                                send(UiEvent::Info(tf!("Foto-Status hochladen: {e}", "Uploading photo status: {e}")));
                                                 return;
                                             }
                                         };
                                         let cap = if caption.is_empty() { None } else { Some(caption.as_str()) };
                                         match client.status().send_image(up, thumb, cap, &recipients, Default::default()).await {
-                                            Ok(_) => send(UiEvent::Info("Foto-Status gepostet".into())),
-                                            Err(e) => send(UiEvent::Info(format!("Foto-Status: {e}"))),
+                                            Ok(_) => send(UiEvent::Info(t!("Foto-Status gepostet", "Photo status posted").into())),
+                                            Err(e) => send(UiEvent::Info(tf!("Foto-Status: {e}", "Photo status: {e}"))),
                                         }
                                     });
                                 }
@@ -2107,17 +2280,17 @@ pub fn spawn(
                                         let (mic, spk) = match crate::call::open(&procs) {
                                             Ok(x) => x,
                                             Err(e) => {
-                                                send(UiEvent::CallEnded(format!("Audio nicht verfügbar: {e}")));
+                                                send(UiEvent::CallEnded(tf!("Audio nicht verfügbar: {e}", "Audio not available: {e}")));
                                                 return;
                                             }
                                         };
-                                        send(UiEvent::CallState { peer: peer.clone(), text: "Rufe an …".into() });
+                                        send(UiEvent::CallState { peer: peer.clone(), text: t!("Rufe an …", "Calling …").into() });
                                         match client.voip().call(&jid).audio(mic, spk).start().await {
                                             Ok(h) => run_call(h, active, procs, client.clone(), send.clone(), peer).await,
                                             Err(e) => {
                                                 procs.stop();
                                                 log(format!("Anruf fehlgeschlagen: {e}"));
-                                                send(UiEvent::CallEnded(format!("Anruf fehlgeschlagen: {e}")));
+                                                send(UiEvent::CallEnded(tf!("Anruf fehlgeschlagen: {e}", "Call failed: {e}")));
                                             }
                                         }
                                     });
@@ -2126,7 +2299,7 @@ pub fn spawn(
                                     let (active, procs, ringing) = (active.clone(), procs.clone(), ringing.clone());
                                     tokio::spawn(async move {
                                         let Some(inc) = ringing.lock().ok().and_then(|mut r| r.remove(&id)) else {
-                                            send(UiEvent::CallEnded("Anruf nicht mehr verfügbar".into()));
+                                            send(UiEvent::CallEnded(t!("Anruf nicht mehr verfügbar", "Call no longer available").into()));
                                             return;
                                         };
                                         let peer = inc.from.user.to_string();
@@ -2134,17 +2307,17 @@ pub fn spawn(
                                             Ok(x) => x,
                                             Err(e) => {
                                                 let _ = client.voip().reject(&inc).await;
-                                                send(UiEvent::CallEnded(format!("Audio nicht verfügbar: {e}")));
+                                                send(UiEvent::CallEnded(tf!("Audio nicht verfügbar: {e}", "Audio not available: {e}")));
                                                 return;
                                             }
                                         };
-                                        send(UiEvent::CallState { peer: peer.clone(), text: "Verbinde …".into() });
+                                        send(UiEvent::CallState { peer: peer.clone(), text: t!("Verbinde …", "Connecting …").into() });
                                         match client.voip().accept(&inc).audio(mic, spk).start().await {
                                             Ok(h) => run_call(h, active, procs, client.clone(), send.clone(), peer).await,
                                             Err(e) => {
                                                 procs.stop();
                                                 log(format!("Annehmen fehlgeschlagen: {e}"));
-                                                send(UiEvent::CallEnded(format!("Annehmen fehlgeschlagen: {e}")));
+                                                send(UiEvent::CallEnded(tf!("Annehmen fehlgeschlagen: {e}", "Accepting failed: {e}")));
                                             }
                                         }
                                     });
@@ -2155,7 +2328,7 @@ pub fn spawn(
                                         if let Some(inc) = ringing.lock().ok().and_then(|mut r| r.remove(&id)) {
                                             let _ = client.voip().reject(&inc).await;
                                         }
-                                        send(UiEvent::CallEnded("Abgelehnt".into()));
+                                        send(UiEvent::CallEnded(t!("Abgelehnt", "Declined").into()));
                                     });
                                 }
                                 Cmd::Hangup => {
@@ -2167,7 +2340,7 @@ pub fn spawn(
                                             h.hangup().await;
                                         }
                                         procs.stop();
-                                        send(UiEvent::CallEnded("Aufgelegt".into()));
+                                        send(UiEvent::CallEnded(t!("Aufgelegt", "Hung up").into()));
                                     });
                                 }
                                 Cmd::MuteCall(on) => {
@@ -2200,7 +2373,7 @@ pub fn spawn(
                                                     i_am_admin,
                                                 }));
                                             }
-                                            Err(e) => send(UiEvent::Info(format!("Gruppeninfo: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Gruppeninfo: {e}", "Group info: {e}"))),
                                         }
                                     });
                                 }
@@ -2212,9 +2385,9 @@ pub fn spawn(
                                         match client.groups().create_group(opts).await {
                                             Ok(r) => {
                                                 send(UiEvent::Groups(vec![(r.metadata.id.clone(), r.metadata.subject.clone())]));
-                                                send(UiEvent::Info(format!("Gruppe „{name}“ erstellt")));
+                                                send(UiEvent::Info(tf!("Gruppe „{name}“ erstellt", "Group “{name}” created")));
                                             }
-                                            Err(e) => send(UiEvent::Info(format!("Gruppe erstellen: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Gruppe erstellen: {e}", "Creating group: {e}"))),
                                         }
                                     });
                                 }
@@ -2226,7 +2399,7 @@ pub fn spawn(
                                         };
                                         match r {
                                             Ok(()) => send(UiEvent::Groups(vec![(jid, name)])),
-                                            Err(e) => send(UiEvent::Info(format!("Umbenennen: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Umbenennen: {e}", "Renaming: {e}"))),
                                         }
                                     });
                                 }
@@ -2234,8 +2407,8 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         let js: Vec<Jid> = numbers.iter().map(|n| Jid::pn(n.clone())).collect();
                                         match client.groups().add_participants(jid.clone(), &js).await {
-                                            Ok(_) => send(UiEvent::Info("Mitglieder hinzugefügt".into())),
-                                            Err(e) => send(UiEvent::Info(format!("Hinzufügen: {e}"))),
+                                            Ok(_) => send(UiEvent::Info(t!("Mitglieder hinzugefügt", "Members added").into())),
+                                            Err(e) => send(UiEvent::Info(tf!("Hinzufügen: {e}", "Adding: {e}"))),
                                         }
                                         let _ = jid;
                                     });
@@ -2244,8 +2417,8 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         let Ok(m) = member.parse::<Jid>() else { return };
                                         match client.groups().remove_participants(jid, &[m]).await {
-                                            Ok(_) => send(UiEvent::Info("Mitglied entfernt".into())),
-                                            Err(e) => send(UiEvent::Info(format!("Entfernen: {e}"))),
+                                            Ok(_) => send(UiEvent::Info(t!("Mitglied entfernt", "Member removed").into())),
+                                            Err(e) => send(UiEvent::Info(tf!("Entfernen: {e}", "Removing: {e}"))),
                                         }
                                     });
                                 }
@@ -2255,15 +2428,15 @@ pub fn spawn(
                                         let g = client.groups();
                                         let r = if on { g.promote_participants(jid, &[m]).await } else { g.demote_participants(jid, &[m]).await };
                                         if let Err(e) = r {
-                                            send(UiEvent::Info(format!("Admin-Rechte: {e}")));
+                                            send(UiEvent::Info(tf!("Admin-Rechte: {e}", "Admin rights: {e}")));
                                         }
                                     });
                                 }
                                 Cmd::GroupLeave(jid) => {
                                     tokio::spawn(async move {
                                         match client.groups().leave(jid).await {
-                                            Ok(()) => send(UiEvent::Info("Gruppe verlassen".into())),
-                                            Err(e) => send(UiEvent::Info(format!("Verlassen: {e}"))),
+                                            Ok(()) => send(UiEvent::Info(t!("Gruppe verlassen", "Exit group").into())),
+                                            Err(e) => send(UiEvent::Info(tf!("Verlassen: {e}", "Leaving: {e}"))),
                                         }
                                     });
                                 }
@@ -2271,7 +2444,7 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         match client.groups().get_invite_link(jid, false).await {
                                             Ok(link) => send(UiEvent::Info(format!("Einladungslink (in die Zwischenablage kopiert): {link}"))),
-                                            Err(e) => send(UiEvent::Info(format!("Einladungslink: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Einladungslink: {e}", "Invite link: {e}"))),
                                         }
                                     });
                                 }
@@ -2286,7 +2459,7 @@ pub fn spawn(
                                                     .collect();
                                                 send(UiEvent::Privacy(list));
                                             }
-                                            Err(e) => send(UiEvent::Info(format!("Datenschutz laden: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Datenschutz laden: {e}", "Loading privacy settings: {e}"))),
                                         }
                                     });
                                 }
@@ -2313,14 +2486,14 @@ pub fn spawn(
                                         };
                                         match client.set_privacy_setting(c, v).await {
                                             Ok(_) => log(format!("Datenschutz {cat} = {val}")),
-                                            Err(e) => send(UiEvent::Info(format!("Datenschutz ändern fehlgeschlagen: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Datenschutz ändern fehlgeschlagen: {e}", "Changing privacy failed: {e}"))),
                                         }
                                     });
                                 }
                                 Cmd::SetDefaultDisappearing(secs) => {
                                     tokio::spawn(async move {
                                         if let Err(e) = client.set_default_disappearing_mode(secs).await {
-                                            send(UiEvent::Info(format!("Selbstlöschen: {e}")));
+                                            send(UiEvent::Info(tf!("Selbstlöschen: {e}", "Disappearing messages: {e}")));
                                         }
                                     });
                                 }
@@ -2332,8 +2505,8 @@ pub fn spawn(
                                             client.set_chat_disappearing_timer(chat, secs).await.map(|_| ()).map_err(|e| e.to_string())
                                         };
                                         match r {
-                                            Ok(()) => send(UiEvent::Info(if secs == 0 { "Selbstlöschende Nachrichten aus".into() } else { "Selbstlöschende Nachrichten an".into() })),
-                                            Err(e) => send(UiEvent::Info(format!("Selbstlöschen: {e}"))),
+                                            Ok(()) => send(UiEvent::Info(if secs == 0 { t!("Selbstlöschende Nachrichten aus", "Disappearing messages off").into() } else { t!("Selbstlöschende Nachrichten an", "Disappearing messages on").into() })),
+                                            Err(e) => send(UiEvent::Info(tf!("Selbstlöschen: {e}", "Disappearing messages: {e}"))),
                                         }
                                     });
                                 }
@@ -2342,8 +2515,8 @@ pub fn spawn(
                                         let path = match path {
                                             Some(p) => p,
                                             None => match rfd::AsyncFileDialog::new()
-                                                .set_title("Profilbild wählen")
-                                                .add_filter("Bilder", &["png", "jpg", "jpeg", "webp"])
+                                                .set_title(t!("Profilbild wählen", "Choose profile photo"))
+                                                .add_filter(t!("Bilder", "Images"), &["png", "jpg", "jpeg", "webp"])
                                                 .pick_file()
                                                 .await
                                             {
@@ -2364,10 +2537,10 @@ pub fn spawn(
                                         .and_then(|r| r);
                                         match jpeg {
                                             Ok(j) => match client.profile().set_profile_picture(j).await {
-                                                Ok(_) => send(UiEvent::Info("Profilbild bei WhatsApp geändert".into())),
-                                                Err(e) => send(UiEvent::Info(format!("Profilbild: {e}"))),
+                                                Ok(_) => send(UiEvent::Info(t!("Profilbild bei WhatsApp geändert", "Profile photo changed on WhatsApp").into())),
+                                                Err(e) => send(UiEvent::Info(tf!("Profilbild: {e}", "Profile photo: {e}"))),
                                             },
-                                            Err(e) => send(UiEvent::Info(format!("Profilbild: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Profilbild: {e}", "Profile photo: {e}"))),
                                         }
                                     });
                                 }
@@ -2375,7 +2548,7 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         match client.blocking().get_blocklist().await {
                                             Ok(list) => send(UiEvent::Blocklist(list.into_iter().map(|b| b.jid.to_string()).collect())),
-                                            Err(e) => send(UiEvent::Info(format!("Blockierte laden: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Blockierte laden: {e}", "Loading blocked contacts: {e}"))),
                                         }
                                     });
                                 }
@@ -2388,9 +2561,9 @@ pub fn spawn(
                                                 if let Ok(list) = b.get_blocklist().await {
                                                     send(UiEvent::Blocklist(list.into_iter().map(|e| e.jid.to_string()).collect()));
                                                 }
-                                                send(UiEvent::Info(if on { "Kontakt blockiert".into() } else { "Blockierung aufgehoben".into() }));
+                                                send(UiEvent::Info(if on { t!("Kontakt blockiert", "Contact blocked").into() } else { t!("Blockierung aufgehoben", "Contact unblocked").into() }));
                                             }
-                                            Err(e) => send(UiEvent::Info(format!("Blockieren: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Blockieren: {e}", "Blocking: {e}"))),
                                         }
                                     });
                                 }
@@ -2406,7 +2579,7 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         match ensure_file(&client, &dir, &id, &media).await {
                                             Ok(path) => send(UiEvent::FileReady { id, path }),
-                                            Err(e) => send(UiEvent::Info(format!("Herunterladen fehlgeschlagen: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Herunterladen fehlgeschlagen: {e}", "Download failed: {e}"))),
                                         }
                                     });
                                 }
@@ -2447,8 +2620,8 @@ pub fn spawn(
                                         let path = match path {
                                             Some(p) => p,
                                             None => match rfd::AsyncFileDialog::new()
-                                                .set_title("Bild für Sticker wählen")
-                                                .add_filter("Bilder", &["png", "jpg", "jpeg", "webp", "gif"])
+                                                .set_title(t!("Bild für Sticker wählen", "Choose image for sticker"))
+                                                .add_filter(t!("Bilder", "Images"), &["png", "jpg", "jpeg", "webp", "gif"])
                                                 .pick_file()
                                                 .await
                                             {
@@ -2466,7 +2639,7 @@ pub fn spawn(
                                         let data = match made {
                                             Ok(d) => d,
                                             Err(e) => {
-                                                send(UiEvent::Info(format!("Sticker: {e}")));
+                                                send(UiEvent::Info(tf!("Sticker: {e}", "Sticker: {e}")));
                                                 return;
                                             }
                                         };
@@ -2498,8 +2671,8 @@ pub fn spawn(
                                     tokio::spawn(async move {
                                         match tokio::task::spawn_blocking(move || giphy_search(&query, &key)).await {
                                             Ok(Ok(list)) => send(UiEvent::GifResults(list)),
-                                            Ok(Err(e)) => send(UiEvent::Info(format!("GIF-Suche: {e}"))),
-                                            Err(e) => send(UiEvent::Info(format!("GIF-Suche: {e}"))),
+                                            Ok(Err(e)) => send(UiEvent::Info(tf!("GIF-Suche: {e}", "GIF search: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("GIF-Suche: {e}", "GIF search: {e}"))),
                                         }
                                     });
                                 }
@@ -2515,11 +2688,11 @@ pub fn spawn(
                                         {
                                             Ok(Ok(d)) => d,
                                             Ok(Err(e)) => {
-                                                send(UiEvent::Info(format!("GIF laden: {e}")));
+                                                send(UiEvent::Info(tf!("GIF laden: {e}", "Loading GIF: {e}")));
                                                 return;
                                             }
                                             Err(e) => {
-                                                send(UiEvent::Info(format!("GIF laden: {e}")));
+                                                send(UiEvent::Info(tf!("GIF laden: {e}", "Loading GIF: {e}")));
                                                 return;
                                             }
                                         };

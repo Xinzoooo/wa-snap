@@ -64,9 +64,9 @@ impl ksni::Tray for WaTray {
         ksni::ToolTip {
             title: "WhatsSnap".into(),
             description: match self.unread {
-                0 => "Keine ungelesenen Nachrichten".into(),
-                1 => "1 ungelesene Nachricht".into(),
-                n => format!("{n} ungelesene Nachrichten"),
+                0 => t!("Keine ungelesenen Nachrichten", "No unread messages").into(),
+                1 => t!("1 ungelesene Nachricht", "1 unread message").into(),
+                n => tf!("{n} ungelesene Nachrichten", "{n} unread messages"),
             },
             ..Default::default()
         }
@@ -81,7 +81,7 @@ impl ksni::Tray for WaTray {
         use ksni::menu::*;
         vec![
             StandardItem {
-                label: "Öffnen".into(),
+                label: t!("Öffnen", "Open").into(),
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.tx.send(TrayMsg::Open);
                 }),
@@ -90,7 +90,7 @@ impl ksni::Tray for WaTray {
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "Beenden".into(),
+                label: t!("Beenden", "Quit").into(),
                 icon_name: "application-exit".into(),
                 activate: Box::new(|t: &mut Self| {
                     let _ = t.tx.send(TrayMsg::Quit);
