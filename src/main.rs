@@ -7,6 +7,10 @@ mod emoji;
 mod store;
 mod theme;
 mod tray;
+mod safety;
+mod dialogs;
+mod video;
+mod viewer;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver};
@@ -54,6 +58,9 @@ struct Settings {
     skin_tone: u8,
     /// Von anderen gelöschte Nachrichten weiter anzeigen
     keep_deleted: bool,
+    /// Ausführliches Log: eine Zeile pro Nachricht (Nummern bleiben auch dann unkenntlich).
+    #[serde(default)]
+    debug_log: bool,
     /// Nur lokal angeheftete Chats (über die 3 von WhatsApp hinaus)
     local_pins: Vec<String>,
     /// Sprache: "" = Systemsprache, "de" oder "en"
@@ -84,6 +91,7 @@ impl Default for Settings {
             recent_emojis: Vec::new(),
             skin_tone: 0,
             keep_deleted: false,
+            debug_log: false,
             local_pins: Vec::new(),
             lang: String::new(),
         }
@@ -364,6 +372,41 @@ struct App {
     emoji: emoji::Cache,
     /// Bilder/Sticker je Nachrichten-ID (Textur, volle Größe?).
     images: HashMap<String, (egui::TextureHandle, bool)>,
+    /// Wann ein Bild zuletzt gezeichnet wurde; lange nicht gezeigte fliegen aus dem Speicher.
+    img_seen: std::cell::RefCell<HashMap<String, std::time::Instant>>,
+    img_sweep: std::time::Instant,
+    img_stale: HashSet<String>,
+    /// Fehlgeschlagene Bild-Downloads mit Zeitpunkt: frühestens nach einer Minute neu versuchen.
+    img_failed: HashMap<String, std::time::Instant>,
+    /// Geöffneter Bild-/Video-Betrachter.
+    viewer: Option<viewer::Viewer>,
+    /// Zustellstatus für Nachrichten, deren ID noch nicht bekannt ist (siehe `set_status`).
+    early_status: HashMap<String, u8>,
+    /// Dateien im Ausgang, die der Server noch nicht bestätigt hat: vorläufige ID → (Chat, Gruppe, Zeit, Text, Medium).
+    outbox_files: HashMap<String, (String, bool, i64, String, backend::MediaRef)>,
+    /// Zähler, der bei jeder neuen Nachricht steigt (macht Such-Zwischenspeicher ungültig).
+    msg_gen: u64,
+    /// Suche über alle Chats: (Suchtext, Stand, Treffer). Wird nur neu berechnet, wenn sich
+    /// Suchtext oder Verlauf ändern, und erst nach einer kurzen Tipp-Pause.
+    search_cache: Option<(String, u64, Vec<(i64, String, String, String)>)>,
+    search_typed: Option<(String, std::time::Instant)>,
+    /// Suche im offenen Chat: (Chat, Suchtext, Nachrichtenzahl, Positionen der Treffer).
+    chat_search_cache: Option<(String, String, usize, Vec<usize>)>,
+    /// Größe der Medienordner für die Speicher-Seite: (gemessen um, Bytes).
+    storage_size: Option<(std::time::Instant, u64)>,
+    /// Status-Gruppen: (Nachrichtenzahl, Minute, Ergebnis).
+    status_cache: std::cell::RefCell<Option<(usize, i64, Vec<(String, Vec<ChatMessage>)>)>>,
+    /// Bild aus der Zwischenablage wird im Hintergrund als PNG gespeichert.
+    paste_rx: Option<Receiver<Result<(std::path::PathBuf, [usize; 2], Vec<u8>), String>>>,
+    /// Reihenfolge, in der Sprachnachrichten dekodiert wurden (älteste zuerst), fürs Speicherbudget.
+    decoded_order: std::collections::VecDeque<String>,
+    /// Rückfrage vor dem Öffnen einer riskanten Datei.
+    open_warn: Option<dialogs::OpenWarn>,
+    /// Nach dem Abmelden: fragen, ob auch Verlauf und Medien gelöscht werden sollen.
+    logout_prompt: bool,
+    /// Zuletzt gemessene Höhe je Nachricht (Prüfwert, Höhe): Nachrichten außerhalb des
+    /// sichtbaren Bereichs werden damit nur freigehalten statt neu aufgebaut.
+    heights: HashMap<String, (u64, f32)>,
     img_requested: HashSet<String>,
     /// Reaktionen je Nachrichten-ID: (Absender, Emoji); Absender leer = ich.
     reactions: HashMap<String, Vec<(String, String)>>,
@@ -371,6 +414,9 @@ struct App {
     reply_to: Option<(String, backend::Quote, bool)>,
     me: Vec<String>,
     drafts: HashMap<String, String>,
+    /// LID → Telefonnummer derselben Person. Einzelchats laufen immer unter der Nummer,
+    /// sonst zerfällt ein Gespräch in zwei Chats (alter Verlauf hier, neue Nachrichten dort).
+    alias: HashMap<String, String>,
     /// Tippt gerade: Chat-Nummer → (Absender, nimmt auf, Zeitpunkt)
     typing: HashMap<String, (String, bool, std::time::Instant)>,
     /// Online-Status: Nummer → (online, zuletzt online)
@@ -455,6 +501,14 @@ struct App {
     channel_refresh: Option<std::time::Instant>,
     /// 0 = Status, 1 = Kanäle finden
     news_tab: u8,
+}
+
+/// Stelle, an der eine Nachricht mit Zeit `ts` eingefügt wird: hinter allen, die nicht jünger sind.
+fn insert_pos(messages: &[ChatMessage], ts: i64) -> usize {
+    match messages.last() {
+        Some(last) if last.ts <= ts => messages.len(),
+        _ => messages.partition_point(|x| x.ts <= ts),
+    }
 }
 
 fn user_of(key: &str) -> String {
@@ -774,6 +828,7 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, size: f32, color: Color32, pal: &P
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, core: Core) -> Self {
         let mut settings = load_settings();
+        backend::DEBUG_LOG.store(settings.debug_log, std::sync::atomic::Ordering::Relaxed);
         // Ältere Versionen speicherten volle JIDs; jetzt zählt nur die Nummer/LID.
         for list in [&mut settings.muted, &mut settings.pinned, &mut settings.archived] {
             let mut v: Vec<String> = list.iter().map(|k| user_of(k)).collect();
@@ -817,11 +872,30 @@ impl App {
             temp_counter: 0,
             emoji: emoji::Cache::default(),
             images: HashMap::new(),
+            img_seen: Default::default(),
+            img_sweep: std::time::Instant::now(),
+            img_stale: HashSet::new(),
+            img_failed: HashMap::new(),
+            viewer: None,
+            early_status: HashMap::new(),
+            outbox_files: HashMap::new(),
+            msg_gen: 0,
+            search_cache: None,
+            search_typed: None,
+            chat_search_cache: None,
+            storage_size: None,
+            status_cache: Default::default(),
+            paste_rx: None,
+            decoded_order: Default::default(),
+            open_warn: None,
+            logout_prompt: false,
+            heights: HashMap::new(),
             img_requested: HashSet::new(),
             reactions: HashMap::new(),
             reply_to: None,
             me: Vec::new(),
             drafts: HashMap::new(),
+            alias: HashMap::new(),
             typing: HashMap::new(),
             presence: HashMap::new(),
             my_typing: None,
@@ -909,6 +983,16 @@ impl App {
                 Source::Disk,
             );
         }
+        // Dasselbe für Dateien: die Kopie liegt im Medienordner und lässt sich erneut senden.
+        let mut files: Vec<(String, (String, bool, i64, String, backend::MediaRef))> = app.outbox_files.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        files.sort_by_key(|(_, f)| f.2);
+        for (temp, (chat, is_group, ts, caption, media)) in files {
+            let Ok(jid) = chat.parse::<Jid>() else { continue };
+            app.add_message(
+                ChatMessage { chat: jid, is_group, from_me: true, sender_name: String::new(), sender: String::new(), text: caption, ts, id: temp, status: 9, media: Some(media), quote: None, x: Default::default() },
+                Source::Disk,
+            );
+        }
         // Gespeicherte Umfragen dem Backend melden, damit neue Stimmen lesbar sind.
         let polls: Vec<(String, Vec<u8>, String, Vec<String>)> = app
             .chats
@@ -923,6 +1007,14 @@ impl App {
             .collect();
         if !polls.is_empty() {
             let _ = app.cmd.send(Cmd::RegisterPolls(polls));
+        }
+        let media: Vec<(String, Jid, bool, String)> = app
+            .chats
+            .values()
+            .flat_map(|c| c.messages.iter().filter(|m| m.media.is_some() && !m.id.is_empty()).map(|m| (m.id.clone(), c.jid.clone(), m.from_me, m.sender.clone())))
+            .collect();
+        if !media.is_empty() {
+            let _ = app.cmd.send(Cmd::RegisterMedia(media));
         }
         #[cfg(debug_assertions)]
         if std::env::var_os("WA_SNAP_DEMO").is_some() {
@@ -1166,7 +1258,11 @@ impl App {
             Rec::Out { temp, chat, is_group, text, ts, quote, mentions, exp } => {
                 self.outbox.insert(temp, Outgoing { chat, is_group, text, ts, quote, mentions, exp });
             }
+            Rec::OutFile { temp, chat, is_group, ts, caption, media } => {
+                self.outbox_files.insert(temp, (chat, is_group, ts, caption, media));
+            }
             Rec::OutDone { temp } => {
+                self.outbox_files.remove(&temp);
                 self.outbox.remove(&temp);
             }
             Rec::Status { id, st } => self.set_status(&id, st, false),
@@ -1183,10 +1279,83 @@ impl App {
             Rec::Vote { poll, voter, options } => {
                 self.votes.entry(poll).or_default().insert(voter, options);
             }
+            Rec::Alias { lid, pn } => self.set_alias(lid, pn, false),
         }
     }
 
+    /// Einzelchat unter der Telefonnummer führen, wenn zur LID eine bekannt ist.
+    fn canon(&self, jid: &Jid) -> Jid {
+        if jid.is_lid() {
+            if let Some(pn) = self.alias.get(jid.user.as_str()) {
+                return Jid::new(pn, whatsapp_rust::Server::Pn);
+            }
+        }
+        jid.clone()
+    }
+
+    /// Zuordnung LID ↔ Nummer merken und einen schon vorhandenen LID-Chat in den Nummern-Chat einfügen.
+    fn set_alias(&mut self, lid: String, pn: String, persist: bool) {
+        if lid.is_empty() || pn.is_empty() || lid == pn || self.alias.get(&lid) == Some(&pn) {
+            return;
+        }
+        if persist {
+            self.store.append(&Rec::Alias { lid: lid.clone(), pn: pn.clone() });
+        }
+        self.alias.insert(lid.clone(), pn.clone());
+        // Name, Stumm/Angeheftet/Archiviert gelten für die Person, nicht für die Kennung.
+        if !self.names.contains_key(&pn) {
+            if let Some(n) = self.names.get(&lid).cloned() {
+                self.names.insert(pn.clone(), n);
+            }
+        }
+        for list in [&mut self.settings.muted, &mut self.settings.pinned, &mut self.settings.archived, &mut self.settings.local_pins] {
+            if list.contains(&lid) && !list.contains(&pn) {
+                list.push(pn.clone());
+            }
+        }
+        let old_key = Jid::new(&lid, whatsapp_rust::Server::Lid).to_string();
+        let Some(old) = self.chats.remove(&old_key) else { return };
+        let pn_jid = Jid::new(&pn, whatsapp_rust::Server::Pn);
+        let new_key = pn_jid.to_string();
+        let default_name = old.name == lid;
+        let c = self.chat_entry(&pn_jid, false);
+        if c.name == pn && !default_name {
+            c.name = old.name.clone();
+        }
+        c.unread += old.unread;
+        c.last_ts = c.last_ts.max(old.last_ts);
+        let have: HashSet<String> = c.messages.iter().filter(|m| !m.id.is_empty()).map(|m| m.id.clone()).collect();
+        let mut moved = Vec::new();
+        for mut m in old.messages {
+            if !m.id.is_empty() && have.contains(&m.id) {
+                continue;
+            }
+            m.chat = pn_jid.clone();
+            moved.push(m.id.clone());
+            c.messages.push(m);
+        }
+        c.messages.sort_by_key(|m| m.ts);
+        for id in moved {
+            if !id.is_empty() {
+                self.msg_index.insert(id, new_key.clone());
+            }
+        }
+        if self.selected.as_deref() == Some(old_key.as_str()) {
+            self.selected = Some(new_key.clone());
+        }
+        if let Some(d) = self.drafts.remove(&old_key) {
+            self.drafts.entry(new_key.clone()).or_insert(d);
+        }
+        for o in self.outbox.values_mut() {
+            if o.chat == old_key {
+                o.chat = new_key.clone();
+            }
+        }
+        self.names_dirty = true;
+    }
+
     fn chat_entry(&mut self, jid: &Jid, is_group: bool) -> &mut Chat {
+        let jid = &self.canon(jid);
         self.chats.entry(jid.to_string()).or_insert_with(|| Chat {
             jid: jid.clone(),
             name: jid.user.to_string(),
@@ -1227,7 +1396,15 @@ impl App {
     }
 
     fn set_status(&mut self, id: &str, st: u8, persist: bool) {
-        let Some(key) = self.msg_index.get(id).cloned() else { return };
+        let Some(key) = self.msg_index.get(id).cloned() else {
+            // Zustellbestätigung kam, bevor der Server die ID der eigenen Nachricht gemeldet hat:
+            // merken und anwenden, sobald „gesendet“ eintrifft.
+            if persist && self.early_status.len() < 500 {
+                let e = self.early_status.entry(id.to_owned()).or_insert(0);
+                *e = (*e).max(st);
+            }
+            return;
+        };
         if let Some(c) = self.chats.get_mut(&key) {
             if let Some(m) = c.messages.iter_mut().rev().find(|m| m.id == id) {
                 if st > m.status || st == 9 {
@@ -1258,27 +1435,29 @@ impl App {
     }
 
     /// Nachricht einsortieren. Gibt false zurück, wenn es ein Duplikat war.
-    fn add_message(&mut self, m: ChatMessage, src: Source) -> bool {
+    fn add_message(&mut self, mut m: ChatMessage, src: Source) -> bool {
+        m.chat = self.canon(&m.chat);
         let key = m.chat.to_string();
         let selected = self.selected.as_deref() == Some(key.as_str());
         let focused = self.focused;
+        // Duplikat? Der Index kennt jede Nachricht des ganzen Verlaufs, nicht nur die letzten.
+        let known = !m.id.is_empty() && self.msg_index.get(&m.id).map(|k| *k == key).unwrap_or(false);
         let chat = self.chat_entry(&m.chat.clone(), m.is_group);
         // Gesprächsname: bei Einzelchats der Name des Gegenübers.
         if !m.is_group && !m.from_me && !m.sender_name.is_empty() && chat.name == chat.jid.user.as_str() {
             chat.name = m.sender_name.clone();
         }
-        if !m.id.is_empty() && chat.messages.iter().rev().take(400).any(|x| x.id == m.id) {
+        if known {
             return false;
         }
         if src == Source::Live && !m.from_me && !(selected && focused) {
             chat.unread += 1;
         }
         chat.last_ts = chat.last_ts.max(m.ts);
-        chat.messages.push(m.clone());
-        let n = chat.messages.len();
-        if n > 1 && chat.messages[n - 2].ts > chat.messages[n - 1].ts {
-            chat.messages.sort_by_key(|x| x.ts);
-        }
+        // An der richtigen Stelle einfügen (fast immer am Ende) statt die ganze Liste neu zu sortieren.
+        let pos = insert_pos(&chat.messages, m.ts);
+        chat.messages.insert(pos, m.clone());
+        self.msg_gen += 1;
         if !m.id.is_empty() {
             self.msg_index.insert(m.id.clone(), key.clone());
         }
@@ -1344,6 +1523,69 @@ impl App {
         if self.conn == Conn::Online && (had_unread || !msgs.is_empty()) {
             let _ = self.cmd.send(Cmd::MarkRead { jid: c.jid.clone(), msgs, last });
         }
+    }
+
+    /// Dekodierte Sprachnachrichten kosten rund 6 MB pro Minute. Älteste freigeben, sobald das
+    /// Budget überschritten ist; die gerade laufende bleibt. Die Datei liegt auf der Platte und
+    /// wird beim nächsten Abspielen neu dekodiert.
+    fn trim_decoded(&mut self) {
+        const BUDGET: usize = 48 * 1024 * 1024;
+        let playing = self.player.as_ref().map(|p| p.id.clone());
+        let mut total: usize = self.decoded.values().map(|(pcm, _, _)| pcm.len() * 2).sum();
+        let mut keep = std::collections::VecDeque::new();
+        while let Some(id) = self.decoded_order.pop_front() {
+            if total <= BUDGET || Some(&id) == playing.as_ref() || self.decoded_order.is_empty() {
+                keep.push_back(id);
+                continue;
+            }
+            if let Some((pcm, _, _)) = self.decoded.remove(&id) {
+                total -= pcm.len() * 2;
+            }
+        }
+        self.decoded_order = keep;
+    }
+
+    /// Treffer der Suche über alle Chats (neueste zuerst, höchstens 300). Gerechnet wird nicht
+    /// bei jedem Tastendruck und nicht in jedem Bild: erst nach einer kurzen Tipp-Pause, danach
+    /// kommt das Ergebnis aus dem Zwischenspeicher, bis sich Suchtext oder Verlauf ändern.
+    fn global_hits(&mut self, ctx: &egui::Context, needle: &str) -> Vec<(i64, String, String, String)> {
+        const PAUSE_MS: u128 = 180;
+        const MAX_HITS: usize = 300;
+        if let Some((n, gen, hits)) = &self.search_cache {
+            if n == needle && *gen == self.msg_gen {
+                return hits.clone();
+            }
+        }
+        match &self.search_typed {
+            Some((n, at)) if n == needle => {
+                let waited = at.elapsed().as_millis();
+                if waited < PAUSE_MS {
+                    ctx.request_repaint_after(std::time::Duration::from_millis((PAUSE_MS - waited) as u64 + 5));
+                    // Bis dahin die alten Treffer zeigen, falls sie zum Anfang des Suchtexts passen.
+                    return self.search_cache.as_ref().filter(|(old, _, _)| needle.starts_with(old.as_str())).map(|(_, _, h)| h.clone()).unwrap_or_default();
+                }
+            }
+            _ => {
+                self.search_typed = Some((needle.to_owned(), std::time::Instant::now()));
+                ctx.request_repaint_after(std::time::Duration::from_millis(PAUSE_MS as u64 + 5));
+                return self.search_cache.as_ref().filter(|(old, _, _)| needle.starts_with(old.as_str())).map(|(_, _, h)| h.clone()).unwrap_or_default();
+            }
+        }
+        let mut hits: Vec<(i64, String, String, String)> = self
+            .chats
+            .values()
+            .flat_map(|c| {
+                c.messages
+                    .iter()
+                    .filter(|m| !m.text.is_empty() && m.text.to_lowercase().contains(needle))
+                    .map(move |m| (m.ts, m.id.clone(), c, m.text.as_str()))
+            })
+            .map(|(ts, id, c, text)| (ts, id, self.display_name(c), text.replace('\n', " ")))
+            .collect();
+        hits.sort_by_key(|h| std::cmp::Reverse(h.0));
+        hits.truncate(MAX_HITS);
+        self.search_cache = Some((needle.to_owned(), self.msg_gen, hits.clone()));
+        hits
     }
 
     /// Sprachnachricht ab `from` Sekunden abspielen (vorher laufende stoppen).
@@ -1437,7 +1679,33 @@ impl App {
     }
 
     /// Nicht gesendete Nachricht endgültig verwerfen.
+    /// Nicht gesendete Datei erneut senden: läuft als neue Sendung, der alte Eintrag verschwindet.
+    fn resend_file(&mut self, temp: &str) {
+        if self.conn != Conn::Online {
+            self.info = Some(t!("Nicht verbunden – bitte später erneut versuchen.", "Not connected – please try again later.").into());
+            return;
+        }
+        let Some((chat, _, _, caption, media)) = self.outbox_files.remove(temp) else { return };
+        let Ok(jid) = chat.parse::<Jid>() else { return };
+        if let Some(c) = self.chats.get_mut(&chat) {
+            c.messages.retain(|m| m.id != temp);
+        }
+        self.msg_index.remove(temp);
+        self.store.append(&Rec::OutDone { temp: temp.to_owned() });
+        let _ = self.cmd.send(Cmd::ResendFile { chat: jid, temp: temp.to_owned(), media, caption });
+    }
+
     fn discard_outgoing(&mut self, temp: &str) {
+        if let Some((chat, _, _, _, media)) = self.outbox_files.remove(temp) {
+            if let Some(c) = self.chats.get_mut(&chat) {
+                c.messages.retain(|m| m.id != temp);
+            }
+            self.msg_index.remove(temp);
+            self.store.append(&Rec::OutDone { temp: temp.to_owned() });
+            let name: String = temp.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+            let _ = std::fs::remove_file(data_dir().join("media").join(format!("{name}.{}", media.ext())));
+            return;
+        }
         let Some(o) = self.outbox.remove(temp) else { return };
         if let Some(c) = self.chats.get_mut(&o.chat) {
             c.messages.retain(|m| m.id != temp);
@@ -1448,6 +1716,7 @@ impl App {
 
     fn run_msg_act(&mut self, a: MsgAct) {
         match &a {
+            MsgAct::Resend(temp) if self.outbox_files.contains_key(temp) => return self.resend_file(temp),
             MsgAct::Resend(temp) => return self.resend(temp),
             MsgAct::Discard(temp) => return self.discard_outgoing(temp),
             _ => {}
@@ -1687,11 +1956,29 @@ impl App {
                     self.conn = Conn::Online;
                     self.qr = None;
                     let _ = self.cmd.send(Cmd::FetchBlocklist);
+                    // Für alle Einzelchats nachschlagen, ob LID und Nummer zur selben Person gehören.
+                    let singles: Vec<Jid> = self.chats.values().filter(|c| !c.is_group && (c.jid.is_lid() || c.jid.is_pn())).map(|c| c.jid.clone()).collect();
+                    if !singles.is_empty() {
+                        let _ = self.cmd.send(Cmd::ResolveAliases(singles));
+                    }
                     if !self.settings.show_online {
                         let _ = self.cmd.send(Cmd::SetOnline(false));
                     }
                 }
                 UiEvent::LoggedOut => self.conn = Conn::LoggedOut,
+                UiEvent::LogoutDone => {
+                    if let Err(e) = dialogs::mark_logged_out(&data_dir()) {
+                        backend::log(format!("Abmelde-Merker nicht geschrieben: {e}"));
+                    }
+                    self.logout_prompt = true;
+                }
+                UiEvent::OpenBlocked { path, reason } => self.open_warn = Some(dialogs::OpenWarn { path, reason }),
+                UiEvent::Alias { lid, pn } => self.set_alias(lid, pn, true),
+                UiEvent::Disconnected => {
+                    if self.conn == Conn::Online {
+                        self.conn = Conn::Starting;
+                    }
+                }
                 UiEvent::Message(m) => {
                     // Bei „Gelöschte behalten“ Fotos sofort laden, damit sie nach einer Löschung noch da sind.
                     if self.settings.keep_deleted && !m.from_me {
@@ -1722,25 +2009,49 @@ impl App {
                     let tex = ctx.load_texture(format!("av-{user}"), img, egui::TextureOptions::LINEAR);
                     self.avatars.insert(user, tex);
                 }
+                UiEvent::AvatarRetry { user } => {
+                    self.avatar_requested.remove(&user);
+                }
                 UiEvent::Sent { chat, temp, id } => {
                     let mut done = None;
+                    // Das eigene Echo kann schneller sein als diese Bestätigung: dann steht die
+                    // Nachricht schon mit echter ID da und der vorläufige Eintrag muss weg.
+                    let echoed = self.msg_index.get(&id).map(|k| *k == chat).unwrap_or(false);
                     if let Some(c) = self.chats.get_mut(&chat) {
-                        if let Some(m) = c.messages.iter_mut().rev().find(|m| m.id == temp) {
+                        if echoed {
+                            c.messages.retain(|m| m.id != temp);
+                        } else if let Some(m) = c.messages.iter_mut().rev().find(|m| m.id == temp) {
                             m.id = id.clone();
                             m.status = m.status.max(1);
                             done = Some(m.clone());
                         }
                     }
+                    self.msg_index.remove(&temp);
+                    if echoed {
+                        self.images.remove(&temp);
+                    }
                     if let Some(m) = done {
                         if let Some(t) = self.images.remove(&temp) {
                             self.images.insert(id.clone(), t);
                         }
-                        self.msg_index.insert(id, chat.clone());
+                        self.msg_index.insert(id.clone(), chat.clone());
                         self.persist_msg(&chat, &m);
                     }
-                    if self.outbox.remove(&temp).is_some() {
+                    if let Some(st) = self.early_status.remove(&id) {
+                        self.set_status(&id, st, true);
+                    }
+                    if self.outbox.remove(&temp).is_some() | self.outbox_files.remove(&temp).is_some() {
                         self.store.append(&Rec::OutDone { temp });
                     }
+                }
+                UiEvent::OutMedia { temp, chat, is_group, caption, media } => {
+                    let ts = now_ts();
+                    self.store.append(&Rec::OutFile { temp: temp.clone(), chat: chat.clone(), is_group, ts, caption: caption.clone(), media: media.clone() });
+                    self.outbox_files.insert(temp, (chat, is_group, ts, caption, media));
+                }
+                UiEvent::MediaFailed { id } => {
+                    self.img_requested.remove(&id);
+                    self.img_failed.insert(id, std::time::Instant::now());
                 }
                 UiEvent::SendFailed { chat, temp, err } => {
                     if let Some(c) = self.chats.get_mut(&chat) {
@@ -1819,18 +2130,26 @@ impl App {
                     self.members.insert(d.group.clone(), members);
                     self.group_info.insert(d.group.clone(), d);
                 }
+                UiEvent::ViewReady { id, path, image, video } => self.viewer_ready(ctx, id, path, image, video),
+                UiEvent::ViewFailed { id, err } => self.viewer_failed(&id, err),
                 UiEvent::FileReady { id, path, voice } => {
                     if self.want_play.as_ref().map(|w| w.0 == id).unwrap_or(false) {
                         let (_, from) = self.want_play.take().unwrap_or_default();
                         match voice.unwrap_or_else(|| Err("kein Opus".into())) {
                             Ok(v) => {
                                 self.decoded.insert(id.clone(), v);
+                                self.decoded_order.retain(|x| *x != id);
+                                self.decoded_order.push_back(id.clone());
+                                self.trim_decoded();
                                 self.start_play(&id, from);
                             }
                             Err(e) => {
                                 // Nicht dekodierbar (z. B. MP3/M4A): mit dem Standardprogramm öffnen
                                 backend::log(format!("Audio {id}: {e}"));
-                                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
+                                match safety::open_verdict(&path) {
+                                    Ok(()) => safety::spawn_opener(path.as_os_str()),
+                                    Err(reason) => self.open_warn = Some(dialogs::OpenWarn { path, reason }),
+                                }
                             }
                         }
                     }
@@ -1864,6 +2183,7 @@ impl App {
                     self.members.insert(group, members);
                 }
                 UiEvent::Typing { chat, from, on, recording } => {
+                    let chat = self.alias.get(&chat).cloned().unwrap_or(chat);
                     if on {
                         self.typing.insert(chat, (from, recording, std::time::Instant::now()));
                     } else {
@@ -1871,6 +2191,7 @@ impl App {
                     }
                 }
                 UiEvent::Presence { user, online, last_seen } => {
+                    let user = self.alias.get(&user).cloned().unwrap_or(user);
                     let e = self.presence.entry(user).or_insert((false, None));
                     e.0 = online;
                     if last_seen.is_some() {
@@ -2245,19 +2566,10 @@ impl App {
         }
         ui.add_space(8.0);
         if self.confirm == Some(2) {
-            ui.label(RichText::new(t!("Gespeicherten Verlauf, Medien und Profilbilder auf diesem PC löschen? Die Chats am Handy bleiben.", "Delete saved history, media and profile photos on this PC? Your chats on the phone stay.")).color(pal.danger));
+            ui.label(RichText::new(t!("Gespeicherten Verlauf, Medien, Profilbilder, Log und Zwischendateien auf diesem PC löschen? Die Chats am Handy bleiben.", "Delete saved history, media, profile photos, log and temporary files on this PC? Your chats on the phone stay.")).color(pal.danger));
             ui.horizontal(|ui| {
                 if ui.button(t!("Ja, löschen", "Yes, delete")).clicked() {
-                    let d = data_dir();
-                    let _ = std::fs::write(d.join("history.jsonl"), b"");
-                    let _ = std::fs::remove_dir_all(d.join("media"));
-                    let _ = std::fs::remove_dir_all(d.join("avatars"));
-                    self.chats.clear();
-                    self.msg_index.clear();
-                    self.selected = None;
-                    self.images.clear();
-                    self.img_requested.clear();
-                    self.info = Some(t!("Lokale Daten gelöscht. Neue Nachrichten kommen weiter an.", "Local data deleted. New messages keep arriving.").into());
+                    self.wipe_local_data();
                     self.confirm = None;
                 }
                 if ui.button(t!("Abbrechen", "Cancel")).clicked() {
@@ -2388,13 +2700,25 @@ impl App {
         *changed |= toggle(ui, &mut self.settings.autoload, t!("Fotos und Sticker automatisch herunterladen", "Download photos and stickers automatically"), pal).changed();
         ui.label(RichText::new(t!("Videos, Dokumente und Sprachnachrichten werden immer erst beim Anklicken geladen.", "Videos, documents and voice messages are only downloaded when you click them.")).small().color(pal.dim));
         ui.add_space(12.0);
-        let size = dir_size(&data_dir().join("media")) + dir_size(&data_dir().join("avatars"));
+        // Ordnergröße nicht in jedem Bild neu ausmessen: höchstens alle paar Sekunden.
+        let size = match self.storage_size {
+            Some((at, s)) if at.elapsed().as_secs() < 5 => s,
+            _ => {
+                let s = dir_size(&data_dir().join("media")) + dir_size(&data_dir().join("avatars"));
+                self.storage_size = Some((std::time::Instant::now(), s));
+                s
+            }
+        };
         ui.label(RichText::new(tf!("Belegt durch Medien: {}", "Used by media: {}", fmt_size(size))).size(14.5));
         if ui.button(t!("Heruntergeladene Medien löschen", "Delete downloaded media")).clicked() {
-            let _ = std::fs::remove_dir_all(data_dir().join("media"));
+            if let Err(e) = std::fs::remove_dir_all(data_dir().join("media")) {
+                backend::log(format!("Medien löschen: {e}"));
+            }
+            self.storage_size = None;
             self.images.clear();
             self.img_requested.clear();
             self.decoded.clear();
+            self.decoded_order.clear();
             self.info = Some(t!("Medien gelöscht. Sie werden bei Bedarf neu geladen.", "Media deleted. It will be downloaded again when needed.").into());
         }
     }
@@ -2414,6 +2738,10 @@ impl App {
         ui.add_space(8.0);
         ui.label(RichText::new(t!("Zusatzfunktionen", "Extra features")).size(14.5));
         *changed |= toggle(ui, &mut self.settings.keep_deleted, t!("Gelöschte Nachrichten anderer weiter anzeigen", "Keep showing messages others deleted"), pal).changed();
+        if toggle(ui, &mut self.settings.debug_log, t!("Ausführliches Log (eine Zeile pro Nachricht, zur Fehlersuche)", "Verbose log (one line per message, for troubleshooting)"), pal).changed() {
+            backend::DEBUG_LOG.store(self.settings.debug_log, std::sync::atomic::Ordering::Relaxed);
+            *changed = true;
+        }
         ui.label(RichText::new(t!("Bleiben mit „🚫 gelöscht“ markiert sichtbar. Wirkt auch für ältere, schon gespeicherte Löschungen (nach Neustart). Fotos nur, wenn sie vorher geladen waren.", "They stay visible, marked “🚫 deleted”. Also applies to older deletions already saved (after a restart). Photos only if they were downloaded before.")).small().color(pal.dim));
         ui.label(RichText::new(t!("Frühere Fassungen bearbeiteter Nachrichten: Maus über „Bearbeitet ⓘ“ halten. Mehr als 3 Chats anheften geht immer; ab dem 4. nur in WhatsSnap.", "Earlier versions of edited messages: hover over “Edited ⓘ”. You can pin more than 3 chats; from the 4th on they're pinned in WhatsSnap only.")).small().color(pal.dim));
         ui.add_space(12.0);
@@ -2444,7 +2772,7 @@ impl App {
         ui.hyperlink_to(t!("Fehler melden", "Report a bug"), "https://github.com/Xinzoooo/wa-snap/issues");
         ui.add_space(8.0);
         if ui.button(t!("Log-Ordner öffnen", "Open log folder")).clicked() {
-            let _ = std::process::Command::new("xdg-open").arg(data_dir()).spawn();
+            safety::spawn_opener(data_dir().as_os_str());
         }
         ui.add_space(12.0);
         ui.label(RichText::new(t!("Lizenzen: WhatsSnap MIT · Schrift Inter (OFL 1.1) · Emojis Fluent Emoji (MIT, Microsoft) und Twemoji (CC-BY 4.0) · libopus, libwebp (BSD)", "Licenses: WhatsSnap MIT · Inter font (OFL 1.1) · Emojis Fluent Emoji (MIT, Microsoft) and Twemoji (CC-BY 4.0) · libopus, libwebp (BSD)")).small().color(pal.dim));
@@ -2748,18 +3076,7 @@ impl App {
                 let needle = self.search.to_lowercase();
                 // Suche über alle Chats: passende Nachrichten
                 if needle.chars().count() >= 2 {
-                    let this = &*self;
-                    let mut hits: Vec<(i64, String, String, String)> = this
-                        .chats
-                        .values()
-                        .flat_map(|c| {
-                            c.messages
-                                .iter()
-                                .filter(|m| !m.text.is_empty() && m.text.to_lowercase().contains(&needle))
-                                .map(move |m| (m.ts, m.id.clone(), this.display_name(c), m.text.replace('\n', " ")))
-                        })
-                        .collect();
-                    hits.sort_by_key(|h| std::cmp::Reverse(h.0));
+                    let hits = self.global_hits(ui.ctx(), &needle);
                     if !hits.is_empty() {
                         ui.horizontal(|ui| {
                             ui.add_space(20.0);
@@ -2820,7 +3137,14 @@ impl App {
                 }
 
                 // Archiviert-Zeile oben (wie bei WhatsApp)
-                let archived_n = self.chats.keys().filter(|k| Self::has(&self.settings.archived, k)).count();
+                // Nur zählen, was die Archiv-Ansicht auch zeigt (keine leeren Einträge aus dem Adressbuch).
+                let archived_n = self
+                    .chats
+                    .iter()
+                    .filter(|(_, c)| c.jid.server != whatsapp_rust::Server::Broadcast && c.jid.server != whatsapp_rust::Server::Newsletter)
+                    .filter(|(_, c)| !c.messages.is_empty() || c.last_ts > 0)
+                    .filter(|(k, _)| Self::has(&self.settings.archived, k))
+                    .count();
                 if !self.show_archive && archived_n > 0 && needle.is_empty() {
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 50.0), egui::Sense::click());
                     let inner = rect.shrink2(egui::vec2(8.0, 2.0));
@@ -3286,7 +3610,7 @@ impl App {
                                             }
                                             ui.horizontal_wrapped(|ui| {
                                                 for (id, md) in list {
-                                                    match self.images.get(&id) {
+                                                    match self.tex(&id) {
                                                         Some((t, _)) => {
                                                             if ui.add(egui::Button::image(egui::Image::new((t.id(), egui::vec2(72.0, 72.0)))).frame(false)).clicked() {
                                                                 sticker_send = Some(md);
@@ -3468,6 +3792,8 @@ impl App {
 
     fn chat_view(&mut self, ctx: &egui::Context, pal: &Palette) {
         let mut act: Option<Act> = None;
+        let mut chat_hits = self.chat_search_cache.take();
+        let mut heights = std::mem::take(&mut self.heights);
         let mut ecache = std::mem::take(&mut self.emoji);
         let mut media_req: Vec<(String, backend::MediaRef)> = Vec::new();
         let mut open_req: Vec<(String, backend::MediaRef)> = Vec::new();
@@ -3477,6 +3803,7 @@ impl App {
         let mut audio_req: Option<(String, backend::MediaRef, Option<f32>)> = None;
         let mut chat_cmd: Option<Cmd> = None;
         let mut toggle_info = false;
+        let mut refetch = false;
         let mut export_chat = false;
         let mut jumped = false;
         let mut scroll_out: Option<(f32, egui::Rect)> = None;
@@ -3602,6 +3929,13 @@ impl App {
                                 if ui.button(t!("Chat exportieren (.txt)", "Export chat (.txt)")).clicked() {
                                     export_chat = true;
                                 }
+                                if ui
+                                    .add_enabled(self.conn == Conn::Online, egui::Button::new(t!("Verlauf vom Handy nachladen", "Reload history from phone")))
+                                    .on_hover_text(t!("Holt die letzten rund 300 Nachrichten dieses Chats erneut. Fehlende Fotos, Videos und Sprachnachrichten werden ergänzt.", "Fetches the last 300 or so messages of this chat again. Missing photos, videos and voice messages are added."))
+                                    .clicked()
+                                {
+                                    refetch = true;
+                                }
                                 if ui.button(t!("Chat schließen", "Close chat")).clicked() {
                                     self.selected = None;
                                 }
@@ -3657,12 +3991,18 @@ impl App {
             let msgs: Vec<&ChatMessage> = if needle.is_empty() {
                 chat.messages[hidden..].iter().collect()
             } else {
-                chat.messages.iter().filter(|m| m.text.to_lowercase().contains(&needle)).collect()
+                // Trefferliste nur neu berechnen, wenn sich Suchtext oder Chat ändern.
+                let fresh = matches!(&chat_hits, Some((k, n, len, _)) if *k == key && *n == needle && *len == chat.messages.len());
+                if !fresh {
+                    let idx: Vec<usize> = chat.messages.iter().enumerate().filter(|(_, m)| m.text.to_lowercase().contains(&needle)).map(|(i, _)| i).collect();
+                    chat_hits = Some((key.clone(), needle.clone(), chat.messages.len(), idx));
+                }
+                chat_hits.as_ref().map(|(_, _, _, idx)| idx.iter().filter_map(|i| chat.messages.get(*i)).collect()).unwrap_or_default()
             };
-            let mut area = egui::ScrollArea::vertical().auto_shrink([false; 2]).stick_to_bottom(true);
-            if self.scroll_bottom {
-                area = area.vertical_scroll_offset(f32::MAX);
-            }
+            // Nicht `vertical_scroll_offset(f32::MAX)`: der Inhalt landet dann für ein Bild weit
+            // außerhalb, seine Höhe wird zu 0 und der Chat springt an den Anfang oder bleibt leer.
+            let to_bottom = self.scroll_bottom;
+            let area = egui::ScrollArea::vertical().auto_shrink([false; 2]).stick_to_bottom(true);
             let out = area
                 .show(ui, |ui| {
                     ui.add_space(10.0);
@@ -3696,6 +4036,16 @@ impl App {
                         let first = prev != Some((m.from_me, m.sender_name.as_str()));
                         prev = Some((m.from_me, m.sender_name.as_str()));
                         ui.add_space(if first { 6.0 } else { 1.0 });
+                        // Außerhalb des sichtbaren Bereichs nur die gemessene Höhe freihalten.
+                        let sig = self.height_sig(m, first, full_w);
+                        if let Some(&(s, h)) = heights.get(&m.id) {
+                            let (top, clip) = (ui.cursor().top(), ui.clip_rect());
+                            let off = top + h < clip.top() - 400.0 || top > clip.bottom() + 400.0;
+                            if s == sig && off && self.jump_to.as_deref() != Some(m.id.as_str()) {
+                                ui.allocate_space(egui::vec2(full_w, h));
+                                continue;
+                            }
+                        }
                         let (mut bg, align) = if m.from_me {
                             (pal.bubble_me, egui::Align::Max)
                         } else {
@@ -3709,7 +4059,7 @@ impl App {
                             bg = Color32::TRANSPARENT;
                         }
                         let margin_side = (full_w * 0.06).clamp(16.0, 63.0) as i8;
-                        ui.with_layout(egui::Layout::top_down(align), |ui| {
+                        let row = ui.with_layout(egui::Layout::top_down(align), |ui| {
                             // Fläche fürs Rechtsklick-Menü VOR dem Inhalt anmelden, damit Knöpfe in der Blase Vorrang haben
                             let bid = egui::Id::new(("bubble", &m.id));
                             let bubble_hit = ui.ctx().data(|d| d.get_temp::<egui::Rect>(bid)).map(|r| ui.interact(r, bid, egui::Sense::click()));
@@ -3729,7 +4079,7 @@ impl App {
                                     };
                                     let meta_w = if m.from_me { 58.0 } else { 40.0 };
                                     let media_w = match &m.media {
-                                        Some(md) if md.is_picture() => media_size(md, self.images.get(&m.id), max_w).x,
+                                        Some(md) if md.is_picture() => media_size(md, self.tex(&m.id), max_w).x,
                                         Some(_) => 260.0_f32.min(max_w),
                                         None => 0.0,
                                     };
@@ -3910,7 +4260,7 @@ impl App {
                                     msg_act = Some(MsgAct::Edit(m.id.clone()));
                                     ui.close_menu();
                                 }
-                                if m.from_me && m.status == 9 && self.outbox.contains_key(&m.id) {
+                                if m.from_me && m.status == 9 && (self.outbox.contains_key(&m.id) || self.outbox_files.contains_key(&m.id)) {
                                     if ui.button(t!("Erneut senden", "Send again")).clicked() {
                                         msg_act = Some(MsgAct::Resend(m.id.clone()));
                                         ui.close_menu();
@@ -3949,13 +4299,22 @@ impl App {
                                 p.add(egui::Shape::convex_polygon(vec![a, b, c], bg, egui::Stroke::NONE));
                             }
                         });
+                        let h = row.response.rect.height();
+                        if heights.get(&m.id) != Some(&(sig, h)) {
+                            heights.insert(m.id.clone(), (sig, h));
+                        }
                     }
                     ui.add_space(10.0);
+                    if to_bottom {
+                        ui.scroll_to_cursor_animation(Some(egui::Align::BOTTOM), egui::style::ScrollAnimation::none());
+                    }
                 });
             let dist = out.content_size.y - (out.state.offset.y + out.inner_rect.height());
             scroll_out = Some((dist, out.inner_rect));
         });
         self.emoji = ecache;
+        self.heights = heights;
+        self.chat_search_cache = chat_hits;
         self.scroll_bottom = false;
         if let Some(c) = chat_cmd {
             let _ = self.cmd.send(c);
@@ -3965,6 +4324,16 @@ impl App {
         }
         if export_chat {
             self.export_current();
+        }
+        if refetch {
+            if let Some(c) = self.selected.as_ref().and_then(|k| self.chats.get(k)) {
+                // Jede 50. Nachricht von neu nach alt als Anker: das Handy liefert jeweils die 50 davor.
+                let real: Vec<&ChatMessage> = c.messages.iter().rev().filter(|m| !m.id.is_empty() && !m.id.starts_with("local-") && !m.id.starts_with("demo")).collect();
+                let anchors: Vec<(String, bool, i64)> = real.iter().step_by(50).take(6).map(|m| (m.id.clone(), m.from_me, m.ts)).collect();
+                if !anchors.is_empty() {
+                    let _ = self.cmd.send(Cmd::Refetch { chat: c.jid.clone(), anchors });
+                }
+            }
         }
         if let Some((id, media, seek)) = audio_req {
             self.audio_action(id, media, seek);
@@ -4043,7 +4412,13 @@ impl App {
             }
         }
         for (id, media) in open_req {
-            let _ = self.cmd.send(Cmd::OpenMedia { id, media });
+            // Bilder und Videos im eingebauten Betrachter, alles andere mit dem Standardprogramm.
+            match self.selected.clone() {
+                Some(chat) if viewer::viewable(&media) => self.open_viewer(ctx, chat, id, media),
+                _ => {
+                    let _ = self.cmd.send(Cmd::OpenMedia { id, media });
+                }
+            }
         }
         if let Some(a) = msg_act {
             self.run_msg_act(a);
@@ -4142,7 +4517,7 @@ impl App {
                 }
                 if ui.link(RichText::new(t!("In Karte öffnen", "Open in map")).size(13.0)).clicked() {
                     let url = format!("https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=16/{lat}/{lon}");
-                    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+                    safety::spawn_opener(std::ffi::OsStr::new(&url));
                 }
             }
             Extra::Contact { name, vcard } => {
@@ -4181,7 +4556,7 @@ impl App {
                     .interact(egui::Sense::click());
                 if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     let u = if url.starts_with("http") { url.clone() } else { format!("https://{url}") };
-                    let _ = std::process::Command::new("xdg-open").arg(u).spawn();
+                    safety::spawn_opener(std::ffi::OsStr::new(&u));
                 }
                 ui.add_space(3.0);
             }
@@ -4303,6 +4678,70 @@ impl App {
     }
 
     /// Bild, Sticker oder Anhang in einer Blase.
+    /// Bild holen und als „gerade gezeigt“ vermerken.
+    fn tex(&self, id: &str) -> Option<&(egui::TextureHandle, bool)> {
+        let t = self.images.get(id)?;
+        self.touch(id);
+        Some(t)
+    }
+
+    fn touch(&self, id: &str) {
+        let mut seen = self.img_seen.borrow_mut();
+        match seen.get_mut(id) {
+            Some(at) => *at = std::time::Instant::now(),
+            None => {
+                seen.insert(id.to_owned(), std::time::Instant::now());
+            }
+        }
+    }
+
+    /// Bilder und Sticker-Animationen, die seit einer Weile nicht zu sehen waren, freigeben.
+    /// Die Dateien liegen auf der Platte und werden beim nächsten Anzeigen neu eingelesen.
+    fn sweep_images(&mut self) {
+        if self.img_sweep.elapsed().as_secs() < 10 {
+            return;
+        }
+        self.img_sweep = std::time::Instant::now();
+        if self.images.len() + self.anims.len() <= 40 {
+            return;
+        }
+        let seen = self.img_seen.get_mut();
+        let old: Vec<String> = self
+            .images
+            .keys()
+            .chain(self.anims.keys())
+            .filter(|id| seen.get(*id).map(|t| t.elapsed().as_secs() >= 45).unwrap_or(true))
+            .cloned()
+            .collect();
+        for id in old {
+            // Erst nach dem zweiten Durchlauf ohne Sichtung entfernen (frisch geladene haben noch keinen Vermerk).
+            if seen.remove(&id).is_none() && !self.img_stale.remove(&id) {
+                self.img_stale.insert(id);
+                continue;
+            }
+            self.img_stale.remove(&id);
+            self.images.remove(&id);
+            self.anims.remove(&id);
+            self.img_requested.remove(&id);
+        }
+    }
+
+    /// Prüfwert über alles, was die Höhe einer Nachricht ändern kann.
+    fn height_sig(&self, m: &ChatMessage, first: bool, width: f32) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        width.to_bits().hash(&mut h);
+        self.settings.font_size.to_bits().hash(&mut h);
+        first.hash(&mut h);
+        m.text.hash(&mut h);
+        (m.x.deleted, m.x.edited, m.x.view_once, m.quote.is_some(), m.media.is_some()).hash(&mut h);
+        self.reactions.get(&m.id).map(|l| l.len()).unwrap_or(0).hash(&mut h);
+        self.images.get(&m.id).map(|(t, full)| (t.size(), *full)).hash(&mut h);
+        self.anims.contains_key(&m.id).hash(&mut h);
+        self.votes.get(&m.id).map(|v| v.len()).unwrap_or(0).hash(&mut h);
+        h.finish()
+    }
+
     fn media_block(
         &self,
         ui: &mut egui::Ui,
@@ -4319,6 +4758,7 @@ impl App {
             return;
         }
         if let Some((frames, delays)) = self.anims.get(&m.id) {
+            self.touch(&m.id);
             // animierter Sticker: Bild nach Zeit auswählen
             let total: u32 = delays.iter().sum::<u32>().max(1);
             let t = (ui.input(|i| i.time) * 1000.0) as u64 % total as u64;
@@ -4340,9 +4780,15 @@ impl App {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(delays[idx].max(30) as u64));
             return;
         }
-        let tex = self.images.get(&m.id);
+        let tex = self.tex(&m.id);
         let auto = self.settings.autoload || m.from_me || self.img_requested.contains(&format!("{}#ok", m.id));
-        if auto && !self.img_requested.contains(&m.id) && tex.map(|t| !t.1).unwrap_or(true) {
+        // Nur anfordern, was in Sichtweite ist: sonst lädt ein langer Chat beim Öffnen alles auf einmal.
+        let near = {
+            let (y, c) = (ui.cursor().top(), ui.clip_rect());
+            y > c.top() - 900.0 && y < c.bottom() + 900.0
+        };
+        let failed = self.img_failed.get(&m.id).map(|t| t.elapsed().as_secs() < 60).unwrap_or(false);
+        if auto && near && !failed && !self.img_requested.contains(&m.id) && tex.map(|t| !t.1).unwrap_or(true) {
             media_req.push((m.id.clone(), md.clone()));
         }
         if !auto && tex.is_none() && md.is_picture() {
@@ -4366,7 +4812,12 @@ impl App {
                 None => {
                     let (r, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                     ui.painter().rect_filled(r, 6.0, pal.hover);
-                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, t!("Lädt …", "Loading …"), egui::FontId::proportional(13.0), pal.dim);
+                    let label = if failed { t!("⟳ Laden fehlgeschlagen – klicken", "⟳ Loading failed – click") } else { t!("Lädt …", "Loading …") };
+                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(13.0), pal.dim);
+                    if failed && resp.clicked() {
+                        media_req.push((m.id.clone(), md.clone()));
+                        return;
+                    }
                     resp
                 }
             };
@@ -4476,6 +4927,13 @@ impl eframe::App for App {
         let was_focused = self.focused;
         self.focused = ctx.input(|i| i.focused);
         self.pump(ctx);
+        self.sweep_images();
+        self.poll_paste(ctx);
+        // Der Betrachter liegt über allem und bekommt die Tasten zuerst.
+        if self.viewer.is_some() {
+            self.viewer_ui(ctx);
+        }
+        self.safety_dialogs(ctx);
         // Online-Status wie bei WhatsApp Web: online, solange das Fenster aktiv ist.
         if self.focused != was_focused && self.conn == Conn::Online {
             let _ = self.cmd.send(Cmd::SetOnline(self.focused && self.settings.show_online));
@@ -4653,7 +5111,7 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         ui.add_space(12.0);
                         for (id, md) in pics.iter().take(9) {
-                            match self.images.get(id) {
+                            match self.tex(id) {
                                 Some((t, _)) => {
                                     if ui.add(egui::Button::image(egui::Image::new((t.id(), egui::vec2(96.0, 96.0))).corner_radius(6.0)).frame(false)).clicked() {
                                         jump = Some(id.clone());
@@ -4840,9 +5298,23 @@ impl App {
 
     /// Status der letzten 24 Stunden, gruppiert nach Person ("" = ich), neueste Person zuerst.
     fn status_groups(&self) -> Vec<(String, Vec<ChatMessage>)> {
-        let Some(c) = self.chats.values().find(|c| c.jid.server == whatsapp_rust::Server::Broadcast && c.jid.user.as_str() == "status") else {
+        let Some(c) = self.chats.get("status@broadcast") else {
             return Vec::new();
         };
+        // Wird in jedem Bild gebraucht (Punkt in der Seitenleiste): nur neu gruppieren, wenn ein
+        // Status dazukam oder eine Minute um ist (dann fallen alte heraus).
+        let stamp = (c.messages.len(), now_ts() / 60);
+        if let Some((n, minute, v)) = self.status_cache.borrow().as_ref() {
+            if (*n, *minute) == stamp {
+                return v.clone();
+            }
+        }
+        let v = self.status_groups_now(c);
+        *self.status_cache.borrow_mut() = Some((stamp.0, stamp.1, v.clone()));
+        v
+    }
+
+    fn status_groups_now(&self, c: &Chat) -> Vec<(String, Vec<ChatMessage>)> {
         let since = now_ts() - 86_400;
         let mut map: HashMap<String, Vec<ChatMessage>> = HashMap::new();
         for m in c.messages.iter().filter(|m| m.ts >= since) {
@@ -5170,7 +5642,7 @@ impl App {
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::Center)));
             if let Some(md) = &m.media {
                 if md.is_picture() {
-                    match self.images.get(&m.id) {
+                    match self.tex(&m.id) {
                         Some((t, _)) => {
                             let sz = t.size_vec2();
                             let k = (area.width() / sz.x).min((area.height() - 60.0) / sz.y).min(3.0);
@@ -5544,17 +6016,43 @@ impl App {
             }
         };
         let Some(rgba) = image::RgbaImage::from_raw(img.width as u32, img.height as u32, img.bytes.into_owned()) else { return };
-        let dir = data_dir().join("tmp");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!("Zwischenablage-{}.png", now_ts()));
-        if let Err(e) = rgba.save(&path) {
-            self.info = Some(tf!("Bild aus der Zwischenablage: {e}", "Image from clipboard: {e}"));
-            return;
+        // PNG-Kodieren dauert bei großen Bildschirmfotos spürbar: nicht im Fenster-Thread.
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = (|| -> Result<(std::path::PathBuf, [usize; 2], Vec<u8>), String> {
+                let dir = data_dir().join("tmp");
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let path = dir.join(format!("Zwischenablage-{}.png", now_ts()));
+                rgba.save(&path).map_err(|e| e.to_string())?;
+                let thumb = image::DynamicImage::ImageRgba8(rgba).thumbnail(240, 240).to_rgba8();
+                Ok((path, [thumb.width() as usize, thumb.height() as usize], thumb.into_raw()))
+            })();
+            let _ = tx.send(r);
+            ctx.request_repaint();
+        });
+        self.paste_rx = Some(rx);
+    }
+
+    /// Fertig kodiertes Bild aus der Zwischenablage übernehmen.
+    fn poll_paste(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.paste_rx else { return };
+        match rx.try_recv() {
+            Ok(Ok((path, size, rgba))) => {
+                let ci = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
+                let tex = ctx.load_texture("paste", ci, egui::TextureOptions::LINEAR);
+                if let Some((old, _)) = self.pending_paste.replace((path, tex)) {
+                    let _ = std::fs::remove_file(old);
+                }
+                self.paste_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.info = Some(tf!("Bild aus der Zwischenablage: {e}", "Image from clipboard: {e}"));
+                self.paste_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.paste_rx = None,
         }
-        let thumb = image::DynamicImage::ImageRgba8(rgba).thumbnail(240, 240).to_rgba8();
-        let ci = egui::ColorImage::from_rgba_unmultiplied([thumb.width() as usize, thumb.height() as usize], thumb.as_raw());
-        let tex = ctx.load_texture("paste", ci, egui::TextureOptions::LINEAR);
-        self.pending_paste = Some((path, tex));
     }
 }
 
@@ -5586,6 +6084,7 @@ fn with_ctx(f: impl FnOnce(&egui::Context)) {
 /// Hülle um die App: beim Schließen des Fensters wird der Zustand aufgehoben statt verworfen.
 struct Shell {
     app: Option<App>,
+    last_frame: std::time::Instant,
 }
 
 impl Shell {
@@ -5606,14 +6105,29 @@ impl Shell {
                 app.emoji = emoji::Cache::default();
                 app
             }
-            None => App::new(cc, core.take().expect("Backend")),
+            // Ohne Backend (kann nur bei einem Programmfehler fehlen) startet das Fenster leer,
+            // statt abzustürzen; die Meldung steht im Log.
+            None => match core.take() {
+                Some(c) => App::new(cc, c),
+                None => {
+                    backend::log("Start: Verbindung zum Backend fehlt");
+                    return Shell { app: None, last_frame: std::time::Instant::now() };
+                }
+            },
         };
-        Shell { app: Some(app) }
+        Shell { app: Some(app), last_frame: std::time::Instant::now() }
     }
 }
 
 impl eframe::App for Shell {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Ohne vsync (Wayland, siehe main) würde eine laufende Animation ungebremst zeichnen
+        // und einen CPU-Kern auslasten. Deshalb höchstens rund 144 Bilder pro Sekunde.
+        const MIN_FRAME: std::time::Duration = std::time::Duration::from_micros(6900);
+        if let Some(wait) = MIN_FRAME.checked_sub(self.last_frame.elapsed()) {
+            std::thread::sleep(wait);
+        }
+        self.last_frame = std::time::Instant::now();
         if let Some(app) = self.app.as_mut() {
             app.update(ctx, frame);
         }
@@ -5642,9 +6156,24 @@ fn single_instance(tx: std::sync::mpsc::Sender<tray::TrayMsg>) -> bool {
     use std::os::unix::net::{UnixListener, UnixStream};
     let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(data_dir);
     let sock = dir.join("wa-snap.sock");
-    if let Ok(mut s) = UnixStream::connect(&sock) {
-        let _ = s.write_all(b"open");
-        return false;
+    // Erst die Sperre, dann der Socket: bei zwei gleichzeitigen Starts gewinnt genau einer.
+    // Ohne Sperre könnten beide den Socket als verwaist ansehen, löschen und doppelt laufen.
+    match safety::lock_instance(&dir) {
+        Some(lock) => {
+            // Die Sperre gilt, solange die Datei offen ist: bis zum Programmende behalten.
+            std::mem::forget(lock);
+        }
+        None => {
+            // Die andere Instanz bindet ihren Socket vielleicht gerade erst: kurz nachfassen.
+            for _ in 0..20 {
+                if let Ok(mut s) = UnixStream::connect(&sock) {
+                    let _ = s.write_all(b"open");
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            return false;
+        }
     }
     let _ = std::fs::remove_file(&sock);
     if let Ok(listener) = UnixListener::bind(&sock) {
@@ -5699,7 +6228,26 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // Vor allem anderen: neue Dateien nur für den eigenen Nutzer, abgemeldete Sitzung entfernen.
+    safety::restrict_new_files();
+    if let Err(e) = std::fs::create_dir_all(data_dir()) {
+        eprintln!("{}", tf!("Datenordner {} lässt sich nicht anlegen: {e}", "Cannot create data folder {}: {e}", data_dir().display()));
+        std::process::exit(1);
+    }
+    dialogs::finish_logout(&data_dir());
     harden_data_dir();
+    // Abstürze ins Log schreiben: beim Start aus dem Menü sieht sonst niemand die Meldung.
+    let log_file = data_dir().join("wa-snap.log");
+    let old_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_file) {
+            let thread = std::thread::current();
+            let line = format!("{} ABSTURZ (Thread {}): {info}\n", chrono::Local::now().format("%F %T"), thread.name().unwrap_or("?"));
+            let _ = f.write_all(line.as_bytes());
+        }
+        old_hook(info);
+    }));
     let (tx, rx) = channel();
     let notify: backend::SharedNotify = Default::default();
     let (cmd, backend_thread) = backend::spawn(data_dir(), tx, notify.clone(), || with_ctx(|c| c.request_repaint()));
@@ -5737,16 +6285,26 @@ fn main() -> eframe::Result<()> {
                     .with_app_id("wa-snap")
                     .with_title(t!("WhatsSnap", "WhatsSnap")),
                 run_and_return: true,
+                // Unter Wayland wartet eglSwapBuffers mit vsync auf einen Frame-Callback, den der
+                // Compositor bei verdecktem oder minimiertem Fenster nie schickt: die App hinge dann
+                // beim nächsten Neuzeichnen fest („Reagiert nicht“). winit taktet dort ohnehin selbst.
+                vsync: std::env::var_os("WAYLAND_DISPLAY").is_none(),
                 ..Default::default()
             };
             let core_ref = &mut core;
-            eframe::run_native(t!("WhatsSnap", "WhatsSnap"), opts, Box::new(|cc| Ok(Box::new(Shell::new(cc, core_ref)))))?;
+            if let Err(e) = eframe::run_native(t!("WhatsSnap", "WhatsSnap"), opts, Box::new(|cc| Ok(Box::new(Shell::new(cc, core_ref))))) {
+                backend::log(format!("Fenster-Fehler: {e}"));
+                return Err(e);
+            }
         }
         show = true;
         let background = STASH.with(|s| s.borrow().as_ref().map(|a| a.settings.background).unwrap_or(true));
-        if QUIT.load(std::sync::atomic::Ordering::SeqCst) || !has_tray || !background {
+        let quit = QUIT.load(std::sync::atomic::Ordering::SeqCst);
+        if quit || !has_tray || !background {
+            backend::log(format!("Beenden: Fenster zu (beenden={quit} tray={has_tray} im_hintergrund={background})"));
             break;
         }
+        backend::log("Fenster geschlossen, läuft im Tray weiter");
         match main_rx.recv() {
             Ok(tray::TrayMsg::Open) => continue,
             _ => break,
@@ -5763,6 +6321,39 @@ fn main() -> eframe::Result<()> {
         backend::log("Beenden: Backend hat nicht rechtzeitig aufgehört");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    fn msg(id: &str, ts: i64) -> ChatMessage {
+        ChatMessage {
+            chat: Jid::new("49151", whatsapp_rust::Server::Pn),
+            is_group: false,
+            from_me: false,
+            sender_name: String::new(),
+            sender: String::new(),
+            text: String::new(),
+            ts,
+            id: id.into(),
+            status: 0,
+            media: None,
+            quote: None,
+            x: Default::default(),
+        }
+    }
+
+    #[test]
+    fn inserts_keep_time_order_and_arrival_order_for_equal_times() {
+        let mut v: Vec<ChatMessage> = Vec::new();
+        for (id, ts) in [("a", 10), ("b", 30), ("c", 20), ("d", 30), ("e", 5), ("f", 20)] {
+            let pos = insert_pos(&v, ts);
+            v.insert(pos, msg(id, ts));
+        }
+        let ids: Vec<&str> = v.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["e", "a", "c", "f", "b", "d"]);
+    }
 }
 
 #[cfg(test)]

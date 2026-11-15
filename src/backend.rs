@@ -20,6 +20,12 @@ pub enum UiEvent {
     Qr(String),
     Connected,
     LoggedOut,
+    /// Das Abmelden kam von hier (nicht vom Handy): Schlüssel vormerken, nach dem Verlauf fragen.
+    LogoutDone,
+    /// Dieselbe Person: interne Kennung (LID) und Telefonnummer, jeweils ohne Server-Teil.
+    Alias { lid: String, pn: String },
+    /// Verbindung zum Server verloren; die Bibliothek verbindet von selbst neu.
+    Disconnected,
     Message(ChatMessage),
     /// Anzeigename für eine Rufnummer/LID (Adressbuch hat Vorrang vor Push-Namen).
     Contact { user: String, name: String, from_book: bool },
@@ -27,7 +33,13 @@ pub enum UiEvent {
     History(Vec<HistChat>),
     /// Profilbild als RGBA-Pixel (96x96 oder kleiner), Schlüssel ist die Rufnummer/LID.
     Avatar { user: String, size: [usize; 2], rgba: Vec<u8> },
+    /// Profilbild konnte gerade nicht geholt werden (offline, Rate-Limit): später erneut fragen.
+    AvatarRetry { user: String },
     SendFailed { chat: String, temp: String, err: String },
+    /// Eine Datei wird gesendet: merken, bis der Server sie bestätigt (übersteht einen Neustart).
+    OutMedia { temp: String, chat: String, is_group: bool, caption: String, media: MediaRef },
+    /// Bild/Sticker ließ sich nicht laden; die Oberfläche darf es später erneut versuchen.
+    MediaFailed { id: String },
     /// Eigene Nachricht wurde vom Server angenommen: lokale ID durch echte ersetzen.
     Sent { chat: String, temp: String, id: String },
     /// Zustellung/Lesen eigener Nachrichten: 2 = zugestellt, 3 = gelesen.
@@ -80,6 +92,11 @@ pub enum UiEvent {
     Blocklist(Vec<String>),
     /// Datei eines Mediums liegt lokal bereit (z. B. Sprachnachricht zum Abspielen).
     /// Bei Ogg/Opus schon im Hintergrund dekodiert: (PCM, Kanäle, Wellenform) oder Fehler.
+    /// Datei ist kein harmloser Typ: vor dem Öffnen nachfragen.
+    OpenBlocked { path: std::path::PathBuf, reason: String },
+    /// Antwort auf `ViewMedia`.
+    ViewReady { id: String, path: std::path::PathBuf, image: Option<([usize; 2], Vec<u8>)>, video: Option<Result<crate::video::Info, String>> },
+    ViewFailed { id: String, err: String },
     FileReady { id: String, path: std::path::PathBuf, voice: Option<Result<(Arc<Vec<i16>>, usize, Vec<u8>), String>> },
     /// Animierter Sticker: Einzelbilder mit Dauer in Millisekunden.
     Anim { id: String, frames: Vec<([usize; 2], Vec<u8>, u32)> },
@@ -91,6 +108,8 @@ pub enum UiEvent {
 
 /// Was die Oberfläche dem Backend aufträgt.
 pub enum Cmd {
+    /// Zu diesen Einzelchats die Zuordnung LID ↔ Telefonnummer nachschlagen.
+    ResolveAliases(Vec<Jid>),
     Send { chat: Jid, text: String, temp: String, quote: Option<Quote>, mentions: Vec<String>, expiration: u32 },
     /// Eigene Nachricht bearbeiten.
     Edit { chat: Jid, id: String, text: String },
@@ -102,6 +121,11 @@ pub enum Cmd {
     Vote { chat: Jid, poll: String, creator: String, secret: Vec<u8>, options: Vec<String> },
     /// Gespeicherte Umfragen bekannt machen, damit Stimmen entschlüsselt werden können.
     RegisterPolls(Vec<(String, Vec<u8>, String, Vec<String>)>),
+    /// Zu Mediennachrichten merken, in welchem Chat und von wem sie sind (Nachrichten-ID,
+    /// Chat, von mir, Absender). Nötig, um abgelaufene Medien neu anzufordern.
+    RegisterMedia(Vec<(String, Jid, bool, String)>),
+    /// Verlauf eines Chats erneut vom Handy holen: je Anker (ID, von mir, Zeit) die 50 Nachrichten davor.
+    Refetch { chat: Jid, anchors: Vec<(String, bool, i64)> },
     /// Mit Emoji reagieren (leer = Reaktion entfernen).
     React { chat: Jid, target: Quote, from_me: bool, emoji: String },
     /// Eigene Nachricht für alle löschen.
@@ -126,6 +150,12 @@ pub enum Cmd {
     TestNotify,
     /// Bild/Sticker laden (erst Vorschau, dann herunterladen und dekodieren).
     LoadMedia { id: String, media: MediaRef },
+    /// Für den Betrachter: Datei holen, Bild in hoher Auflösung dekodieren bzw. Video vermessen.
+    ViewMedia { id: String, media: MediaRef, max_side: u32 },
+    /// Datei über einen „Speichern unter“-Dialog kopieren.
+    SaveMedia { id: String, media: MediaRef },
+    /// Nicht gesendete Datei noch einmal senden; sie liegt als `<temp>.<endung>` im Medienordner.
+    ResendFile { chat: Jid, temp: String, media: MediaRef, caption: String },
     /// Anhang herunterladen und mit dem Standardprogramm öffnen.
     OpenMedia { id: String, media: MediaRef },
     /// Datei senden (Bild als Foto, sonst als Dokument). Ohne Pfad: Dateiauswahl öffnen.
@@ -475,6 +505,69 @@ fn decode_rgba(bytes: &[u8], max: u32) -> Option<([usize; 2], Vec<u8>)> {
     Some(([rgba.width() as usize, rgba.height() as usize], rgba.into_raw()))
 }
 
+/// Begrenzt gleichzeitige Abrufe beim WhatsApp-Server (Medien, Profilbilder). Ohne Grenze
+/// fragt ein Start mit vielen Chats alles auf einmal an und der Server antwortet mit 429.
+static NET_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
+
+fn is_rate_limit(err: &str) -> bool {
+    err.contains("429") || err.contains("rate-overlimit")
+}
+
+/// Sprachnachricht (Ogg/Opus) hochladen und senden.
+async fn send_voice(client: &Client, send: &(impl Fn(UiEvent) + Clone), dir: &std::path::Path, chat: &Jid, ogg: Vec<u8>, seconds: u32, waveform: Vec<u8>) -> Result<(), String> {
+    use whatsapp_rust::wacore::download::MediaType as M;
+    let mime = "audio/ogg; codecs=opus";
+    let mref = MediaRef { kind: "ptt".into(), mime: mime.into(), len: ogg.len() as u64, seconds, ..Default::default() };
+    upload_and_send(client, send, dir, chat, ogg, mref, String::new(), M::Audio, move |up| wa::Message {
+        audio_message: whatsapp_rust::waproto::buffa::MessageField::some(wa::message::AudioMessage {
+            url: Some(up.url.clone()),
+            direct_path: Some(up.direct_path.clone()),
+            media_key: Some(up.media_key.to_vec()),
+            file_sha256: Some(up.file_sha256.to_vec()),
+            file_enc_sha256: Some(up.file_enc_sha256.to_vec()),
+            file_length: Some(up.file_length),
+            media_key_timestamp: Some(up.media_key_timestamp),
+            mimetype: Some(mime.into()),
+            seconds: Some(seconds),
+            ptt: Some(true),
+            waveform: Some(waveform),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await
+}
+
+/// Herkunft von Mediennachrichten: Nachrichten-ID → (Chat, von mir, Absender).
+static MEDIA_CTX: Mutex<Option<HashMap<String, (Jid, bool, String)>>> = Mutex::new(None);
+
+fn remember_media(id: &str, chat: &Jid, from_me: bool, sender: &str) {
+    if let Ok(mut g) = MEDIA_CTX.lock() {
+        g.get_or_insert_with(HashMap::new).insert(id.to_owned(), (chat.clone(), from_me, sender.to_owned()));
+    }
+}
+
+/// Abgelaufenes Medium beim Absender-Gerät neu anfordern. Liefert den neuen Pfad.
+async fn request_reupload(client: &Client, id: &str, m: &MediaRef) -> Option<String> {
+    let (chat, from_me, sender) = MEDIA_CTX.lock().ok()?.as_ref()?.get(id)?.clone();
+    let participant = if chat.is_group() { sender.parse::<Jid>().ok() } else { None };
+    let req = whatsapp_rust::MediaReuploadRequest { msg_id: id, chat_jid: &chat, media_key: &m.key, is_from_me: from_me, participant: participant.as_ref() };
+    match client.media_reupload().request(&req).await {
+        Ok(whatsapp_rust::MediaRetryResult::Success { direct_path }) => {
+            log(format!("Medium {id}: neu bereitgestellt"));
+            Some(direct_path)
+        }
+        Ok(r) => {
+            log(format!("Medium {id}: Neu-Anforderung abgelehnt ({r:?})"));
+            None
+        }
+        Err(e) => {
+            log(format!("Medium {id}: Neu-Anforderung fehlgeschlagen: {e}"));
+            None
+        }
+    }
+}
+
 /// Datei des Mediums im Datenordner; lädt sie herunter, falls sie noch fehlt.
 async fn ensure_file(client: &Client, dir: &std::path::Path, id: &str, m: &MediaRef) -> Result<std::path::PathBuf, String> {
     let path = dir.join(format!("{}.{}", safe_name(id), m.ext()));
@@ -486,7 +579,33 @@ async fn ensure_file(client: &Client, dir: &std::path::Path, id: &str, m: &Media
     if m.direct_path.is_empty() || m.key.is_empty() {
         return Err(t!("Medium ist nicht mehr verfügbar", "Media is no longer available").into());
     }
-    let bytes = client.download_from_params(&m.params()).await.map_err(|e| e.to_string())?;
+    let bytes = {
+        // Höchstens ein paar Abrufe gleichzeitig; bei „rate-overlimit“ warten und erneut versuchen.
+        let _slot = NET_SLOTS.acquire().await;
+        let mut wait = 2;
+        loop {
+            match client.download_from_params(&m.params()).await {
+                Ok(b) => break b,
+                Err(e) => {
+                    let e = e.to_string();
+                    if is_rate_limit(&e) && wait <= 18 {
+                        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                        wait *= 3;
+                        continue;
+                    }
+                    // Kein Tempolimit: die Datei liegt vermutlich nicht mehr auf dem Server.
+                    // Einmal neu anfordern (das Handy des Absenders lädt sie wieder hoch).
+                    if is_rate_limit(&e) {
+                        return Err(e);
+                    }
+                    let Some(path) = request_reupload(client, id, m).await else { return Err(e) };
+                    let mut fresh = m.clone();
+                    fresh.direct_path = path;
+                    break client.download_from_params(&fresh.params()).await.map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    };
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let part = dir.join(format!("{}.{}.part", safe_name(id), m.ext()));
     let p2 = part.clone();
@@ -712,11 +831,35 @@ fn save_thumb(id: &str, bytes: &[u8]) {
 }
 
 /// Diagnose-Log (`wa-snap.log` im Datenordner), damit sich Probleme nachvollziehen lassen.
+///
+/// Telefonnummern und andere lange Kennungen werden vor dem Schreiben unkenntlich gemacht.
+/// Die Datei wird auch im laufenden Betrieb begrenzt: ab [`LOG_MAX`] wandert sie nach
+/// `wa-snap.log.old` (eine Generation).
 pub fn log(msg: impl AsRef<str>) {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let Some(p) = LOG_PATH.get() else { return };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-        let _ = writeln!(f, "{} {}", chrono::Local::now().format("%F %T"), msg.as_ref());
+    static LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 200 == 0 && std::fs::metadata(p).map(|m| m.len() > LOG_MAX).unwrap_or(false) {
+        let _ = std::fs::rename(p, p.with_extension("log.old"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(p) {
+        // Ganze Zeile in einem einzigen write(): sonst mischen sich Zeilen aus mehreren Threads.
+        let line = format!("{} {}\n", chrono::Local::now().format("%F %T"), crate::safety::anonymize(msg.as_ref()));
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Größe, ab der das Log rotiert wird.
+const LOG_MAX: u64 = 512_000;
+
+/// Ausführliches Log (eine Zeile pro Nachricht); Schalter in den Einstellungen, Standard aus.
+pub static DEBUG_LOG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Nur schreiben, wenn das ausführliche Log eingeschaltet ist.
+pub fn log_debug(msg: impl AsRef<str>) {
+    if DEBUG_LOG.load(std::sync::atomic::Ordering::Relaxed) {
+        log(msg);
     }
 }
 
@@ -726,7 +869,8 @@ pub fn show_notification(title: &str, body: &str) -> Result<(), String> {
     let r = notify_rust::Notification::new()
         .appname(t!("WhatsSnap", "WhatsSnap"))
         .summary(title)
-        .body(body)
+        // Der Text kommt von außen: als Markup gedeutete Zeichen entschärfen.
+        .body(&crate::safety::escape_markup(body))
         .icon("wa-snap")
         .show();
     match r {
@@ -773,7 +917,7 @@ fn maybe_notify(state: &SharedNotify, m: &ChatMessage) {
     let (title, body) = {
         let Ok(st) = state.lock() else { return };
         let viewing = st.focused && st.selected_user.as_deref() == Some(chat_user.as_str());
-        log(format!(
+        log_debug(format!(
             "Benachrichtigung? an={} stumm={} alt={age}s sichtbar={viewing}",
             st.enabled,
             st.muted.contains(&chat_user)
@@ -886,6 +1030,10 @@ fn convert_history(h: &wa::HistorySync, send: &impl Fn(UiEvent)) {
                 save_thumb(&id, th);
             }
             let from_me = key.from_me.unwrap_or(false);
+            if media.is_some() {
+                let who = wm.participant.clone().or_else(|| key.participant.clone()).unwrap_or_default();
+                remember_media(&id, &jid, from_me, &who);
+            }
             let sender = wm
                 .participant
                 .clone()
@@ -952,21 +1100,40 @@ async fn load_avatar(client: Arc<Client>, dir: std::path::PathBuf, jid: Jid) -> 
     };
     let bytes: Vec<u8> = match cached {
         Some((a, b)) if (!b.is_empty() && a < 7 * 86_400) || (b.is_empty() && a < 86_400) => b,
-        _ => {
-            let fetched = match client.contacts().get_profile_picture(&jid, true).await {
+        stale => {
+            // Nur eine echte Antwort des Servers zwischenspeichern. Ein Fehler (offline,
+            // 429 rate-overlimit, Download abgebrochen) darf nicht als „hat kein Bild“ gelten.
+            let slot = NET_SLOTS.acquire().await;
+            let fetched: Result<Vec<u8>, ()> = match client.contacts().get_profile_picture(&jid, true).await {
                 Ok(Some(pp)) => tokio::task::spawn_blocking(move || {
                     let mut resp = ureq::get(&pp.url).call().ok()?;
                     resp.body_mut().read_to_vec().ok()
                 })
                 .await
                 .ok()
-                .flatten(),
-                _ => None,
+                .flatten()
+                .filter(|b| !b.is_empty())
+                .ok_or(()),
+                Ok(None) => Ok(Vec::new()),
+                Err(_) => Err(()),
             };
-            let data = fetched.unwrap_or_default();
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(&path, &data);
-            data
+            drop(slot);
+            match fetched {
+                Ok(data) => {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(&path, &data);
+                    data
+                }
+                Err(()) => {
+                    // Altes Bild weiter zeigen, falls vorhanden; sonst in einer Minute neu versuchen.
+                    let old = stale.map(|(_, b)| b).unwrap_or_default();
+                    if old.is_empty() {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        return Some(UiEvent::AvatarRetry { user });
+                    }
+                    old
+                }
+            }
         }
     };
     if bytes.is_empty() {
@@ -1208,9 +1375,14 @@ async fn upload_and_send(
     build: impl FnOnce(&whatsapp_rust::upload::UploadResponse) -> wa::Message,
 ) -> Result<(), String> {
     let temp = format!("local-u-{}", chrono::Utc::now().timestamp_millis());
-    let _ = std::fs::create_dir_all(dir);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        log(format!("Medienordner anlegen fehlgeschlagen: {e}"));
+    }
     let local = dir.join(format!("{}.{}", safe_name(&temp), mref.ext()));
-    let _ = std::fs::write(&local, &data);
+    if let Err(e) = std::fs::write(&local, &data) {
+        log(format!("Kopie für den Ausgang nicht geschrieben: {e}"));
+    }
+    send(UiEvent::OutMedia { temp: temp.clone(), chat: chat.to_string(), is_group: chat.is_group(), caption: caption.clone(), media: mref.clone() });
     send(UiEvent::Message(ChatMessage {
         chat: chat.clone(),
         is_group: chat.is_group(),
@@ -1285,6 +1457,7 @@ async fn send_file(
     chat: &Jid,
     path: &std::path::Path,
     caption: String,
+    name_override: Option<String>,
 ) -> Result<(), String> {
     use whatsapp_rust::wacore::download::MediaType as M;
     let data = tokio::fs::read(path).await.map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1292,7 +1465,7 @@ async fn send_file(
         return Err(t!("Datei ist größer als 100 MB", "File is larger than 100 MB").into());
     }
     let mime = mime_of(path);
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = name_override.filter(|n| !n.is_empty()).unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
     // Videos und GIFs (als stummes MP4) als Video senden
     let gif = mime == "image/gif";
     if mime == "video/mp4" || gif {
@@ -1353,9 +1526,14 @@ async fn send_file(
         mref.h = img.height();
     }
     let temp = format!("local-f-{}", chrono::Utc::now().timestamp_millis());
-    let _ = std::fs::create_dir_all(dir);
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        log(format!("Medienordner anlegen fehlgeschlagen: {e}"));
+    }
     let local = dir.join(format!("{}.{}", safe_name(&temp), mref.ext()));
-    let _ = std::fs::write(&local, &data);
+    if let Err(e) = std::fs::write(&local, &data) {
+        log(format!("Kopie für den Ausgang nicht geschrieben: {e}"));
+    }
+    send(UiEvent::OutMedia { temp: temp.clone(), chat: chat.to_string(), is_group: chat.is_group(), caption: caption.clone(), media: mref.clone() });
     send(UiEvent::Message(ChatMessage {
         chat: chat.clone(),
         is_group: chat.is_group(),
@@ -1434,11 +1612,13 @@ pub fn spawn(
     let handle = std::thread::Builder::new()
         .name("wa-backend".into())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
+            let rt = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Status(tf!("Start fehlgeschlagen: {e}", "Start failed: {e}")));
+                    return;
+                }
+            };
             rt.block_on(async move {
                 let send = {
                     let tx = ui_tx.clone();
@@ -1451,8 +1631,8 @@ pub fn spawn(
 
                 let _ = std::fs::create_dir_all(&dir);
                 let lp = dir.join("wa-snap.log");
-                if std::fs::metadata(&lp).map(|m| m.len() > 512_000).unwrap_or(false) {
-                    let _ = std::fs::remove_file(&lp);
+                if std::fs::metadata(&lp).map(|m| m.len() > LOG_MAX).unwrap_or(false) {
+                    let _ = std::fs::rename(&lp, lp.with_extension("log.old"));
                 }
                 let _ = LOG_PATH.set(lp);
                 log(format!("--- Start v{} ---", env!("CARGO_PKG_VERSION")));
@@ -1535,10 +1715,6 @@ pub fn spawn(
                         async move {
                             let info = &ctx.info;
                             let client = ctx.client.clone();
-                            log(format!(
-                                "Nachricht {} von_mir={} typ='{}'",
-                                info.source.chat, info.source.is_from_me, info.media_type
-                            ));
                             let base = ctx.message.get_base_message();
                             if let Some(r) = base.reaction_message.as_option() {
                                 if let Some(target) = r.key.as_option().and_then(|k| k.id.clone()) {
@@ -1547,6 +1723,11 @@ pub fn spawn(
                                 }
                                 return;
                             }
+                            // Reaktionen nicht protokollieren: wer sie im Sekundentakt umschaltet, füllt sonst das Log.
+                            log_debug(format!(
+                                "Nachricht {} von_mir={} typ='{}'",
+                                info.source.chat, info.source.is_from_me, info.media_type
+                            ));
                             if let Some(pu) = base.poll_update_message.as_option() {
                                 let poll_id = pu.poll_creation_message_key.as_option().and_then(|k| k.id.clone()).unwrap_or_default();
                                 let known = POLLS.lock().ok().and_then(|g| g.as_ref().and_then(|m| m.get(&poll_id).cloned()));
@@ -1592,12 +1773,20 @@ pub fn spawn(
                                 return;
                             }
                             let x = extra_of(&ctx.message);
-                            if !is_visible(&ctx.message, &info.media_type) && x.kind.is_none() {
+                            let media = media_of(&ctx.message);
+                            // Am Inhalt entscheiden, nicht am Typ-Vermerk des Servers: bei Nachrichten, die
+                            // das Handy nachliefert (erste Zustellung nicht lesbar), ist der Vermerk leer.
+                            // Fotos und Sprachnachrichten ohne Text fielen deshalb bisher weg.
+                            if !is_visible(&ctx.message, &info.media_type) && x.kind.is_none() && media.is_none() {
+                                log_debug(format!("Nachricht {} ohne anzeigbaren Inhalt übersprungen", info.id));
                                 return;
                             }
-                            let media = media_of(&ctx.message);
                             if let Some((_, Some(th), _)) = &media {
                                 save_thumb(&info.id, th);
+                            }
+                            if let Some((m, _, _)) = &media {
+                                log(format!("Medium empfangen: {} {} (Typ-Vermerk '{}')", m.kind, info.id, info.media_type));
+                                remember_media(&info.id, &info.source.chat, info.source.is_from_me, &info.source.sender.to_string());
                             }
                             let text = match (&media, ctx.message.text_content()) {
                                 (_, Some(t)) => t.to_owned(),
@@ -1626,6 +1815,13 @@ pub fn spawn(
                                 quote: quote_of(&ctx.message),
                                 x,
                             };
+                            // Einzelchat: Zuordnung LID ↔ Nummer mitgeben, damit die Oberfläche
+                            // nicht zwei getrennte Chats für dieselbe Person führt.
+                            if !info.source.is_group {
+                                if let Ok(Some(e)) = client.get_lid_pn_entry(&info.source.chat).await {
+                                    s(UiEvent::Alias { lid: e.lid.to_string(), pn: e.phone_number.to_string() });
+                                }
+                            }
                             maybe_notify(&st, &msg);
                             s(UiEvent::Message(msg));
                         }
@@ -1645,6 +1841,11 @@ pub fn spawn(
                             EventKind::StarUpdate,
                             EventKind::IncomingCall,
                             EventKind::MissedCall,
+                            EventKind::Disconnected,
+                            EventKind::UndecryptableMessage,
+                            EventKind::ConnectFailure,
+                            EventKind::TemporaryBan,
+                            EventKind::StreamReplaced,
                         ],
                         move |event, client| {
                             let s = s_ev.clone();
@@ -1775,6 +1976,27 @@ pub fn spawn(
                                             convert_history(hs, &s);
                                         }
                                     }
+                                    Event::UndecryptableMessage(u) => {
+                                        log(format!(
+                                            "Nachricht {} in {} nicht lesbar (nicht verfügbar={}, {:?}); wird vom Handy nachgefordert",
+                                            u.info.id, u.info.source.chat, u.is_unavailable, u.decrypt_fail_mode
+                                        ));
+                                    }
+                                    Event::Disconnected(d) => {
+                                        log(format!("Getrennt: {:?}", d.reason));
+                                        s(UiEvent::Disconnected);
+                                    }
+                                    Event::ConnectFailure(f) => {
+                                        log(format!("Verbindung abgelehnt: {:?} {}", f.reason, f.message.as_deref().unwrap_or("")));
+                                    }
+                                    Event::TemporaryBan(b) => {
+                                        let mins = b.expire.num_minutes();
+                                        log(format!("Vorübergehend gesperrt: {:?}, {mins} min", b.code));
+                                        s(UiEvent::Info(tf!("WhatsApp hat dieses Konto vorübergehend gesperrt ({mins} min).", "WhatsApp has temporarily banned this account ({mins} min).")));
+                                    }
+                                    Event::StreamReplaced(_) => {
+                                        log("Verbindung wurde von einer anderen Sitzung übernommen");
+                                    }
                                     Event::PushNameUpdate(p) if !p.new_push_name.is_empty() => {
                                         s(UiEvent::Contact {
                                             user: p.jid.user.to_string(),
@@ -1888,6 +2110,33 @@ pub fn spawn(
                                         }
                                     });
                                 }
+                                Cmd::RegisterMedia(list) => {
+                                    if let Ok(mut g) = MEDIA_CTX.lock() {
+                                        let map = g.get_or_insert_with(HashMap::new);
+                                        for (id, chat, from_me, sender) in list {
+                                            map.insert(id, (chat, from_me, sender));
+                                        }
+                                    }
+                                }
+                                Cmd::Refetch { chat, anchors } => {
+                                    tokio::spawn(async move {
+                                        let n = anchors.len();
+                                        let mut ok = 0;
+                                        for (id, from_me, ts) in anchors {
+                                            match client.fetch_message_history(&chat, &id, from_me, ts * 1000, 50).await {
+                                                Ok(_) => ok += 1,
+                                                Err(e) => log(format!("Verlauf nachladen: {e}")),
+                                            }
+                                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                        }
+                                        log(format!("Verlauf nachladen: {ok} von {n} Anfragen gesendet"));
+                                        send(UiEvent::Info(if ok > 0 {
+                                            t!("Verlauf wird vom Handy nachgeladen. Das Handy muss online sein.", "Reloading history from your phone. The phone must be online.").into()
+                                        } else {
+                                            t!("Verlauf nachladen fehlgeschlagen", "Reloading history failed").into()
+                                        }));
+                                    });
+                                }
                                 Cmd::RegisterPolls(list) => {
                                     for (id, secret, creator, options) in list {
                                         remember_poll(&id, &secret, &creator, &options);
@@ -1936,6 +2185,15 @@ pub fn spawn(
                                         let r = if on { p.set_available().await } else { p.set_unavailable().await };
                                         if let Err(e) = r {
                                             log(format!("Online-Status: {e}"));
+                                        }
+                                    });
+                                }
+                                Cmd::ResolveAliases(jids) => {
+                                    tokio::spawn(async move {
+                                        for j in jids {
+                                            if let Ok(Some(e)) = client.get_lid_pn_entry(&j).await {
+                                                send(UiEvent::Alias { lid: e.lid.to_string(), pn: e.phone_number.to_string() });
+                                            }
                                         }
                                     });
                                 }
@@ -2090,7 +2348,58 @@ pub fn spawn(
                                                     }
                                                 }
                                             }
-                                            Err(e) => log(format!("Medium {id} laden fehlgeschlagen: {e}")),
+                                            Err(e) => {
+                                                log(format!("Medium {id} laden fehlgeschlagen: {e}"));
+                                                send(UiEvent::MediaFailed { id });
+                                            }
+                                        }
+                                    });
+                                }
+                                Cmd::ViewMedia { id, media, max_side } => {
+                                    let dir = media_dir.clone();
+                                    tokio::spawn(async move {
+                                        let path = match ensure_file(&client, &dir, &id, &media).await {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                log(format!("Medium {id} laden fehlgeschlagen: {e}"));
+                                                send(UiEvent::ViewFailed { id, err: tf!("Laden fehlgeschlagen: {e}", "Loading failed: {e}") });
+                                                return;
+                                            }
+                                        };
+                                        let p = path.clone();
+                                        let is_video = media.kind == "video" || media.kind == "gif";
+                                        let r = tokio::task::spawn_blocking(move || {
+                                            if is_video {
+                                                (None, Some(crate::video::probe(&p)))
+                                            } else {
+                                                (std::fs::read(&p).ok().and_then(|b| decode_rgba(&b, max_side.max(640))), None)
+                                            }
+                                        })
+                                        .await;
+                                        match r {
+                                            Ok((None, None)) => send(UiEvent::ViewFailed { id, err: t!("Bild kann nicht angezeigt werden", "Image cannot be displayed").into() }),
+                                            Ok((image, video)) => send(UiEvent::ViewReady { id, path, image, video }),
+                                            Err(e) => send(UiEvent::ViewFailed { id, err: e.to_string() }),
+                                        }
+                                    });
+                                }
+                                Cmd::SaveMedia { id, media } => {
+                                    let dir = media_dir.clone();
+                                    tokio::spawn(async move {
+                                        let src = match ensure_file(&client, &dir, &id, &media).await {
+                                            Ok(p) => p,
+                                            Err(e) => {
+                                                send(UiEvent::Info(tf!("Herunterladen fehlgeschlagen: {e}", "Download failed: {e}")));
+                                                return;
+                                            }
+                                        };
+                                        let name = if media.name.is_empty() { format!("WhatsSnap-{}.{}", safe_name(&id), media.ext()) } else { media.name.clone() };
+                                        let Some(target) = rfd::AsyncFileDialog::new().set_title(t!("Speichern unter", "Save as")).set_file_name(name).save_file().await else { return };
+                                        let dst = target.path().to_path_buf();
+                                        match tokio::task::spawn_blocking(move || std::fs::copy(&src, &dst).map(|_| dst)).await {
+                                            Ok(Ok(dst)) => send(UiEvent::Info(tf!("Gespeichert: {}", "Saved: {}", dst.display()))),
+                                            Ok(Err(e)) => send(UiEvent::Info(tf!("Speichern fehlgeschlagen: {e}", "Saving failed: {e}"))),
+                                            Err(e) => send(UiEvent::Info(tf!("Speichern fehlgeschlagen: {e}", "Saving failed: {e}"))),
                                         }
                                     });
                                 }
@@ -2100,8 +2409,14 @@ pub fn spawn(
                                         send(UiEvent::Info(tf!("{} wird geladen …", "Loading {} …", media.label())));
                                         match ensure_file(&client, &dir, &id, &media).await {
                                             Ok(path) => {
-                                                let _ = std::process::Command::new("xdg-open").arg(&path).spawn();
                                                 send(UiEvent::Info(String::new()));
+                                                // Nur harmlose Dateitypen direkt öffnen; alles andere erst nach Rückfrage.
+                                                let p = path.clone();
+                                                match tokio::task::spawn_blocking(move || crate::safety::open_verdict(&p)).await {
+                                                    Ok(Ok(())) => crate::safety::spawn_opener(path.as_os_str()),
+                                                    Ok(Err(reason)) => send(UiEvent::OpenBlocked { path, reason }),
+                                                    Err(e) => send(UiEvent::Info(e.to_string())),
+                                                }
                                             }
                                             Err(e) => send(UiEvent::Info(tf!("Herunterladen fehlgeschlagen: {e}", "Download failed: {e}"))),
                                         }
@@ -2117,7 +2432,7 @@ pub fn spawn(
                                                 None => return,
                                             },
                                         };
-                                        if let Err(e) = send_file(&client, &send, &dir, &chat, &path, caption).await {
+                                        if let Err(e) = send_file(&client, &send, &dir, &chat, &path, caption, None).await {
                                             log(format!("Datei senden fehlgeschlagen: {e}"));
                                             send(UiEvent::Info(tf!("Datei senden fehlgeschlagen: {e}", "Sending file failed: {e}")));
                                         }
@@ -2624,6 +2939,7 @@ pub fn spawn(
                                         client.logout().await;
                                         log("Abgemeldet (auf Wunsch)");
                                         send(UiEvent::LoggedOut);
+                                        send(UiEvent::LogoutDone);
                                     });
                                 }
                                 Cmd::FetchFile { id, media } => {
@@ -2632,11 +2948,12 @@ pub fn spawn(
                                         match ensure_file(&client, &dir, &id, &media).await {
                                             Ok(path) => {
                                                 // Dekodieren kostet bei langen Nachrichten spürbar Zeit – nicht im UI-Thread.
-                                                let voice = if media.ext() == "ogg" {
+                                                let voice = if media.kind == "ptt" || media.kind == "audio" {
                                                     let p = path.clone();
                                                     tokio::task::spawn_blocking(move || {
                                                         let b = std::fs::read(&p).map_err(|e| e.to_string())?;
-                                                        let (pcm, ch) = crate::audio::decode_ogg_opus(&b)?;
+                                                        // Sprachnachrichten sind Ogg/Opus; andere Audiodateien (MP3, M4A) über ffmpeg.
+                                                        let (pcm, ch) = crate::audio::decode_ogg_opus(&b).or_else(|_| crate::audio::decode_with_ffmpeg(&p))?;
                                                         let wf = crate::audio::waveform(&pcm, ch);
                                                         Ok((Arc::new(pcm), ch, wf))
                                                     })
@@ -2654,30 +2971,42 @@ pub fn spawn(
                                 Cmd::SendVoice { chat, ogg, seconds, waveform } => {
                                     let dir = media_dir.clone();
                                     tokio::spawn(async move {
-                                        use whatsapp_rust::wacore::download::MediaType as M;
-                                        let mime = "audio/ogg; codecs=opus";
-                                        let mref = MediaRef { kind: "ptt".into(), mime: mime.into(), len: ogg.len() as u64, seconds, ..Default::default() };
-                                        let wf = waveform.clone();
-                                        let r = upload_and_send(&client, &send, &dir, &chat, ogg, mref, String::new(), M::Audio, move |up| wa::Message {
-                                            audio_message: whatsapp_rust::waproto::buffa::MessageField::some(wa::message::AudioMessage {
-                                                url: Some(up.url.clone()),
-                                                direct_path: Some(up.direct_path.clone()),
-                                                media_key: Some(up.media_key.to_vec()),
-                                                file_sha256: Some(up.file_sha256.to_vec()),
-                                                file_enc_sha256: Some(up.file_enc_sha256.to_vec()),
-                                                file_length: Some(up.file_length),
-                                                media_key_timestamp: Some(up.media_key_timestamp),
-                                                mimetype: Some(mime.into()),
-                                                seconds: Some(seconds),
-                                                ptt: Some(true),
-                                                waveform: Some(wf),
-                                                ..Default::default()
-                                            }),
-                                            ..Default::default()
-                                        })
-                                        .await;
-                                        if let Err(e) = r {
+                                        if let Err(e) = send_voice(&client, &send, &dir, &chat, ogg, seconds, waveform).await {
                                             log(format!("Sprachnachricht fehlgeschlagen: {e}"));
+                                        }
+                                    });
+                                }
+                                Cmd::ResendFile { chat, temp, media, caption } => {
+                                    let dir = media_dir.clone();
+                                    tokio::spawn(async move {
+                                        let path = dir.join(format!("{}.{}", safe_name(&temp), media.ext()));
+                                        let r = if media.kind == "ptt" {
+                                            let p = path.clone();
+                                            // Lautstärkekurve neu berechnen (sie wird nicht mitgespeichert).
+                                            let prep = tokio::task::spawn_blocking(move || {
+                                                let ogg = std::fs::read(&p).map_err(|e| e.to_string())?;
+                                                let (pcm, ch) = crate::audio::decode_ogg_opus(&ogg)?;
+                                                Ok::<_, String>((crate::audio::waveform(&pcm, ch), ogg))
+                                            })
+                                            .await
+                                            .map_err(|e| e.to_string())
+                                            .and_then(|r| r);
+                                            match prep {
+                                                Ok((wf, ogg)) => send_voice(&client, &send, &dir, &chat, ogg, media.seconds, wf).await,
+                                                Err(e) => Err(e),
+                                            }
+                                        } else {
+                                            send_file(&client, &send, &dir, &chat, &path, caption, Some(media.name.clone())).await
+                                        };
+                                        match r {
+                                            // Die neue Sendung hat ihre eigene Kopie; die alte kann weg.
+                                            Ok(()) => {
+                                                let _ = std::fs::remove_file(&path);
+                                            }
+                                            Err(e) => {
+                                                log(format!("Erneut senden fehlgeschlagen: {e}"));
+                                                send(UiEvent::Info(tf!("Erneut senden fehlgeschlagen: {e}", "Sending again failed: {e}")));
+                                            }
                                         }
                                     });
                                 }
@@ -2840,7 +3169,10 @@ pub fn spawn(
                 }
             });
         })
-        .expect("backend thread");
+        .unwrap_or_else(|e| {
+            eprintln!("{}", tf!("WhatsSnap kann nicht starten (Hintergrund-Thread): {e}", "WhatsSnap cannot start (background thread): {e}"));
+            std::process::exit(1)
+        });
 
     (cmd_tx, handle)
 }

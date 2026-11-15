@@ -5,7 +5,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.13)
+## Funktionen (v0.14)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - 3D-Emojis im Stil von WhatsApp (Microsoft Fluent Emoji, fehlende aus Twemoji) in Nachrichten, Chatliste und Auswahl; alle 1900+ Emojis mit Kategorien wie bei WhatsApp, „Letzte“, deutscher Suche und Hauttönen (Rechtsklick); reine Emoji-Nachrichten werden groß angezeigt
@@ -22,7 +22,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Knopf „Nach unten“ mit Zähler neuer Nachrichten; Klick auf ein Zitat springt zur Originalnachricht
 - Weiterleiten (auch Fotos, Sticker, Dokumente ohne neuen Upload)
 - Stummschalten für 8 Stunden, 1 Woche oder immer
-- Sprachanrufe: anrufen (📞 im Chat-Kopf), annehmen und ablehnen mit Anzeige oben, stummschalten, auflegen; Ton über PipeWire (`pw-record`/`pw-play`), ersatzweise PulseAudio oder ALSA. Videoanrufe werden als Sprachanruf angenommen
+- Sprachanrufe: anrufen (📞 im Chat-Kopf), annehmen und ablehnen mit Anzeige oben, stummschalten, auflegen; Ton mit 16 kHz über PipeWire (`pw-record`/`pw-play`), ersatzweise PulseAudio oder ALSA. Videoanrufe werden als Sprachanruf angenommen. Zur Fehlersuche: mit `WA_SNAP_CALL_DUMP=1 wa-snap` landen beide Richtungen als WAV in `/tmp`
 - Status: Status der letzten 24 Stunden ansehen (◎ in der linken Leiste, grüner Ring = neu, Pfeiltasten blättern), eigenen Text- oder Foto-Status posten, aus dem Status in den Chat antworten
 - Kanäle (im Bereich „Aktuelles“): dieselben Abos wie am Handy, Beiträge lesen und mit Emojis reagieren, Kanäle suchen oder per Link abonnieren, deabonnieren, eigenen Kanal erstellen und darin posten
 - Oberfläche auf Deutsch oder Englisch (Einstellungen → Chats; Standard ist die Systemsprache)
@@ -44,7 +44,11 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Kontakt- und Gruppeninfo (Klick auf den Chat-Kopf): Medien, Beschreibung, Mitglieder, gemeinsame Gruppen, Blockieren
 - Gruppen: neue Gruppe anlegen (+ → Neue Gruppe), umbenennen, Mitglieder hinzufügen/entfernen, Admins ernennen, Einladungslink, verlassen; selbstlöschende Nachrichten je Chat (⋮-Menü)
 - Neuer Chat per Telefonnummer (Nummer in die Suche tippen)
-- Fotos und Sticker werden im Chat angezeigt (Klick öffnet in voller Größe), animierte Sticker bewegen sich; Videos, GIFs und Dokumente laden per Klick und öffnen im Standardprogramm
+- Fotos und Sticker werden im Chat angezeigt, animierte Sticker bewegen sich
+- Bilder und Videos direkt in der App ansehen: Klick öffnet den Betrachter über dem ganzen Fenster. Bilder: Zoom mit Mausrad oder Strg +/−, Verschieben mit der Maus, Doppelklick, `0` setzt zurück. Videos und GIFs: Abspielen/Pause (Leertaste), Spulen, Lautstärke, `,`/`.` springt 5 Sekunden. Pfeiltasten blättern durch die Medien des Chats, `F` Vollbild, Esc schließt; „Speichern unter …“ und „Extern öffnen“. Videos brauchen `ffmpeg`
+- Dokumente öffnen im Standardprogramm – aber nur harmlose Typen (Bilder, Video, Audio, PDF, Office, Text) ohne Rückfrage. Bei allem anderen (`.sh`, `.jar`, `.html`, `.desktop`, `.rpm` …) und wenn der Inhalt nicht zum Namen passt, fragt WhatsSnap nach und bietet „Im Ordner anzeigen“ an
+- Nicht gesendete Fotos, Videos, Dateien und Sprachnachrichten bleiben nach einem Neustart im Chat stehen: „Erneut senden“ oder „Verwerfen“ per Rechtsklick
+- Fehlende Medien: „Verlauf vom Handy nachladen“ im ⋮-Menü holt die letzten rund 300 Nachrichten eines Chats erneut (Handy muss online sein); abgelaufene Bilder werden beim Absender-Gerät neu angefordert
 - Sprachnachrichten direkt in der App abspielen (Wellenform, Pause, Klick zum Spulen) und aufnehmen (Mikrofon-Knopf, wenn das Eingabefeld leer ist); Opus ist eingebaut, abgespielt und aufgenommen wird über PipeWire (`pw-play`/`pw-record`), ersatzweise PulseAudio oder ALSA
 - Videos senden; GIF-Dateien werden mit ffmpeg (falls installiert) zu WhatsApp-GIFs umgewandelt, sonst als Dokument gesendet
 - GIF-Suche über Giphy (eigener kostenloser API-Schlüssel nötig, Eintrag in den Einstellungen oder direkt im GIF-Reiter)
@@ -52,23 +56,23 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Fotos und Dateien senden: 📎 oder Datei ins Fenster ziehen; Text im Eingabefeld wird zur Bildunterschrift
 - Sticker: empfangene Sticker erscheinen in der Emoji-Auswahl unter „Sticker“ und lassen sich weiterschicken
 - Rechtsklick auf eine Nachricht: Reagieren, Antworten, Text kopieren, für alle löschen; Reaktionen, Antworten (Zitate), gelöschte und bearbeitete Nachrichten von anderen werden angezeigt
-- Diagnose-Log: `~/.local/share/wa-snap/wa-snap.log`
+- Diagnose-Log: `~/.local/share/wa-snap/wa-snap.log` (höchstens rund 500 KB, eine ältere Generation als `.log.old`). Telefonnummern stehen dort nur als Kürzel. Eine Zeile pro Nachricht gibt es nur mit dem Schalter „Ausführliches Log“ unter Einstellungen → WhatsSnap
 
-**Noch nicht vorhanden:** Videoanrufe, Videos direkt in der App abspielen, Fotos in Kanäle posten. Fehler bitte als Issue melden.
+**Noch nicht vorhanden:** Videoanrufe, Fotos in Kanäle posten, verschlüsselte Sitzungsdatenbank. Fehler bitte als Issue melden.
 
 ## Installation auf Fedora (empfohlen)
 
 Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.13.1-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.14.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
 
 ## Aus dem Quellcode bauen
 
-Du brauchst [Rust](https://rustup.rs) (stabile Version) und einen C-Compiler (unter Fedora: `sudo dnf install gcc`, unter Debian/Ubuntu: `sudo apt install build-essential`).
+Du brauchst [Rust](https://rustup.rs) (stabile Version), einen C-Compiler und cmake (unter Fedora: `sudo dnf install gcc cmake`, unter Debian/Ubuntu: `sudo apt install build-essential cmake`). Zur Laufzeit zusätzlich `ffmpeg` für Videos (das RPM zieht es von selbst nach).
 
 **Variante 1: mit einem Befehl installieren**
 
@@ -97,7 +101,7 @@ Das legt einen Startmenü-Eintrag mit Icon an. Danach findest du WhatsSnap im An
 
 ## Daten
 
-Die Sitzung liegt in `~/.local/share/wa-snap/whatsapp.db` (Linux), heruntergeladene Medien in `~/.local/share/wa-snap/media/`. Die Datei enthält deine Schlüssel: nicht weitergeben und nie in ein Repo hochladen. Zum Abmelden löschst du die Datei und entfernst das Gerät in der WhatsApp-App.
+Die Sitzung liegt in `~/.local/share/wa-snap/whatsapp.db` (Linux), heruntergeladene Medien in `~/.local/share/wa-snap/media/`. Alle Dateien werden nur für dich lesbar angelegt (0600, Ordner 0700). Die Datenbank enthält deine Schlüssel und ist nicht verschlüsselt: nicht weitergeben und nie in ein Repo hochladen. Abmelden geht unter Einstellungen → Konto; die Schlüssel werden danach beim nächsten Start entfernt, und WhatsSnap fragt, ob auch Verlauf und Medien gelöscht werden sollen.
 
 ## Lizenz
 
@@ -114,7 +118,7 @@ WhatsSnap is a fast, native WhatsApp client for Linux written in Rust (egui). It
 Install on Fedora 40+:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.13.1-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.14.0-1.x86_64.rpm
 ```
 
 Then start “WhatsSnap” from the app menu and scan the QR code with WhatsApp → Settings → Linked devices.

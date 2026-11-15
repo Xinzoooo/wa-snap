@@ -116,6 +116,42 @@ pub fn waveform(pcm: &[i16], channels: usize) -> Vec<u8> {
     v.into_iter().map(|x| x as u8).collect()
 }
 
+/// Gleichanteil entfernen. Viele Mikrofon-Eingänge driften direkt nach dem Einschalten
+/// stark; ohne Filter ist der Anfang einer Aufnahme ein lautes Knacken oder Brummen.
+#[derive(Default)]
+pub struct DcBlock {
+    x1: f32,
+    y1: f32,
+}
+
+impl DcBlock {
+    pub fn run(&mut self, samples: &mut [i16]) {
+        for s in samples {
+            let x = *s as f32;
+            let y = x - self.x1 + 0.995 * self.y1;
+            self.x1 = x;
+            self.y1 = y;
+            *s = y.clamp(-32768.0, 32767.0) as i16;
+        }
+    }
+}
+
+/// Beliebige Audiodatei (MP3, M4A, …) mit ffmpeg zu 16-Bit-PCM mono 48 kHz dekodieren.
+pub fn decode_with_ffmpeg(path: &Path) -> Result<(Vec<i16>, usize), String> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-t", &MAX_VOICE_SECS.to_string(), "-i"])
+        .arg(path)
+        .args(["-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", &RATE.to_string(), "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg: {e}"))?;
+    if !out.status.success() || out.stdout.len() < 2 {
+        return Err("ffmpeg konnte die Datei nicht dekodieren".into());
+    }
+    Ok((out.stdout.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect(), 1))
+}
+
 fn wav_bytes(pcm: &[i16], channels: usize) -> Vec<u8> {
     let data_len = (pcm.len() * 2) as u32;
     let mut b = Vec::with_capacity(44 + data_len as usize);
@@ -310,7 +346,15 @@ impl Recording {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let pcm = read_wav_mono(&self.path);
+        let pcm = read_wav_mono(&self.path).map(|mut pcm| {
+            DcBlock::default().run(&mut pcm);
+            // Die ersten 30 ms einblenden: kein Knacken am Anfang.
+            let n = (RATE as usize * 30 / 1000).min(pcm.len());
+            for (i, s) in pcm[..n].iter_mut().enumerate() {
+                *s = (*s as f32 * i as f32 / n as f32) as i16;
+            }
+            pcm
+        });
         let _ = std::fs::remove_file(&self.path);
         pcm
     }
@@ -363,6 +407,34 @@ mod tests {
         }
         assert!(out.len() < 8_000_000, "Testdatei sollte klein sein: {}", out.len());
         assert!(decode_ogg_opus(&out).is_err());
+    }
+
+    /// Die erzeugte Datei muss auch für fremde Programme gültig sein (läuft nur mit ffprobe).
+    #[test]
+    fn ogg_is_valid_for_ffprobe() {
+        let pcm: Vec<i16> = (0..RATE as usize * 2).map(|i| ((i as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin() * 8000.0) as i16).collect();
+        let dir = std::env::temp_dir().join(format!("wasnap-ogg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.ogg");
+        std::fs::write(&p, encode_ogg_opus(&pcm).unwrap()).unwrap();
+        let out = Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_name,channels:format=duration", "-of", "csv=p=0"]).arg(&p).output();
+        let Ok(out) = out else { return };
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(out.status.success(), "ffprobe lehnt die Datei ab: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("opus,1"), "{text}");
+        let dur: f32 = text.lines().filter_map(|l| l.trim().parse().ok()).next().unwrap_or(0.0);
+        assert!((dur - 2.0).abs() < 0.1, "Dauer {dur}");
+        // und zurück über ffmpeg
+        let (back, _) = decode_with_ffmpeg(&p).unwrap();
+        assert!((back.len() as i64 - pcm.len() as i64).abs() < 4000, "{}", back.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dc_block_removes_offset() {
+        let mut pcm = vec![10_000i16; 48_000];
+        DcBlock::default().run(&mut pcm);
+        assert!(pcm[47_000..].iter().all(|s| s.abs() < 50));
     }
 
     #[test]

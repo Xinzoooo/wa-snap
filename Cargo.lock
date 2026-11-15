@@ -933,6 +933,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfb"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a347dcabdae9c31b0825fd6a8bed285ec9c2acb89c47827126d52fa4f59cece3"
+dependencies = [
+ "fnv",
+ "uuid",
+ "web-time",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1575,8 +1586,6 @@ dependencies = [
 [[package]]
 name = "eframe"
 version = "0.31.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0dfe0859f3fb1bc6424c57d41e10e9093fe938f426b691e42272c2f336d915c"
 dependencies = [
  "ahash",
  "bytemuck",
@@ -2536,6 +2545,15 @@ checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "infer"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4200d433cbd5178df7797c9c2e75b348b728e39631cf14520d1e2fc424201f4"
+dependencies = [
+ "cfb",
 ]
 
 [[package]]
@@ -5125,14 +5143,16 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "wa-snap"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "arboard",
  "async-channel",
  "chrono",
  "eframe",
  "image",
+ "infer",
  "ksni",
+ "libc",
  "notify-rust",
  "ogg",
  "opus",
@@ -5550,9 +5570,9 @@ dependencies = [
 
 [[package]]
 name = "webbrowser"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe8d20d0214027baf11b8b0cc307c1da7657d8f4db9aa956f7de27a6fb1acbd5"
+checksum = "73e91ccd4698f2647d6137e8eb17a3f1dcfd63810be9029fb2398f507279b95b"
 dependencies = [
  "jni",
  "log",
