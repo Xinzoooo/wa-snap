@@ -1965,7 +1965,14 @@ impl App {
                         let _ = self.cmd.send(Cmd::SetOnline(false));
                     }
                 }
-                UiEvent::LoggedOut => self.conn = Conn::LoggedOut,
+                UiEvent::LoggedOut => {
+                    // Egal ob hier oder am Handy abgemeldet: die alte Sitzung ist ungültig und
+                    // muss beim nächsten Start weg, sonst kommt nie ein neuer QR-Code.
+                    if let Err(e) = dialogs::mark_logged_out(&data_dir()) {
+                        backend::log(format!("Abmelde-Merker nicht geschrieben: {e}"));
+                    }
+                    self.conn = Conn::LoggedOut;
+                }
                 UiEvent::LogoutDone => {
                     if let Err(e) = dialogs::mark_logged_out(&data_dir()) {
                         backend::log(format!("Abmelde-Merker nicht geschrieben: {e}"));
@@ -4966,7 +4973,8 @@ impl eframe::App for App {
         tray::BADGE.store(unread, std::sync::atomic::Ordering::Relaxed);
         let pal = Palette::of(self.settings.dark);
 
-        if self.conn != Conn::Online && self.chats.is_empty() {
+        // QR-Code und „Abgemeldet“ immer zeigen, auch wenn schon Chats im Verlauf liegen.
+        if (self.conn != Conn::Online && self.chats.is_empty()) || matches!(self.conn, Conn::NeedsQr | Conn::LoggedOut) {
             egui::CentralPanel::default().frame(egui::Frame::new().fill(pal.side)).show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(56.0);
@@ -4985,9 +4993,17 @@ impl eframe::App for App {
                         Conn::LoggedOut => {
                             ui.label(RichText::new(t!("Abgemeldet", "Logged out")).size(24.0).family(theme::bold()));
                             ui.label(
-                                RichText::new(t!("Die Verknüpfung wurde auf dem Handy entfernt. Bitte neu starten und erneut scannen.", "The link was removed on the phone. Please restart and scan again."))
+                                RichText::new(t!("Die Verknüpfung mit dem Handy wurde aufgehoben. Dein Verlauf auf diesem PC bleibt erhalten.", "The link with your phone was removed. Your history on this PC is kept."))
                                     .color(pal.dim),
                             );
+                            ui.add_space(18.0);
+                            if ui.button(RichText::new(t!("Neu verknüpfen", "Link again")).size(16.0)).clicked() {
+                                let _ = dialogs::mark_logged_out(&data_dir());
+                                backend::log("Neu verknüpfen: Neustart");
+                                RESTART.store(true, std::sync::atomic::Ordering::SeqCst);
+                                QUIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
                         }
                         _ => {
                             ui.label(RichText::new(t!("WhatsSnap", "WhatsSnap")).size(26.0).family(theme::bold()));
@@ -6072,6 +6088,8 @@ thread_local! {
 static CTX: std::sync::Mutex<Option<egui::Context>> = std::sync::Mutex::new(None);
 static WINDOW_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Nach dem Beenden das Programm neu starten (für „Neu verknüpfen“).
+static RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn with_ctx(f: impl FnOnce(&egui::Context)) {
     if let Ok(g) = CTX.lock() {
@@ -6319,6 +6337,15 @@ fn main() -> eframe::Result<()> {
     }
     if !backend_thread.is_finished() {
         backend::log("Beenden: Backend hat nicht rechtzeitig aufgehört");
+    }
+    if RESTART.load(std::sync::atomic::Ordering::SeqCst) {
+        // Prozess ersetzen: Sperrdatei und Socket sind CLOEXEC und werden dabei freigegeben,
+        // die neue Instanz löscht die alte Sitzung (Merker) und zeigt den QR-Code.
+        use std::os::unix::process::CommandExt;
+        if let Ok(exe) = std::env::current_exe() {
+            let e = std::process::Command::new(exe).exec();
+            backend::log(format!("Neustart fehlgeschlagen: {e}"));
+        }
     }
     Ok(())
 }
