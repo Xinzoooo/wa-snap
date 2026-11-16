@@ -5,7 +5,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.15)
+## Funktionen (v0.15.1)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - 3D-Emojis im Stil von WhatsApp (Microsoft Fluent Emoji, fehlende aus Twemoji) in Nachrichten, Chatliste und Auswahl; alle 1900+ Emojis mit Kategorien wie bei WhatsApp, „Letzte“, deutscher Suche und Hauttönen (Rechtsklick); reine Emoji-Nachrichten werden groß angezeigt
