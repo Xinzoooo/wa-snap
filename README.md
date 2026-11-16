@@ -1,11 +1,47 @@
-# WhatsSnap
+<p align="center">
+  <img src="assets/wa-snap.svg" width="96" alt="WhatsSnap">
+</p>
 
-**Schneller, nativer WhatsApp-Desktop-Client in Rust.**
-Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk/egui), das WhatsApp-Protokoll kommt von [`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust). Dadurch startet das Programm schnell und braucht deutlich weniger Speicher als die Web-Versionen zum Herunterladen.
+<h1 align="center">WhatsSnap</h1>
+
+<p align="center">
+  <b>Schneller, nativer WhatsApp-Client für Linux – in Rust, ohne Browser und ohne Electron.</b>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Xinzoooo/wa-snap/releases/latest"><img src="https://img.shields.io/github/v/release/Xinzoooo/wa-snap?label=Release&color=25D366" alt="Release"></a>
+  <img src="https://img.shields.io/badge/Linux-Fedora%20%7C%20KDE%20%7C%20GNOME-0b0b0b?logo=linux&logoColor=white" alt="Linux">
+  <img src="https://img.shields.io/badge/Rust-egui-B7410E?logo=rust&logoColor=white" alt="Rust + egui">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/Lizenz-MIT-blue" alt="MIT"></a>
+</p>
+
+<p align="center">
+  <img src="docs/screenshot.png" width="860" alt="WhatsSnap Screenshot (Demo-Daten)">
+</p>
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.15.1)
+## Warum WhatsSnap?
+
+- **Nativ statt Web-Wrapper** – Oberfläche mit [egui](https://github.com/emilk/egui), Protokoll über [`whatsapp-rust`](https://github.com/jlucaso1/whatsapp-rust). Startet schnell, braucht wenig Speicher.
+- **Fühlt sich an wie WhatsApp Web** – Chatliste, Sprechblasen, Haken, 3D-Emojis, hell und dunkel.
+- **Alles Wichtige drin** – Fotos, Videos, Sprachnachrichten, Sprachanrufe, Status, Kanäle, Gruppen, Umfragen.
+- **Deine Daten bleiben bei dir** – lokaler Verlauf, Dateirechte nur für dich, Log ohne Telefonnummern.
+
+## Highlights
+
+| | |
+|---|---|
+| 💬 **Chatten** | Antworten, Reaktionen, Bearbeiten, Weiterleiten, @Erwähnungen, Formatierung, Entwürfe, Suche über alle Chats |
+| 📷 **Medien** | Fotos, Videos, GIFs und Sticker mit eingebautem Betrachter; Bilder per Strg+V; eigene Sticker; GIF-Suche |
+| 🎙️ **Sprache** | Sprachnachrichten aufnehmen und abspielen, Sprachanrufe über PipeWire |
+| 📣 **Status & Kanäle** | Status ansehen und posten, Kanäle abonnieren, lesen, reagieren, selbst posten |
+| 🔔 **Desktop** | Benachrichtigungen, Tray-Symbol mit Ungelesen-Punkt, Autostart in die Leiste, Tastenkürzel |
+| 🔒 **Sicher** | Gefährliche Dateitypen nur nach Warnung, ffmpeg nur für lokale echte Container, Instanz-Sperre |
+| ✨ **Extras** | Gelöschte Nachrichten behalten (optional), frühere Fassungen bearbeiteter Nachrichten, mehr als 3 angeheftete Chats |
+
+<details>
+<summary><b>Alle Funktionen (v0.15.1)</b></summary>
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - 3D-Emojis im Stil von WhatsApp (Microsoft Fluent Emoji, fehlende aus Twemoji) in Nachrichten, Chatliste und Auswahl; alle 1900+ Emojis mit Kategorien wie bei WhatsApp, „Letzte“, deutscher Suche und Hauttönen (Rechtsklick); reine Emoji-Nachrichten werden groß angezeigt
@@ -62,15 +98,17 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 **Noch nicht vorhanden:** Videoanrufe, Fotos in Kanäle posten, verschlüsselte Sitzungsdatenbank. Fehler bitte als Issue melden.
 
+</details>
+
 ## Installation auf Fedora (empfohlen)
 
 Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.15.1-1.x86_64.rpm
+sudo dnf install https://github.com/Xinzoooo/wa-snap/releases/download/v0.15.1/wa-snap-0.15.1-1.x86_64.rpm
 ```
 
-Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
+Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht. Alle Versionen: [Releases](https://github.com/Xinzoooo/wa-snap/releases) · Änderungen: [CHANGELOG.md](CHANGELOG.md)
 
 ## Aus dem Quellcode bauen
 
@@ -120,7 +158,7 @@ WhatsSnap is a fast, native WhatsApp client for Linux written in Rust (egui). It
 Install on Fedora 40+:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.15.1-1.x86_64.rpm
+sudo dnf install https://github.com/Xinzoooo/wa-snap/releases/download/v0.15.1/wa-snap-0.15.1-1.x86_64.rpm
 ```
 
 Then start “WhatsSnap” from the app menu and scan the QR code with WhatsApp → Settings → Linked devices.
