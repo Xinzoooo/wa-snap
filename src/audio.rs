@@ -151,7 +151,7 @@ pub fn decode_with_ffmpeg(path: &Path) -> Result<(Vec<i16>, usize), String> {
     if !out.status.success() || out.stdout.len() < 2 {
         return Err("ffmpeg konnte die Datei nicht dekodieren".into());
     }
-    Ok((out.stdout.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect(), 1))
+    Ok((out.stdout.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]])).collect(), 1))
 }
 
 fn wav_bytes(pcm: &[i16], channels: usize) -> Vec<u8> {
@@ -206,7 +206,7 @@ pub fn read_wav_mono(path: &Path) -> Result<Vec<i16>, String> {
     if bits != 16 {
         return Err(format!("{bits}-Bit-Aufnahme wird nicht unterstützt"));
     }
-    let samples: Vec<i16> = data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+    let samples: Vec<i16> = data.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
     let mono: Vec<i16> = samples.chunks(ch).map(|c| (c.iter().map(|x| *x as i32).sum::<i32>() / c.len() as i32) as i16).collect();
     if rate == RATE || rate == 0 {
         return Ok(mono);

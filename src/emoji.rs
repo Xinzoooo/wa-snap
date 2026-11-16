@@ -94,7 +94,7 @@ pub fn segments(text: &str) -> Vec<Seg<'_>> {
                     key.push(cj);
                 }
                 // Einzelne Ziffern/#/* sind nur mit Tastenkappe (U+20E3) ein Emoji.
-                let ascii_only = key.chars().all(|k| k.is_ascii());
+                let ascii_only = key.is_ascii();
                 if !ascii_only && idx.entries.contains_key(&key) {
                     best = Some((j + 1, key.clone()));
                 }

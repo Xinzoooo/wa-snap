@@ -332,13 +332,10 @@ fn spawn_audio(path: &Path, ss: &str, volume: f32) -> Vec<Child> {
         ("pacat", &["--raw", "--format=s16le", "--rate=48000", "--channels=2"]),
         ("aplay", &["-q", "-t", "raw", "-f", "S16_LE", "-r", "48000", "-c", "2"]),
     ];
-    let mut pipe = Some(Stdio::from(pipe));
-    for (cmd, args) in sinks {
-        let Some(input) = pipe.take() else { break };
-        match Command::new(cmd).args(args).stdin(input).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-            Ok(sink) => return vec![dec, sink],
-            // Programm fehlt: die Pipe ist verbraucht, ohne Ton weiter.
-            Err(_) => break,
+    // Die Pipe wandert beim ersten Versuch in den Kindprozess; es gibt also nur einen Versuch (pw-play).
+    if let Some((cmd, args)) = sinks.into_iter().next() {
+        if let Ok(sink) = Command::new(cmd).args(args).stdin(Stdio::from(pipe)).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            return vec![dec, sink];
         }
     }
     let _ = dec.kill();

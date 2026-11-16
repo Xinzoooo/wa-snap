@@ -180,7 +180,7 @@ pub fn open(procs: &Procs) -> Result<(Mic, Speaker), String> {
             if out.read_exact(&mut buf).is_err() {
                 break;
             }
-            let mut frame: Vec<i16> = buf.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+            let mut frame: Vec<i16> = buf.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
             dc.run(&mut frame);
             if MUTED.load(std::sync::atomic::Ordering::Relaxed) {
                 frame.fill(0);

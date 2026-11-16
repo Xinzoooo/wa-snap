@@ -590,7 +590,7 @@ async fn request_reupload_now(client: &Client, id: &str, m: &MediaRef) -> Option
     // meist unter der LID. Ohne passende Chat-Angabe antwortet es gar nicht (Zeitlimit).
     if !chat.is_group() && chat.is_pn() {
         if let Ok(Some(e)) = client.get_lid_pn_entry(&chat).await {
-            chat = Jid::new(&e.lid.to_string(), whatsapp_rust::Server::Lid);
+            chat = Jid::new(e.lid.to_string(), whatsapp_rust::Server::Lid);
         }
     }
     log_debug(format!("Medium {id}: Neu-Anforderung (chat={}, von_mir={from_me}, absender={})", chat.server, !sender.is_empty()));
@@ -884,7 +884,7 @@ pub fn log(msg: impl AsRef<str>) {
     use std::os::unix::fs::OpenOptionsExt;
     let Some(p) = LOG_PATH.get() else { return };
     static LINES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 200 == 0 && std::fs::metadata(p).map(|m| m.len() > LOG_MAX).unwrap_or(false) {
+    if LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(200) && std::fs::metadata(p).map(|m| m.len() > LOG_MAX).unwrap_or(false) {
         let _ = std::fs::rename(p, p.with_extension("log.old"));
     }
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(p) {
@@ -1412,7 +1412,7 @@ fn decode_anim(bytes: &[u8]) -> Option<Vec<([usize; 2], Vec<u8>, u32)>> {
     let mut out = Vec::new();
     for f in dec.into_frames().take(60).flatten() {
         let (n, d) = f.delay().numer_denom_ms();
-        let ms = if d == 0 { 100 } else { (n / d).max(20) };
+        let ms = n.checked_div(d).map_or(100, |v| v.max(20));
         let img = image::DynamicImage::ImageRgba8(f.into_buffer()).thumbnail(256, 256).to_rgba8();
         out.push(([img.width() as usize, img.height() as usize], img.into_raw(), ms));
     }
@@ -2057,7 +2057,7 @@ pub fn spawn(
                                     }
                                     Event::ContactUpdate(c) => {
                                         let n = CONTACTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                                        if n == 1 || n % 50 == 0 {
+                                        if n == 1 || n.is_multiple_of(50) {
                                             log(format!("Adressbuch-Einträge empfangen: {n}"));
                                         }
                                         let a = &c.action;
