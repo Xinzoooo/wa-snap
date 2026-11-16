@@ -548,8 +548,52 @@ fn remember_media(id: &str, chat: &Jid, from_me: bool, sender: &str) {
 }
 
 /// Abgelaufenes Medium beim Absender-Gerät neu anfordern. Liefert den neuen Pfad.
+///
+/// Jede Neu-Anforderung ist eine verschlüsselte Nachricht an ein Handy. Damit beim Blättern
+/// durch einen alten Chat keine Flut entsteht: je Medium höchstens einmal pro Sitzung,
+/// höchstens [`REUPLOAD_MAX`] pro Sitzung, nur eine gleichzeitig und mit Abstand.
 async fn request_reupload(client: &Client, id: &str, m: &MediaRef) -> Option<String> {
-    let (chat, from_me, sender) = MEDIA_CTX.lock().ok()?.as_ref()?.get(id)?.clone();
+    if !reupload_allowed(id) {
+        log(format!("Medium {id}: Neu-Anforderung übersprungen (schon versucht oder Limit der Sitzung erreicht)"));
+        return None;
+    }
+    let mut last = REUPLOAD_GATE.lock().await;
+    if let Some(t) = *last {
+        let gap = std::time::Duration::from_secs(REUPLOAD_GAP_SECS);
+        if t.elapsed() < gap {
+            tokio::time::sleep(gap - t.elapsed()).await;
+        }
+    }
+    *last = Some(std::time::Instant::now());
+    let r = request_reupload_now(client, id, m).await;
+    *last = Some(std::time::Instant::now());
+    r
+}
+
+/// Höchstzahl der Neu-Anforderungen pro Sitzung.
+const REUPLOAD_MAX: usize = 40;
+/// Mindestabstand zwischen zwei Neu-Anforderungen.
+const REUPLOAD_GAP_SECS: u64 = 3;
+static REUPLOAD_GATE: tokio::sync::Mutex<Option<std::time::Instant>> = tokio::sync::Mutex::const_new(None);
+static REUPLOAD_TRIED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Merkt sich das Medium und sagt, ob es (noch) neu angefordert werden darf.
+fn reupload_allowed(id: &str) -> bool {
+    let Ok(mut g) = REUPLOAD_TRIED.lock() else { return false };
+    let set = g.get_or_insert_with(HashSet::new);
+    set.len() < REUPLOAD_MAX && set.insert(id.to_owned())
+}
+
+async fn request_reupload_now(client: &Client, id: &str, m: &MediaRef) -> Option<String> {
+    let (mut chat, from_me, sender) = MEDIA_CTX.lock().ok()?.as_ref()?.get(id)?.clone();
+    // Zusammengeführte Einzelchats tragen die Nummern-JID; das Handy führt die Nachricht
+    // meist unter der LID. Ohne passende Chat-Angabe antwortet es gar nicht (Zeitlimit).
+    if !chat.is_group() && chat.is_pn() {
+        if let Ok(Some(e)) = client.get_lid_pn_entry(&chat).await {
+            chat = Jid::new(&e.lid.to_string(), whatsapp_rust::Server::Lid);
+        }
+    }
+    log_debug(format!("Medium {id}: Neu-Anforderung (chat={}, von_mir={from_me}, absender={})", chat.server, !sender.is_empty()));
     let participant = if chat.is_group() { sender.parse::<Jid>().ok() } else { None };
     let req = whatsapp_rust::MediaReuploadRequest { msg_id: id, chat_jid: &chat, media_key: &m.key, is_from_me: from_me, participant: participant.as_ref() };
     match client.media_reupload().request(&req).await {
@@ -847,6 +891,65 @@ pub fn log(msg: impl AsRef<str>) {
         // Ganze Zeile in einem einzigen write(): sonst mischen sich Zeilen aus mehreren Threads.
         let line = format!("{} {}\n", chrono::Local::now().format("%F %T"), crate::safety::anonymize(msg.as_ref()));
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// Beschreibung einer Abmeldung fürs Log: Grund, Zeitpunkt (beim Verbinden oder während
+/// der Sitzung) und die Eckdaten der Server-Stanza (Tag, `code`, Art des Konflikts).
+fn describe_logout(info: &whatsapp_rust::types::events::LoggedOut) -> String {
+    let mut out = format!("Grund={:?} beim_verbinden={}", info.reason, info.on_connect);
+    if let Some(raw) = &info.raw {
+        out.push_str(&format!(" stanza=<{}>", raw.tag));
+        if let Some(c) = raw.attrs().optional_string("code") {
+            out.push_str(&format!(" code={c}"));
+        }
+        if let Some(c) = raw.attrs().optional_string("reason") {
+            out.push_str(&format!(" reason={c}"));
+        }
+        if let Some(conflict) = raw.get_optional_child("conflict") {
+            out.push_str(&format!(" conflict={}", conflict.attrs().optional_string("type").unwrap_or_default()));
+        }
+        let kinder: Vec<String> = raw.children().unwrap_or_default().iter().map(|n| n.tag.to_string()).collect();
+        if !kinder.is_empty() {
+            out.push_str(&format!(" kinder={kinder:?}"));
+        }
+    } else {
+        out.push_str(" (ohne Stanza)");
+    }
+    if let Some(m) = &info.logout_message {
+        out.push_str(&format!(" text={:?}", m.header.as_deref().unwrap_or_default()));
+    }
+    out
+}
+
+/// Leitet Warnungen und Fehler der WhatsApp-Bibliothek (`log`-Crate) ins Diagnose-Log.
+/// Ohne das gehen z. B. „stream error … Logging out“ und abgelehnte Verbindungen verloren.
+struct LibLogger;
+
+impl log::Log for LibLogger {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Warn && (m.target().starts_with("whatsapp_rust") || m.target().starts_with("wacore"))
+    }
+    fn log(&self, r: &log::Record) {
+        if !self.enabled(r.metadata()) {
+            return;
+        }
+        // Begrenzen: höchstens 200 Bibliothekszeilen pro Sitzung, jede höchstens 400 Zeichen.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 200 {
+            return;
+        }
+        let text: String = r.args().to_string().chars().take(400).collect();
+        log(format!("[lib {} {}] {text}", r.level(), r.target()));
+    }
+    fn flush(&self) {}
+}
+
+/// Bibliotheks-Logger einmalig anmelden.
+pub fn install_lib_logger() {
+    static L: LibLogger = LibLogger;
+    if log::set_logger(&L).is_ok() {
+        log::set_max_level(log::LevelFilter::Warn);
     }
 }
 
@@ -1247,7 +1350,9 @@ fn has_cmd(cmd: &str) -> bool {
 fn gif_to_mp4(path: &std::path::Path, out: &std::path::Path) -> bool {
     has_cmd("ffmpeg")
         && std::process::Command::new("ffmpeg")
-            .args(["-y", "-loglevel", "error", "-i"])
+            .args(["-y", "-loglevel", "error"])
+            .args(crate::video::SAFE_INPUT)
+            .arg("-i")
             .arg(path)
             .args(["-movflags", "faststart", "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-an"])
             .arg(out)
@@ -1262,7 +1367,9 @@ fn video_thumb(path: &std::path::Path) -> Option<(Vec<u8>, u32, u32)> {
         return None;
     }
     let out = std::process::Command::new("ffmpeg")
-        .args(["-loglevel", "error", "-i"])
+        .args(["-loglevel", "error", "-nostdin"])
+        .args(crate::video::SAFE_INPUT)
+        .arg("-i")
         .arg(path)
         .args(["-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"])
         .output()
@@ -1636,6 +1743,7 @@ pub fn spawn(
                 }
                 let _ = LOG_PATH.set(lp);
                 log(format!("--- Start v{} ---", env!("CARGO_PKG_VERSION")));
+                install_lib_logger();
                 let avatar_dir = dir.join("avatars");
                 let media_dir = dir.join("media");
                 let _ = MEDIA_DIR.set(media_dir.clone());
@@ -1702,10 +1810,11 @@ pub fn spawn(
                             }
                         }
                     })
-                    .on_logged_out(move |_info| {
+                    .on_logged_out(move |info| {
                         let s = s_out.clone();
                         async move {
-                            log("Abgemeldet");
+                            // Grund mitschreiben: der Server sagt ihn genau einmal.
+                            log(format!("Abgemeldet: {}", describe_logout(&info)));
                             s(UiEvent::LoggedOut)
                         }
                     })
@@ -3199,5 +3308,23 @@ mod limit_tests {
         let b = png(20_000, 2);
         assert!(b.len() < 10_000);
         assert!(load_image_limited(&b).is_none());
+    }
+}
+
+#[cfg(test)]
+mod reupload_tests {
+    use super::{reupload_allowed, REUPLOAD_MAX};
+
+    #[test]
+    fn je_medium_nur_einmal_und_begrenzt() {
+        assert!(reupload_allowed("test-a"));
+        assert!(!reupload_allowed("test-a"), "zweite Anforderung für dasselbe Medium");
+        let mut ok = 1;
+        for i in 0..REUPLOAD_MAX * 2 {
+            if reupload_allowed(&format!("test-{i}")) {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, REUPLOAD_MAX, "nicht mehr als REUPLOAD_MAX pro Sitzung");
     }
 }

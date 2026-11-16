@@ -16,6 +16,20 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
 use std::time::Instant;
 
+/// Vor jedes `-i` bei ffmpeg/ffprobe: nur lokale Dateien und nur echte Container.
+///
+/// Empfangene Dateien sind fremd. Ohne Sperre könnte eine als `.mp4` getarnte
+/// HLS-Playlist oder concat-Liste Netzwerkadressen abrufen oder andere lokale Dateien
+/// einlesen. `-protocol_whitelist` verbietet Netzwerkprotokolle (gilt auch für alles,
+/// was der Demuxer nachlädt); `-format_whitelist` lässt Playlist-, concat- und
+/// Bildfolgen-Demuxer gar nicht erst zu – sonst kämen relative Dateinamen über `file` durch.
+pub const SAFE_INPUT: [&str; 4] = [
+    "-protocol_whitelist",
+    "file,pipe",
+    "-format_whitelist",
+    "mov,matroska,ogg,mp3,wav,flac,aac,amr,gif,avi,mpegts,mpeg,asf,flv",
+];
+
 /// Bilder, die höchstens im Voraus dekodiert im Speicher liegen.
 const QUEUE: usize = 3;
 /// Größte Kantenlänge, auf die das Video zum Anzeigen verkleinert wird.
@@ -82,6 +96,7 @@ pub fn parse_probe(text: &str) -> Option<Info> {
 
 pub fn probe(path: &Path) -> Result<Info, String> {
     let out = Command::new("ffprobe")
+        .args(SAFE_INPUT)
         .args(["-v", "error", "-show_entries", "stream=codec_type,width,height,avg_frame_rate,r_frame_rate,duration:stream_side_data=rotation:format=duration", "-of", "default=nw=1"])
         .arg(path)
         .stdin(Stdio::null())
@@ -210,7 +225,9 @@ impl Player {
         let ss = format!("{at:.3}");
         let vf = format!("fps={},scale={w}:{h}", self.fps);
         let mut video = Command::new("ffmpeg")
-            .args(["-v", "error", "-nostdin", "-ss", &ss, "-i"])
+            .args(["-v", "error", "-nostdin", "-ss", &ss])
+            .args(SAFE_INPUT)
+            .arg("-i")
             .arg(&self.path)
             .args(["-an", "-sn", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
             .stdin(Stdio::null())
@@ -295,7 +312,9 @@ impl Player {
 fn spawn_audio(path: &Path, ss: &str, volume: f32) -> Vec<Child> {
     let af = format!("volume={volume:.2}");
     let dec = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-ss", ss, "-i"])
+        .args(["-v", "error", "-nostdin", "-ss", ss])
+        .args(SAFE_INPUT)
+        .arg("-i")
         .arg(path)
         .args(["-vn", "-sn", "-af", &af, "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "2", "-ar", "48000", "-"])
         .stdin(Stdio::null())
@@ -330,6 +349,40 @@ fn spawn_audio(path: &Path, ss: &str, volume: f32) -> Vec<Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Präparierte Dateien (HLS-Playlist mit http://, concat-Liste mit relativem und
+    /// absolutem Pfad) dürfen weder geprüft noch dekodiert werden. Läuft nur mit ffmpeg.
+    #[test]
+    fn rejects_playlists_and_concat() {
+        if Command::new("ffprobe").arg("-version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("wasnap-evil-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.mp4");
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5:duration=1", "-pix_fmt", "yuv420p"])
+            .arg(&ok)
+            .status();
+        let hls = "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nhttp://127.0.0.1:9/x.ts\n#EXT-X-ENDLIST\n";
+        let cases = [
+            ("hls.mp4", hls.to_owned()),
+            ("hls.m3u8", hls.to_owned()),
+            ("rel.mp4", "ffconcat version 1.0\nfile 'ok.mp4'\n".to_owned()),
+            ("abs.mp4", format!("ffconcat version 1.0\nfile '{}'\n", ok.display())),
+        ];
+        for (name, body) in cases {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            assert!(probe(&p).is_err(), "{name}: ffprobe hat die Datei angenommen");
+            assert!(crate::audio::decode_with_ffmpeg(&p).is_err(), "{name}: ffmpeg hat die Datei dekodiert");
+        }
+        // Ein echtes Video geht weiterhin.
+        if matches!(made, Ok(s) if s.success()) {
+            assert!(probe(&ok).is_ok(), "echtes MP4 abgelehnt");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn probe_output_is_parsed() {

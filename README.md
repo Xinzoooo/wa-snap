@@ -5,7 +5,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 
 > ⚠️ **Inoffizielles Projekt.** WhatsApp bietet für private Konten keine offizielle API. Inoffizielle Clients können gegen die Nutzungsbedingungen von Meta verstoßen und zur Sperrung des Kontos führen. Benutzung auf eigene Gefahr, am besten zuerst mit einer Zweitnummer. Dieses Projekt steht in keiner Verbindung zu WhatsApp oder Meta.
 
-## Funktionen (v0.14)
+## Funktionen (v0.15)
 
 - Aussehen wie WhatsApp Web: Seitenleiste, Chatliste mit Filtern (Alle, Ungelesen, Gruppen), „Archiviert“ oben, Sprechblasen mit Zipfel, Haken, Schrift Inter; hell und dunkel
 - 3D-Emojis im Stil von WhatsApp (Microsoft Fluent Emoji, fehlende aus Twemoji) in Nachrichten, Chatliste und Auswahl; alle 1900+ Emojis mit Kategorien wie bei WhatsApp, „Letzte“, deutscher Suche und Hauttönen (Rechtsklick); reine Emoji-Nachrichten werden groß angezeigt
@@ -27,6 +27,8 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 - Kanäle (im Bereich „Aktuelles“): dieselben Abos wie am Handy, Beiträge lesen und mit Emojis reagieren, Kanäle suchen oder per Link abonnieren, deabonnieren, eigenen Kanal erstellen und darin posten
 - Oberfläche auf Deutsch oder Englisch (Einstellungen → Chats; Standard ist die Systemsprache)
 - Chat exportieren als Textdatei in den Downloads-Ordner (⋮-Menü im Chat)
+- Sicherheit: empfangene Videos und Töne werden mit ffmpeg nur als lokale Datei und nur als echter Container geöffnet (keine Playlists, keine Netzwerkadressen); Programme, Skripte und HTML öffnen nur nach Warnung
+- Diagnose: Bei einer Abmeldung durch WhatsApp steht der Grund im Log (`~/.local/share/wa-snap/wa-snap.log`), ebenso Warnungen der WhatsApp-Bibliothek
 - Zusatzfunktionen: von anderen gelöschte Nachrichten weiter anzeigen (Schalter unter Einstellungen → WhatsSnap, standardmäßig aus), frühere Fassungen bearbeiteter Nachrichten ansehen (Maus über „Bearbeitet ⓘ“), mehr als 3 Chats anheften (ab dem 4. nur in WhatsSnap)
 - Eigene Nachrichten bearbeiten (bis 15 Minuten), „Bearbeitet“-Hinweis
 - @Erwähnungen in Gruppen mit Vorschlagsliste; Erwähnungen werden mit Namen hervorgehoben
@@ -65,7 +67,7 @@ Kein Browser, kein Electron: Die Oberfläche ist [egui](https://github.com/emilk
 Ein Befehl, danach findest du WhatsSnap in der Anwendungssuche und kannst es an die Taskleiste anheften:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.14.1-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.15.0-1.x86_64.rpm
 ```
 
 Deinstallieren: `sudo dnf remove wa-snap`. Deine Anmeldedaten bleiben in `~/.local/share/wa-snap/` und werden dabei nicht gelöscht.
@@ -118,7 +120,7 @@ WhatsSnap is a fast, native WhatsApp client for Linux written in Rust (egui). It
 Install on Fedora 40+:
 
 ```bash
-sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.14.1-1.x86_64.rpm
+sudo dnf install https://raw.githubusercontent.com/Xinzoooo/wa-snap/main/dist/wa-snap-0.15.0-1.x86_64.rpm
 ```
 
 Then start “WhatsSnap” from the app menu and scan the QR code with WhatsApp → Settings → Linked devices.

@@ -139,7 +139,9 @@ impl DcBlock {
 /// Beliebige Audiodatei (MP3, M4A, …) mit ffmpeg zu 16-Bit-PCM mono 48 kHz dekodieren.
 pub fn decode_with_ffmpeg(path: &Path) -> Result<(Vec<i16>, usize), String> {
     let out = Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-t", &MAX_VOICE_SECS.to_string(), "-i"])
+        .args(["-v", "error", "-nostdin", "-t", &MAX_VOICE_SECS.to_string()])
+        .args(crate::video::SAFE_INPUT)
+        .arg("-i")
         .arg(path)
         .args(["-vn", "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", &RATE.to_string(), "-"])
         .stdin(Stdio::null())
